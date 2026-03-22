@@ -7,6 +7,8 @@ mod pipeline;
 mod render_gl;
 #[cfg(target_os = "macos")]
 mod render_macos;
+#[cfg(target_os = "macos")]
+mod render_macos_metal;
 #[cfg(target_os = "windows")]
 mod render_windows;
 mod transport;
@@ -15,7 +17,6 @@ mod video_frame;
 use eframe::egui;
 use input::{LocalCaptureMode, LocalKeyboardState, RemoteCursorTexture, SharedInputState};
 use render_gl::NativeVideoTexture;
-use transport::AudioPacket;
 use st_protocol::{
     ClientDisplayInfo, ClockSyncPing, ControlMessage, ControllerState, InputPacket, KeyboardKey,
     KeyboardStateInput, MouseAbsoluteInput, MouseButtonsInput, MouseRelativeInput, MouseWheelInput,
@@ -30,6 +31,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
+use transport::AudioPacket;
 use video_frame::{NativeSurfaceCapabilities, NativeSurfaceControl, VideoFrameBuffer};
 
 use crate::debug_state::{unix_time_micros, ConnectionDebugSnapshot, ConnectionDebugState};
@@ -73,6 +75,8 @@ struct StreamApp {
     seen_cursor_shape_version: u64,
     menu_open: bool,
     last_pointer_move: Option<Instant>,
+    applied_cursor_visible: Option<bool>,
+    applied_cursor_grab: Option<egui::CursorGrab>,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +177,8 @@ impl StreamApp {
             seen_cursor_shape_version: 0,
             menu_open: false,
             last_pointer_move: None,
+            applied_cursor_visible: None,
+            applied_cursor_grab: None,
         }
     }
 
@@ -332,25 +338,27 @@ impl StreamApp {
             && self.remote_cursor_texture.is_some()
     }
 
-    fn apply_pointer_capture_mode(&self, ctx: &egui::Context) {
-        if self.capture_mode == LocalCaptureMode::CapturedRelative {
-            if self.native_cursor_fallback_active() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
-                    egui::CursorGrab::Confined,
-                ));
+    fn apply_pointer_capture_mode(&mut self, ctx: &egui::Context) {
+        let (cursor_visible, cursor_grab) =
+            if self.capture_mode == LocalCaptureMode::CapturedRelative {
+                if self.native_cursor_fallback_active() {
+                    (true, egui::CursorGrab::Confined)
+                } else {
+                    (false, egui::CursorGrab::Locked)
+                }
+            } else if self.absolute_remote_cursor_overlay_active() {
+                (false, egui::CursorGrab::None)
             } else {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
-                    egui::CursorGrab::Locked,
-                ));
-            }
-        } else if self.absolute_remote_cursor_overlay_active() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
-        } else {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+                (true, egui::CursorGrab::None)
+            };
+
+        if self.applied_cursor_grab != Some(cursor_grab) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(cursor_grab));
+            self.applied_cursor_grab = Some(cursor_grab);
+        }
+        if self.applied_cursor_visible != Some(cursor_visible) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(cursor_visible));
+            self.applied_cursor_visible = Some(cursor_visible);
         }
     }
 
@@ -1049,6 +1057,7 @@ fn start_media_threads(
     frame_buf: Arc<Mutex<VideoFrameBuffer>>,
     debug_state: Arc<ConnectionDebugState>,
     ctx: egui::Context,
+    display_refresh_millihz: Option<u32>,
     audio_enabled: Arc<AtomicBool>,
     native_surfaces: Arc<NativeSurfaceControl>,
     control_tx: crossbeam_channel::Sender<ControlMessage>,
@@ -1067,6 +1076,8 @@ fn start_media_threads(
 
     let (audio_data_tx, audio_data_rx) = crossbeam_channel::bounded::<AudioPacket>(60);
     let (feedback_tx, feedback_rx) = crossbeam_channel::bounded::<TransportFeedback>(8);
+    let present_refresh_millihz =
+        display::desired_present_refresh_millihz(display_refresh_millihz, stream_config.framerate);
 
     let (video_stop_tx, video_stop_rx) = crossbeam_channel::bounded(1);
     let pipeline_frame = Arc::clone(&frame_buf);
@@ -1084,6 +1095,7 @@ fn start_media_threads(
             pipeline_audio_flag,
             native_surfaces,
             control_tx,
+            present_refresh_millihz,
             stream_config,
             udp_socket,
         );
@@ -1237,7 +1249,8 @@ fn run_connection(
     let mut media_threads: Option<MediaThreads> = None;
     let mut udp_socket = Some(udp_socket);
     let mut input_rx = Some(input_rx);
-    let (pipeline_control_tx, pipeline_control_rx) = crossbeam_channel::bounded::<ControlMessage>(8);
+    let (pipeline_control_tx, pipeline_control_rx) =
+        crossbeam_channel::bounded::<ControlMessage>(8);
     loop {
         if session_cancelled(
             disconnect.as_ref(),
@@ -1289,6 +1302,7 @@ fn run_connection(
                                     Arc::clone(&frame_buf),
                                     Arc::clone(&debug_state),
                                     ctx.clone(),
+                                    display_refresh_millihz,
                                     Arc::clone(&audio_enabled),
                                     Arc::clone(&native_surfaces),
                                     pipeline_control_tx.clone(),
@@ -1361,8 +1375,12 @@ fn run_connection(
                         ControlMessage::CursorShape(shape) => {
                             eprintln!(
                                 "[cursor] shape: serial={} {}x{} hotspot=({},{}) rgba_len={}",
-                                shape.serial, shape.width, shape.height,
-                                shape.hotspot_x, shape.hotspot_y, shape.rgba.len()
+                                shape.serial,
+                                shape.width,
+                                shape.height,
+                                shape.hotspot_x,
+                                shape.hotspot_y,
+                                shape.rgba.len()
                             );
                             shared_input.set_cursor_shape(shape);
                             ctx.request_repaint();
@@ -1551,8 +1569,12 @@ fn run_connection(
                         ControlMessage::CursorShape(shape) => {
                             eprintln!(
                                 "[cursor] shape: serial={} {}x{} hotspot=({},{}) rgba_len={}",
-                                shape.serial, shape.width, shape.height,
-                                shape.hotspot_x, shape.hotspot_y, shape.rgba.len()
+                                shape.serial,
+                                shape.width,
+                                shape.height,
+                                shape.hotspot_x,
+                                shape.hotspot_y,
+                                shape.rgba.len()
                             );
                             shared_input.set_cursor_shape(shape);
                             ctx.request_repaint();
@@ -1722,7 +1744,10 @@ fn set_udp_recv_buffer(socket: &UdpSocket, size: i32) {
         )
     };
     if ret != 0 {
-        eprintln!("[udp] setsockopt SO_RCVBUF failed: {}", std::io::Error::last_os_error());
+        eprintln!(
+            "[udp] setsockopt SO_RCVBUF failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 
@@ -2190,6 +2215,7 @@ impl eframe::App for StreamApp {
             ConnectionState::Disconnected | ConnectionState::Error(_)
         ) {
             self.clear_local_session_interaction();
+            self.video_texture.clear_frame();
         }
         self.apply_pointer_capture_mode(ctx);
         self.sync_remote_cursor_texture(ctx);
@@ -2255,7 +2281,13 @@ impl eframe::App for StreamApp {
             ctx.request_repaint();
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| match &state {
+        let central_panel = if state == ConnectionState::Connected {
+            egui::CentralPanel::default().frame(egui::Frame::NONE)
+        } else {
+            egui::CentralPanel::default()
+        };
+
+        central_panel.show(ctx, |ui| match &state {
             ConnectionState::Disconnected => {
                 self.render_home_screen(ui, ctx);
             }
@@ -2279,7 +2311,9 @@ impl eframe::App for StreamApp {
                     ui.centered_and_justified(|ui| {
                         let (rect, response) = ui.allocate_exact_size(sized, egui::Sense::click());
                         #[cfg(target_os = "macos")]
-                        let painted_direct = self.video_texture.paint_direct_if_available(ui, rect);
+                        let painted_direct = self
+                            .video_texture
+                            .paint_direct_if_available(frame, ui, rect);
                         #[cfg(not(target_os = "macos"))]
                         let painted_direct = false;
 
@@ -2337,6 +2371,14 @@ impl eframe::App for StreamApp {
                     debug_top,
                 );
             }
+        }
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if *self.state.lock().unwrap() == ConnectionState::Connected {
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            egui::Color32::from_rgba_unmultiplied(12, 12, 12, 180).to_normalized_gamma_f32()
         }
     }
 
@@ -2526,7 +2568,7 @@ fn main() {
             .with_title("Stream Client")
             .with_inner_size([1280.0, 720.0]),
         renderer: eframe::Renderer::Glow,
-        vsync: false,
+        vsync: display::vsync_enabled(),
         ..Default::default()
     };
 

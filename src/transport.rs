@@ -83,7 +83,8 @@ impl UdpReceiver {
 
                     // Demux by payload type
                     if let Some(header) = PacketHeader::deserialize(raw) {
-                        if std::env::var_os("ST_TRACE").is_some() && self.trace_packets_logged < 24 {
+                        if std::env::var_os("ST_TRACE").is_some() && self.trace_packets_logged < 24
+                        {
                             eprintln!(
                                 "[trace][client] udp packet #{} from {addr}: type={:?} frame_id={} seq={} bytes={n}",
                                 self.trace_packets_logged,

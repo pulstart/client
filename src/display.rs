@@ -5,6 +5,24 @@ pub fn detect_max_refresh_millihz() -> Option<u32> {
     env_override_refresh_millihz().or_else(detect_platform_refresh_millihz)
 }
 
+pub fn desired_present_refresh_millihz(
+    display_refresh_millihz: Option<u32>,
+    stream_fps: u16,
+) -> Option<u32> {
+    env_override_present_refresh_millihz().or_else(|| {
+        let stream_refresh = normalize_refresh_millihz(u32::from(stream_fps).saturating_mul(1000))?;
+        Some(
+            display_refresh_millihz
+                .map(|display_refresh| display_refresh.min(stream_refresh))
+                .unwrap_or(stream_refresh),
+        )
+    })
+}
+
+pub fn vsync_enabled() -> bool {
+    env_override_vsync().unwrap_or(cfg!(target_os = "macos"))
+}
+
 fn env_override_refresh_millihz() -> Option<u32> {
     if let Ok(value) = std::env::var("ST_CLIENT_REFRESH_MILLIHZ") {
         if let Ok(parsed) = value.parse::<u32>() {
@@ -16,6 +34,29 @@ fn env_override_refresh_millihz() -> Option<u32> {
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .and_then(normalize_refresh_hz)
+}
+
+fn env_override_present_refresh_millihz() -> Option<u32> {
+    if let Ok(value) = std::env::var("ST_CLIENT_PRESENT_MILLIHZ") {
+        if let Ok(parsed) = value.parse::<u32>() {
+            return normalize_refresh_millihz(parsed);
+        }
+    }
+
+    std::env::var("ST_CLIENT_PRESENT_FPS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .and_then(normalize_refresh_hz)
+}
+
+fn env_override_vsync() -> Option<bool> {
+    std::env::var("ST_CLIENT_VSYNC").ok().and_then(|value| {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    })
 }
 
 #[cfg(target_os = "linux")]

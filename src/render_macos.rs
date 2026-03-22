@@ -47,8 +47,7 @@ const GL_TEXTURE_RECTANGLE_ARB: u32 = 0x84F5;
 impl MacosVideoToolboxImporter {
     pub fn supports_extensions(gl: &glow::Context) -> bool {
         let version = gl.version();
-        gl
-            .supported_extensions()
+        gl.supported_extensions()
             .contains("GL_ARB_texture_rectangle")
             || gl
                 .supported_extensions()

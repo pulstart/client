@@ -1,7 +1,7 @@
 #[cfg(target_os = "macos")]
-use crate::render_macos::{
-    MacosDirectVideoPresenter, MacosVideoToolboxImporter, RectYuvPipeline,
-};
+use crate::render_macos::{MacosDirectVideoPresenter, MacosVideoToolboxImporter, RectYuvPipeline};
+#[cfg(target_os = "macos")]
+use crate::render_macos_metal::MacosMetalVideoPresenter;
 #[cfg(target_os = "windows")]
 use crate::render_windows::WindowsD3d11Importer;
 #[cfg(target_os = "linux")]
@@ -35,6 +35,8 @@ pub struct NativeVideoTexture {
     macos_videotoolbox_importer: Option<MacosVideoToolboxImporter>,
     #[cfg(target_os = "macos")]
     rect_yuv_pipeline: Option<RectYuvPipeline>,
+    #[cfg(target_os = "macos")]
+    macos_metal_presenter: Option<MacosMetalVideoPresenter>,
     #[cfg(target_os = "macos")]
     macos_direct_presenter: Option<MacosDirectVideoPresenter>,
     #[cfg(target_os = "windows")]
@@ -82,13 +84,16 @@ impl NativeVideoTexture {
             #[cfg(target_os = "linux")]
             dmabuf_importer: None,
             #[cfg(target_os = "macos")]
-            macos_videotoolbox_supported: gl
-                .map(|gl| MacosVideoToolboxImporter::supports_extensions(gl))
-                .unwrap_or(false),
+            macos_videotoolbox_supported: MacosMetalVideoPresenter::supported()
+                || gl
+                    .map(|gl| MacosVideoToolboxImporter::supports_extensions(gl))
+                    .unwrap_or(false),
             #[cfg(target_os = "macos")]
             macos_videotoolbox_importer: None,
             #[cfg(target_os = "macos")]
             rect_yuv_pipeline: None,
+            #[cfg(target_os = "macos")]
+            macos_metal_presenter: Some(MacosMetalVideoPresenter::new()),
             #[cfg(target_os = "macos")]
             macos_direct_presenter: Some(MacosDirectVideoPresenter::new()),
             #[cfg(target_os = "windows")]
@@ -103,6 +108,16 @@ impl NativeVideoTexture {
     pub fn has_frame(&self) -> bool {
         if self.width == 0 || self.height == 0 {
             return false;
+        }
+
+        #[cfg(target_os = "macos")]
+        if self
+            .macos_metal_presenter
+            .as_ref()
+            .map(|presenter| presenter.has_frame())
+            .unwrap_or(false)
+        {
+            return true;
         }
 
         #[cfg(target_os = "macos")]
@@ -130,6 +145,10 @@ impl NativeVideoTexture {
         self.width = 0;
         self.height = 0;
         #[cfg(target_os = "macos")]
+        if let Some(presenter) = self.macos_metal_presenter.as_mut() {
+            presenter.clear();
+        }
+        #[cfg(target_os = "macos")]
         if let Some(presenter) = self.macos_direct_presenter.as_ref() {
             presenter.clear();
         }
@@ -143,6 +162,13 @@ impl NativeVideoTexture {
         let Some(frame) = video.videotoolbox.as_ref() else {
             return false;
         };
+        if let Some(presenter) = self.macos_metal_presenter.as_mut() {
+            if presenter.is_enabled() && presenter.stage_frame(frame) {
+                self.width = video.width;
+                self.height = video.height;
+                return true;
+            }
+        }
         let Some(presenter) = self.macos_direct_presenter.as_ref() else {
             return false;
         };
@@ -157,7 +183,19 @@ impl NativeVideoTexture {
     }
 
     #[cfg(target_os = "macos")]
-    pub fn paint_direct_if_available(&self, ui: &egui::Ui, rect: egui::Rect) -> bool {
+    pub fn paint_direct_if_available(
+        &mut self,
+        frame: &eframe::Frame,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+    ) -> bool {
+        if let Some(presenter) = self.macos_metal_presenter.as_mut() {
+            if presenter.has_frame() && presenter.present(frame, rect, ui.ctx().pixels_per_point())
+            {
+                return true;
+            }
+        }
+
         let Some(presenter) = self.macos_direct_presenter.as_ref() else {
             return false;
         };

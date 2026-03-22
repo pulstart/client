@@ -12,3 +12,9 @@ cpal = "0.15"
 opus = "0.3"
 khronos-egl = { version = "6", features = ["dynamic"] }
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics-types = "0.2"
+metal = "0.32"
+objc = "0.2"
+raw-window-handle = "0.6"

@@ -128,14 +128,8 @@ pub fn run_audio_pipeline(
                         .is_ok();
                         if recovered_with_fec {
                             concealed_packets += 1;
-                        } else if decode_and_enqueue(
-                            &mut decoder,
-                            &[],
-                            false,
-                            &mut pcm_buf,
-                            &ring,
-                        )
-                        .is_ok()
+                        } else if decode_and_enqueue(&mut decoder, &[], false, &mut pcm_buf, &ring)
+                            .is_ok()
                         {
                             concealed_packets += 1;
                         }
@@ -143,8 +137,7 @@ pub fn run_audio_pipeline(
                         if trace && concealment_logs < 12 {
                             eprintln!(
                                 "[trace][audio] concealed {} missing packet(s) before seq={}",
-                                concealed_packets,
-                                packet.seq
+                                concealed_packets, packet.seq
                             );
                             concealment_logs += 1;
                         }
@@ -153,8 +146,7 @@ pub fn run_audio_pipeline(
                         if trace && concealment_logs < 12 {
                             eprintln!(
                                 "[trace][audio] large audio gap ({} packets), resyncing at seq={}",
-                                missing_packets,
-                                packet.seq
+                                missing_packets, packet.seq
                             );
                             concealment_logs += 1;
                         }

@@ -12,6 +12,49 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+struct RepaintPacer {
+    min_interval: Option<Duration>,
+    last_request: Option<Instant>,
+}
+
+impl RepaintPacer {
+    fn new(refresh_millihz: Option<u32>) -> Self {
+        Self {
+            min_interval: refresh_millihz.and_then(|refresh| {
+                if refresh == 0 {
+                    None
+                } else {
+                    Some(Duration::from_secs_f64(1000.0 / refresh as f64))
+                }
+            }),
+            last_request: None,
+        }
+    }
+
+    fn request(&mut self, ctx: &egui::Context) {
+        let Some(min_interval) = self.min_interval else {
+            self.last_request = Some(Instant::now());
+            ctx.request_repaint();
+            return;
+        };
+
+        let now = Instant::now();
+        let Some(last_request) = self.last_request else {
+            self.last_request = Some(now);
+            ctx.request_repaint();
+            return;
+        };
+
+        let elapsed = now.saturating_duration_since(last_request);
+        if elapsed >= min_interval {
+            self.last_request = Some(now);
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(min_interval - elapsed);
+        }
+    }
+}
+
 pub fn run_receive_pipeline(
     frame_buf: Arc<Mutex<VideoFrameBuffer>>,
     debug_state: Arc<ConnectionDebugState>,
@@ -22,6 +65,7 @@ pub fn run_receive_pipeline(
     audio_enabled: Arc<AtomicBool>,
     native_surfaces: Arc<NativeSurfaceControl>,
     control_tx: Sender<ControlMessage>,
+    present_refresh_millihz: Option<u32>,
     stream_config: StreamConfig,
     udp_socket: UdpSocket,
 ) {
@@ -49,6 +93,7 @@ pub fn run_receive_pipeline(
     };
     decoder.set_native_surface_control(native_surfaces);
     let mut decoded_frame = VideoFrameBuffer::default();
+    let mut repaint_pacer = RepaintPacer::new(present_refresh_millihz);
 
     loop {
         if shutdown_rx.try_recv().is_ok() {
@@ -174,7 +219,7 @@ pub fn run_receive_pipeline(
                     std::mem::swap(&mut *fb, &mut decoded_frame);
                     fb.dirty = true;
                     decoded_frame.dirty = false;
-                    ctx.request_repaint();
+                    repaint_pacer.request(&ctx);
                 }
             }
         }
