@@ -41,9 +41,6 @@ use crate::debug_state::{unix_time_micros, ConnectionDebugSnapshot, ConnectionDe
 
 const UDP_PORT: u16 = 5000;
 const MAX_REMOTE_CURSOR_TEXTURES: usize = 8;
-const CURSOR_PREDICTION_RECENT_MS: u64 = 120;
-const CURSOR_PREDICTION_SNAP_DISTANCE: f32 = 96.0;
-
 fn trace_enabled() -> bool {
     std::env::var_os("ST_TRACE").is_some()
 }
@@ -101,9 +98,7 @@ struct StreamApp {
     remote_cursor_textures: BTreeMap<u64, RemoteCursorTexture>,
     latest_remote_cursor_serial: Option<u64>,
     seen_cursor_shape_version: u64,
-    seen_cursor_state_version: u64,
-    predicted_cursor_stream_pos: Option<egui::Pos2>,
-    last_local_cursor_motion: Option<Instant>,
+    local_cursor_stream_pos: Option<egui::Pos2>,
     debug_overlay_tab: DebugOverlayTab,
     menu_open: bool,
     local_overlay_hit_rects: Vec<egui::Rect>,
@@ -211,9 +206,7 @@ impl StreamApp {
             remote_cursor_textures: BTreeMap::new(),
             latest_remote_cursor_serial: None,
             seen_cursor_shape_version: 0,
-            seen_cursor_state_version: 0,
-            predicted_cursor_stream_pos: None,
-            last_local_cursor_motion: None,
+            local_cursor_stream_pos: None,
             debug_overlay_tab: DebugOverlayTab::General,
             menu_open: false,
             local_overlay_hit_rects: Vec::new(),
@@ -240,9 +233,7 @@ impl StreamApp {
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
         self.seen_cursor_shape_version = 0;
-        self.seen_cursor_state_version = 0;
-        self.predicted_cursor_stream_pos = None;
-        self.last_local_cursor_motion = None;
+        self.local_cursor_stream_pos = None;
         self.shared_input.reset();
         self.audio_enabled_flag
             .store(self.audio_enabled, Ordering::SeqCst);
@@ -307,9 +298,7 @@ impl StreamApp {
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
         self.seen_cursor_shape_version = 0;
-        self.seen_cursor_state_version = 0;
-        self.predicted_cursor_stream_pos = None;
-        self.last_local_cursor_motion = None;
+        self.local_cursor_stream_pos = None;
         self.menu_open = false;
         self.local_overlay_hit_rects.clear();
         let mut s = self.state.lock().unwrap();
@@ -332,9 +321,7 @@ impl StreamApp {
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
         self.seen_cursor_shape_version = 0;
-        self.seen_cursor_state_version = 0;
-        self.predicted_cursor_stream_pos = None;
-        self.last_local_cursor_motion = None;
+        self.local_cursor_stream_pos = None;
         self.last_video_rect = None;
         self.menu_open = false;
         self.local_overlay_hit_rects.clear();
@@ -412,36 +399,23 @@ impl StreamApp {
         self.clamp_stream_pos(egui::pos2(x, y))
     }
 
-    fn sync_cursor_prediction(&mut self) {
-        let snapshot = self.shared_input.snapshot();
-        if snapshot.cursor_state_version == self.seen_cursor_state_version {
-            return;
-        }
-
-        self.seen_cursor_state_version = snapshot.cursor_state_version;
-        let server_pos = self.clamp_stream_pos(egui::pos2(
+    fn server_cursor_stream_pos(&self, snapshot: &input::SharedInputSnapshot) -> egui::Pos2 {
+        self.clamp_stream_pos(egui::pos2(
             snapshot.cursor_state.x as f32,
             snapshot.cursor_state.y as f32,
-        ));
-        let local_motion_recent = self
-            .last_local_cursor_motion
-            .map(|t| t.elapsed() <= Duration::from_millis(CURSOR_PREDICTION_RECENT_MS))
-            .unwrap_or(false);
+        ))
+    }
 
-        self.predicted_cursor_stream_pos = match self.predicted_cursor_stream_pos {
-            None => Some(server_pos),
-            Some(predicted)
-                if self.capture_mode == LocalCaptureMode::CapturedRelative && local_motion_recent =>
-            {
-                let delta = server_pos - predicted;
-                if delta.length() > CURSOR_PREDICTION_SNAP_DISTANCE {
-                    Some(server_pos)
-                } else {
-                    Some(predicted)
-                }
-            }
-            Some(_) => Some(server_pos),
-        };
+    fn sync_local_cursor_stream_pos(&mut self) {
+        let snapshot = self.shared_input.snapshot();
+        let local_control_active = snapshot.controller_state == ControllerState::OwnedByYou
+            && matches!(
+                self.capture_mode,
+                LocalCaptureMode::HoverAbsolute | LocalCaptureMode::CapturedRelative
+            );
+        if !local_control_active || self.local_cursor_stream_pos.is_none() {
+            self.local_cursor_stream_pos = Some(self.server_cursor_stream_pos(&snapshot));
+        }
     }
 
     fn remote_cursor_texture_for_serial(&self, serial: u64) -> Option<&RemoteCursorTexture> {
@@ -616,16 +590,13 @@ impl StreamApp {
                 .filter(|pos| video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos))?;
             (pointer_pos, true)
         } else {
-            let predicted_stream_pos = self.predicted_cursor_stream_pos.unwrap_or_else(|| {
-                self.clamp_stream_pos(egui::pos2(
-                    input_snapshot.cursor_state.x as f32,
-                    input_snapshot.cursor_state.y as f32,
-                ))
-            });
+            let local_stream_pos = self
+                .local_cursor_stream_pos
+                .unwrap_or_else(|| self.server_cursor_stream_pos(input_snapshot));
             (
                 egui::pos2(
-                    video_rect.left() + predicted_stream_pos.x * scale_x,
-                    video_rect.top() + predicted_stream_pos.y * scale_y,
+                    video_rect.left() + local_stream_pos.x * scale_x,
+                    video_rect.top() + local_stream_pos.y * scale_y,
                 ),
                 false,
             )
@@ -747,24 +718,12 @@ impl StreamApp {
         }
 
         lines.push(format!(
-            "predict: pos={} local_recent={} server_delta={}",
-            format_pos_opt(self.predicted_cursor_stream_pos),
-            if self
-                .last_local_cursor_motion
-                .map(|t| t.elapsed() <= Duration::from_millis(CURSOR_PREDICTION_RECENT_MS))
-                .unwrap_or(false)
-            {
-                "y"
-            } else {
-                "n"
-            },
-            self.predicted_cursor_stream_pos
-                .map(|predicted| {
-                    let server = egui::pos2(
-                        input_snapshot.cursor_state.x as f32,
-                        input_snapshot.cursor_state.y as f32,
-                    );
-                    format_vec2(server - predicted)
+            "local: pos={} server_delta={}",
+            format_pos_opt(self.local_cursor_stream_pos),
+            self.local_cursor_stream_pos
+                .map(|local| {
+                    let server = self.server_cursor_stream_pos(input_snapshot);
+                    format_vec2(server - local)
                 })
                 .unwrap_or_else(|| "-".to_string()),
         ));
@@ -784,10 +743,15 @@ impl StreamApp {
         let snapshot = self.shared_input.snapshot();
         let hover_supported =
             snapshot.capabilities.mouse_absolute && snapshot.capabilities.separate_cursor;
+        let pointer_over_local_overlay = ctx
+            .input(|i| i.pointer.latest_pos())
+            .map(|pos| self.pointer_over_local_overlay(pos))
+            .unwrap_or(false);
         let pointer_over_video = ctx
             .input(|i| i.pointer.latest_pos())
-            .map(|pos| response.rect.contains(pos) && !self.pointer_over_local_overlay(pos))
+            .map(|pos| response.rect.contains(pos) && !pointer_over_local_overlay)
             .unwrap_or(false);
+        let clicked_video = response.clicked_by(egui::PointerButton::Primary) && pointer_over_video;
         if snapshot.controller_state != ControllerState::OwnedByYou
             && matches!(
                 self.capture_mode,
@@ -815,7 +779,7 @@ impl StreamApp {
             self.capture_mode = LocalCaptureMode::HoverAbsolute;
         }
 
-        if response.clicked_by(egui::PointerButton::Primary) {
+        if clicked_video {
             if snapshot.controller_state == ControllerState::OwnedByYou {
                 if snapshot.capabilities.mouse_relative {
                     self.capture_mode = LocalCaptureMode::CapturedRelative;
@@ -841,7 +805,7 @@ impl StreamApp {
 
         if pointer_over_video
             && self.capture_mode == LocalCaptureMode::ForceReleased
-            && response.clicked_by(egui::PointerButton::Primary)
+            && clicked_video
             && snapshot.controller_state == ControllerState::OwnedByYou
             && snapshot.capabilities.mouse_relative
         {
@@ -2606,7 +2570,7 @@ impl eframe::App for StreamApp {
             .set_active(matches!(state, ConnectionState::Connected));
         self.apply_pointer_capture_mode(ctx);
         self.sync_remote_cursor_texture(ctx);
-        self.sync_cursor_prediction();
+        self.sync_local_cursor_stream_pos();
         let recent_pointer_activity = self
             .last_pointer_move
             .map(|t| t.elapsed() < Duration::from_secs(3))
@@ -2837,9 +2801,8 @@ impl eframe::App for StreamApp {
                     {
                         if let Some(rect) = video_rect {
                             if rect.contains(pos) && !self.pointer_over_local_overlay(pos) {
-                                self.predicted_cursor_stream_pos =
+                                self.local_cursor_stream_pos =
                                     Some(self.map_video_pos_to_stream(pos, rect));
-                                self.last_local_cursor_motion = Some(Instant::now());
                                 self.send_input_packet(InputPacket::MouseAbsolute(
                                     MouseAbsoluteInput {
                                         client_id,
@@ -2859,16 +2822,12 @@ impl eframe::App for StreamApp {
                         let dx = delta.x.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                         let dy = delta.y.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                         if dx != 0 || dy != 0 {
-                            let base = self.predicted_cursor_stream_pos.unwrap_or_else(|| {
-                                self.clamp_stream_pos(egui::pos2(
-                                    snapshot.cursor_state.x as f32,
-                                    snapshot.cursor_state.y as f32,
-                                ))
-                            });
-                            self.predicted_cursor_stream_pos = Some(self.clamp_stream_pos(
+                            let base = self
+                                .local_cursor_stream_pos
+                                .unwrap_or_else(|| self.server_cursor_stream_pos(&snapshot));
+                            self.local_cursor_stream_pos = Some(self.clamp_stream_pos(
                                 egui::pos2(base.x + dx as f32, base.y + dy as f32),
                             ));
-                            self.last_local_cursor_motion = Some(Instant::now());
                             self.send_input_packet(InputPacket::MouseRelative(
                                 MouseRelativeInput {
                                     client_id,
@@ -2899,7 +2858,9 @@ impl eframe::App for StreamApp {
                     let over_video = video_rect
                         .map(|rect| rect.contains(pos) && !self.pointer_over_local_overlay(pos))
                         .unwrap_or(false);
+                    let over_local_overlay = self.pointer_over_local_overlay(pos);
                     if snapshot.controller_state == ControllerState::OwnedByYou
+                        && !over_local_overlay
                         && (self.capture_mode == LocalCaptureMode::CapturedRelative
                             || self.capture_mode == LocalCaptureMode::HoverAbsolute && over_video)
                     {
@@ -2911,6 +2872,12 @@ impl eframe::App for StreamApp {
                 }
                 egui::Event::MouseWheel { delta, unit, .. } => {
                     if snapshot.controller_state != ControllerState::OwnedByYou {
+                        continue;
+                    }
+                    if last_pointer_pos
+                        .map(|pos| self.pointer_over_local_overlay(pos))
+                        .unwrap_or(false)
+                    {
                         continue;
                     }
                     let over_video = last_pointer_pos
