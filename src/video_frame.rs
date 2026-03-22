@@ -1,0 +1,351 @@
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::ffi::c_void;
+#[cfg(target_os = "linux")]
+use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoFormat {
+    Rgba8,
+    Yuv420p8,
+    Nv12,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NativeSurfaceCapabilities {
+    pub linux_dmabuf: bool,
+    pub macos_videotoolbox: bool,
+    pub windows_d3d11: bool,
+}
+
+pub struct NativeSurfaceControl {
+    mask: AtomicU8,
+}
+
+impl NativeSurfaceControl {
+    const LINUX_DMABUF_BIT: u8 = 1 << 0;
+    const MACOS_VIDEOTOOLBOX_BIT: u8 = 1 << 1;
+    const WINDOWS_D3D11_BIT: u8 = 1 << 2;
+
+    pub fn new(caps: NativeSurfaceCapabilities) -> Self {
+        Self {
+            mask: AtomicU8::new(Self::mask_from_caps(caps)),
+        }
+    }
+
+    pub fn reset(&self, caps: NativeSurfaceCapabilities) {
+        self.mask
+            .store(Self::mask_from_caps(caps), Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> NativeSurfaceCapabilities {
+        Self::caps_from_mask(self.mask.load(Ordering::Relaxed))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn disable_linux_dmabuf(&self) -> bool {
+        self.disable_bit(Self::LINUX_DMABUF_BIT)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn disable_macos_videotoolbox(&self) -> bool {
+        self.disable_bit(Self::MACOS_VIDEOTOOLBOX_BIT)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn disable_windows_d3d11(&self) -> bool {
+        self.disable_bit(Self::WINDOWS_D3D11_BIT)
+    }
+
+    fn disable_bit(&self, bit: u8) -> bool {
+        let previous = self.mask.fetch_and(!bit, Ordering::Relaxed);
+        previous & bit != 0
+    }
+
+    fn mask_from_caps(caps: NativeSurfaceCapabilities) -> u8 {
+        let mut mask = 0u8;
+        if caps.linux_dmabuf {
+            mask |= Self::LINUX_DMABUF_BIT;
+        }
+        if caps.macos_videotoolbox {
+            mask |= Self::MACOS_VIDEOTOOLBOX_BIT;
+        }
+        if caps.windows_d3d11 {
+            mask |= Self::WINDOWS_D3D11_BIT;
+        }
+        mask
+    }
+
+    fn caps_from_mask(mask: u8) -> NativeSurfaceCapabilities {
+        NativeSurfaceCapabilities {
+            linux_dmabuf: mask & Self::LINUX_DMABUF_BIT != 0,
+            macos_videotoolbox: mask & Self::MACOS_VIDEOTOOLBOX_BIT != 0,
+            windows_d3d11: mask & Self::WINDOWS_D3D11_BIT != 0,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinuxDmaBufFormat {
+    Yuv420p8,
+    Nv12,
+}
+
+#[cfg(target_os = "linux")]
+pub struct LinuxDmaBufPlane {
+    pub fd: OwnedFd,
+    pub offset: u32,
+    pub pitch: u32,
+    pub modifier: u64,
+    pub width: u32,
+    pub height: u32,
+    pub drm_format: u32,
+}
+
+#[cfg(target_os = "linux")]
+pub struct LinuxDmaBufFrame {
+    pub width: u32,
+    pub height: u32,
+    pub format: LinuxDmaBufFormat,
+    pub planes: Vec<LinuxDmaBufPlane>,
+}
+
+#[cfg(target_os = "macos")]
+pub struct MacosCvPixelBuffer {
+    ptr: *mut c_void,
+}
+
+#[cfg(target_os = "macos")]
+unsafe impl Send for MacosCvPixelBuffer {}
+
+#[cfg(target_os = "macos")]
+impl Clone for MacosCvPixelBuffer {
+    fn clone(&self) -> Self {
+        unsafe {
+            cf_retain(self.ptr);
+        }
+        Self { ptr: self.ptr }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MacosCvPixelBuffer {
+    pub unsafe fn retain(ptr: *mut c_void) -> Option<Self> {
+        if ptr.is_null() {
+            return None;
+        }
+        cf_retain(ptr);
+        Some(Self { ptr })
+    }
+
+    pub fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacosCvPixelBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            cf_release(self.ptr);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub struct MacosVideoToolboxFrame {
+    pub width: u32,
+    pub height: u32,
+    pub format: VideoFormat,
+    pub pixel_buffer: MacosCvPixelBuffer,
+}
+
+#[cfg(target_os = "macos")]
+impl Clone for MacosVideoToolboxFrame {
+    fn clone(&self) -> Self {
+        Self {
+            width: self.width,
+            height: self.height,
+            format: self.format,
+            pixel_buffer: self.pixel_buffer.clone(),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub struct WindowsComPtr {
+    ptr: *mut c_void,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for WindowsComPtr {}
+
+#[cfg(target_os = "windows")]
+impl WindowsComPtr {
+    pub unsafe fn retain(ptr: *mut c_void) -> Option<Self> {
+        if ptr.is_null() {
+            return None;
+        }
+        com_add_ref(ptr);
+        Some(Self { ptr })
+    }
+
+    pub fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsComPtr {
+    fn drop(&mut self) {
+        unsafe {
+            com_release(self.ptr);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub struct WindowsD3d11Frame {
+    pub width: u32,
+    pub height: u32,
+    pub format: VideoFormat,
+    pub device: WindowsComPtr,
+    pub video_device: WindowsComPtr,
+    pub video_context: WindowsComPtr,
+    pub texture: WindowsComPtr,
+    pub array_index: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FrameDebugTiming {
+    pub frame_id: u32,
+    pub server_capture_micros: u64,
+    pub server_send_micros: u64,
+    pub client_assembled_micros: u64,
+    pub client_decode_start_micros: u64,
+    pub client_decode_done_micros: u64,
+}
+
+pub struct VideoFrameBuffer {
+    pub width: u32,
+    pub height: u32,
+    pub format: VideoFormat,
+    pub plane0: Vec<u8>,
+    pub plane1: Vec<u8>,
+    pub plane2: Vec<u8>,
+    #[cfg(target_os = "linux")]
+    pub dmabuf: Option<LinuxDmaBufFrame>,
+    #[cfg(target_os = "macos")]
+    pub videotoolbox: Option<MacosVideoToolboxFrame>,
+    #[cfg(target_os = "windows")]
+    pub d3d11: Option<WindowsD3d11Frame>,
+    pub debug_timing: Option<FrameDebugTiming>,
+    pub dirty: bool,
+}
+
+impl Default for VideoFrameBuffer {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            format: VideoFormat::Rgba8,
+            plane0: Vec::new(),
+            plane1: Vec::new(),
+            plane2: Vec::new(),
+            #[cfg(target_os = "linux")]
+            dmabuf: None,
+            #[cfg(target_os = "macos")]
+            videotoolbox: None,
+            #[cfg(target_os = "windows")]
+            d3d11: None,
+            debug_timing: None,
+            dirty: false,
+        }
+    }
+}
+
+impl VideoFrameBuffer {
+    pub fn clear(&mut self) {
+        self.width = 0;
+        self.height = 0;
+        self.dirty = false;
+        self.plane0.clear();
+        self.plane1.clear();
+        self.plane2.clear();
+        self.debug_timing = None;
+        self.clear_native_surfaces();
+    }
+
+    pub fn clear_native_surfaces(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            self.dmabuf = None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.videotoolbox = None;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            self.d3d11 = None;
+        }
+    }
+
+    pub fn chroma_width(&self) -> u32 {
+        self.width.div_ceil(2)
+    }
+
+    pub fn chroma_height(&self) -> u32 {
+        self.height.div_ceil(2)
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRetain(cf: *const c_void) -> *const c_void;
+    fn CFRelease(cf: *const c_void);
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn cf_retain(ptr: *mut c_void) {
+    let _ = CFRetain(ptr.cast_const());
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn cf_release(ptr: *mut c_void) {
+    if !ptr.is_null() {
+        CFRelease(ptr.cast_const());
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct ComVtable {
+    query_interface: unsafe extern "system" fn(*mut c_void, *const c_void, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct ComObject {
+    vtable: *const ComVtable,
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn com_add_ref(ptr: *mut c_void) {
+    if !ptr.is_null() {
+        let object = ptr as *mut ComObject;
+        ((*(*object).vtable).add_ref)(ptr);
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn com_release(ptr: *mut c_void) {
+    if !ptr.is_null() {
+        let object = ptr as *mut ComObject;
+        ((*(*object).vtable).release)(ptr);
+    }
+}
