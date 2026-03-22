@@ -5,13 +5,20 @@ use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
 const FEEDBACK_INTERVAL: Duration = Duration::from_millis(500);
+const URGENT_FEEDBACK_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Demuxed data from the unified UDP stream.
+#[derive(Debug, Clone)]
+pub struct AudioPacket {
+    pub seq: u16,
+    pub data: Vec<u8>,
+}
+
 pub enum ReceivedData {
     /// A fully assembled video frame (one or more packets reassembled).
     Video(CompletedFrame),
     /// A single audio packet (raw Opus data).
-    Audio(Vec<u8>),
+    Audio(AudioPacket),
 }
 
 pub struct UdpReceiver {
@@ -45,6 +52,10 @@ impl TransportWindowStats {
             completed_frames: self.completed_frames,
             dropped_frames: self.dropped_frames,
         }
+    }
+
+    pub fn needs_recovery_keyframe(self) -> bool {
+        self.lost_packets > 0 || self.dropped_frames > 0
     }
 }
 
@@ -88,7 +99,10 @@ impl UdpReceiver {
                                     self.feedback.received_bytes.saturating_add(n as u64);
                                 self.feedback.received_audio_bytes =
                                     self.feedback.received_audio_bytes.saturating_add(n as u64);
-                                return Some(ReceivedData::Audio(raw[HEADER_SIZE..].to_vec()));
+                                return Some(ReceivedData::Audio(AudioPacket {
+                                    seq: header.seq,
+                                    data: raw[HEADER_SIZE..].to_vec(),
+                                }));
                             }
                             continue;
                         }
@@ -114,6 +128,9 @@ impl UdpReceiver {
                         .feedback
                         .dropped_frames
                         .saturating_add(outcome.feedback.dropped_frames);
+                    if outcome.feedback.lost_packets > 0 || outcome.feedback.dropped_frames > 0 {
+                        self.feedback.urgent = true;
+                    }
                     if let Some(frame) = outcome.completed {
                         self.feedback.completed_frames =
                             self.feedback.completed_frames.saturating_add(1);
@@ -134,6 +151,7 @@ impl UdpReceiver {
 #[derive(Debug)]
 struct FeedbackWindow {
     started_at: Instant,
+    urgent: bool,
     received_packets: u32,
     lost_packets: u32,
     late_packets: u32,
@@ -148,6 +166,7 @@ impl Default for FeedbackWindow {
     fn default() -> Self {
         Self {
             started_at: Instant::now(),
+            urgent: false,
             received_packets: 0,
             lost_packets: 0,
             late_packets: 0,
@@ -163,7 +182,8 @@ impl Default for FeedbackWindow {
 impl FeedbackWindow {
     fn take_if_due(&mut self) -> Option<TransportWindowStats> {
         let elapsed = self.started_at.elapsed();
-        if elapsed < FEEDBACK_INTERVAL {
+        let urgent_due = self.urgent && elapsed >= URGENT_FEEDBACK_MIN_INTERVAL;
+        if elapsed < FEEDBACK_INTERVAL && !urgent_due {
             return None;
         }
 
@@ -180,6 +200,7 @@ impl FeedbackWindow {
         };
 
         self.started_at = Instant::now();
+        self.urgent = false;
         self.received_packets = 0;
         self.lost_packets = 0;
         self.late_packets = 0;

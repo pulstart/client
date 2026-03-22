@@ -15,6 +15,7 @@ mod video_frame;
 use eframe::egui;
 use input::{LocalCaptureMode, LocalKeyboardState, RemoteCursorTexture, SharedInputState};
 use render_gl::NativeVideoTexture;
+use transport::AudioPacket;
 use st_protocol::{
     ClientDisplayInfo, ClockSyncPing, ControlMessage, ControllerState, InputPacket, KeyboardKey,
     KeyboardStateInput, MouseAbsoluteInput, MouseButtonsInput, MouseRelativeInput, MouseWheelInput,
@@ -1041,7 +1042,7 @@ fn start_media_threads(
         run_input_sender(input_socket, input_target, input_rx, input_stop_rx);
     });
 
-    let (audio_data_tx, audio_data_rx) = crossbeam_channel::bounded::<Vec<u8>>(60);
+    let (audio_data_tx, audio_data_rx) = crossbeam_channel::bounded::<AudioPacket>(60);
     let (feedback_tx, feedback_rx) = crossbeam_channel::bounded::<TransportFeedback>(8);
 
     let (video_stop_tx, video_stop_rx) = crossbeam_channel::bounded(1);
@@ -1155,6 +1156,7 @@ fn run_connection(
             return;
         }
     };
+    let _ = tcp.set_nodelay(true);
 
     if session_cancelled(
         disconnect.as_ref(),

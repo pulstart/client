@@ -1,6 +1,6 @@
 use crate::debug_state::{unix_time_micros, ConnectionDebugState};
 use crate::decode::VideoDecoder;
-use crate::transport::{ReceivedData, UdpReceiver};
+use crate::transport::{AudioPacket, ReceivedData, TransportWindowStats, UdpReceiver};
 use crate::video_frame::{FrameDebugTiming, NativeSurfaceControl, VideoFrameBuffer};
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
@@ -17,7 +17,7 @@ pub fn run_receive_pipeline(
     debug_state: Arc<ConnectionDebugState>,
     ctx: egui::Context,
     shutdown_rx: Receiver<()>,
-    audio_tx: Sender<Vec<u8>>,
+    audio_tx: Sender<AudioPacket>,
     feedback_tx: Sender<TransportFeedback>,
     audio_enabled: Arc<AtomicBool>,
     native_surfaces: Arc<NativeSurfaceControl>,
@@ -60,6 +60,12 @@ pub fn run_receive_pipeline(
             None => {
                 if let Some(stats) = receiver.take_stats() {
                     debug_state.update_transport_window(&stats);
+                    maybe_request_transport_recovery_keyframe(
+                        stats,
+                        &control_tx,
+                        &mut last_recovery_keyframe_request,
+                        trace,
+                    );
                     let _ = feedback_tx.try_send(stats.feedback());
                 }
                 std::thread::sleep(Duration::from_micros(500));
@@ -69,6 +75,12 @@ pub fn run_receive_pipeline(
 
         if let Some(stats) = receiver.take_stats() {
             debug_state.update_transport_window(&stats);
+            maybe_request_transport_recovery_keyframe(
+                stats,
+                &control_tx,
+                &mut last_recovery_keyframe_request,
+                trace,
+            );
             let _ = feedback_tx.try_send(stats.feedback());
         }
 
@@ -166,5 +178,28 @@ pub fn run_receive_pipeline(
                 }
             }
         }
+    }
+}
+
+fn maybe_request_transport_recovery_keyframe(
+    stats: TransportWindowStats,
+    control_tx: &Sender<ControlMessage>,
+    last_recovery_keyframe_request: &mut Instant,
+    trace: bool,
+) {
+    if !stats.needs_recovery_keyframe()
+        || last_recovery_keyframe_request.elapsed() < Duration::from_millis(250)
+    {
+        return;
+    }
+
+    let _ = control_tx.try_send(ControlMessage::RequestKeyframe);
+    *last_recovery_keyframe_request = Instant::now();
+    if trace {
+        eprintln!(
+            "[trace][client] requested recovery keyframe after transport loss: lost_packets={} dropped_frames={}",
+            stats.lost_packets,
+            stats.dropped_frames
+        );
     }
 }
