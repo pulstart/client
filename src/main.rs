@@ -323,6 +323,15 @@ impl StreamApp {
             && (snapshot.cursor_state.visible || snapshot.cursor_state.serial == 0)
     }
 
+    fn absolute_remote_cursor_overlay_active(&self) -> bool {
+        let snapshot = self.shared_input.snapshot();
+        self.capture_mode == LocalCaptureMode::HoverAbsolute
+            && snapshot.controller_state == ControllerState::OwnedByYou
+            && snapshot.capabilities.separate_cursor
+            && snapshot.cursor_state.visible
+            && self.remote_cursor_texture.is_some()
+    }
+
     fn apply_pointer_capture_mode(&self, ctx: &egui::Context) {
         if self.capture_mode == LocalCaptureMode::CapturedRelative {
             if self.native_cursor_fallback_active() {
@@ -336,6 +345,9 @@ impl StreamApp {
                     egui::CursorGrab::Locked,
                 ));
             }
+        } else if self.absolute_remote_cursor_overlay_active() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
         } else {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
@@ -490,10 +502,21 @@ impl StreamApp {
         };
         let size = egui::vec2(texture.size.x * scale_x, texture.size.y * scale_y);
         let hotspot = egui::vec2(texture.hotspot.x * scale_x, texture.hotspot.y * scale_y);
-        let cursor_pos = egui::pos2(
-            video_rect.left() + snapshot.cursor_state.x as f32 * scale_x,
-            video_rect.top() + snapshot.cursor_state.y as f32 * scale_y,
-        );
+        let cursor_pos = if self.capture_mode == LocalCaptureMode::HoverAbsolute {
+            ctx.input(|i| i.pointer.latest_pos())
+                .filter(|pos| video_rect.contains(*pos))
+                .unwrap_or_else(|| {
+                    egui::pos2(
+                        video_rect.left() + snapshot.cursor_state.x as f32 * scale_x,
+                        video_rect.top() + snapshot.cursor_state.y as f32 * scale_y,
+                    )
+                })
+        } else {
+            egui::pos2(
+                video_rect.left() + snapshot.cursor_state.x as f32 * scale_x,
+                video_rect.top() + snapshot.cursor_state.y as f32 * scale_y,
+            )
+        };
         let top_left = cursor_pos - hotspot;
         let rect = egui::Rect::from_min_size(top_left, size);
         if rect.max.x <= video_rect.left()
