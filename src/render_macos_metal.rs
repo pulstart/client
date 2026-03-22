@@ -288,7 +288,7 @@ impl MetalVideoRenderer {
             msg_send![self.root_view.as_ptr(), convertRect: local_rect toView: self.parent_view.as_ptr()]
         };
 
-        let mut changed = self.last_rect != Some(rect)
+        let changed = self.last_rect != Some(rect)
             || (self.last_scale - pixels_per_point).abs() > f32::EPSILON;
         if changed {
             unsafe {

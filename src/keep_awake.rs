@@ -110,7 +110,7 @@ mod platform {
 #[cfg(target_os = "macos")]
 mod platform {
     use core_foundation::base::TCFType;
-    use core_foundation::string::CFString;
+    use core_foundation::string::{CFString, CFStringRef};
 
     pub struct Inhibitor {
         assertion_id: u32,
@@ -148,7 +148,6 @@ mod platform {
     type IOPMAssertionID = u32;
     type IOPMAssertionLevel = u32;
     type IOReturn = i32;
-    type CFStringRef = *const core::ffi::c_void;
 
     const K_IOPM_ASSERTION_LEVEL_ON: IOPMAssertionLevel = 255;
 
