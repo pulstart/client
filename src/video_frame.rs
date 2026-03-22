@@ -1,7 +1,9 @@
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::ffi::c_void;
 #[cfg(target_os = "linux")]
-use std::os::fd::OwnedFd;
+use std::io;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,6 +113,38 @@ pub struct LinuxDmaBufFrame {
     pub planes: Vec<LinuxDmaBufPlane>,
 }
 
+#[cfg(target_os = "linux")]
+impl LinuxDmaBufPlane {
+    fn try_clone(&self) -> Result<Self, String> {
+        Ok(Self {
+            fd: dup_owned_fd(&self.fd).map_err(|err| format!("dup dmabuf fd: {err}"))?,
+            offset: self.offset,
+            pitch: self.pitch,
+            modifier: self.modifier,
+            width: self.width,
+            height: self.height,
+            drm_format: self.drm_format,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxDmaBufFrame {
+    pub fn try_clone(&self) -> Result<Self, String> {
+        let mut planes = Vec::with_capacity(self.planes.len());
+        for plane in &self.planes {
+            planes.push(plane.try_clone()?);
+        }
+
+        Ok(Self {
+            width: self.width,
+            height: self.height,
+            format: self.format,
+            planes,
+        })
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub struct MacosCvPixelBuffer {
     ptr: *mut c_void,
@@ -182,6 +216,16 @@ pub struct WindowsComPtr {
 unsafe impl Send for WindowsComPtr {}
 
 #[cfg(target_os = "windows")]
+impl Clone for WindowsComPtr {
+    fn clone(&self) -> Self {
+        unsafe {
+            com_add_ref(self.ptr);
+        }
+        Self { ptr: self.ptr }
+    }
+}
+
+#[cfg(target_os = "windows")]
 impl WindowsComPtr {
     pub unsafe fn retain(ptr: *mut c_void) -> Option<Self> {
         if ptr.is_null() {
@@ -215,6 +259,22 @@ pub struct WindowsD3d11Frame {
     pub video_context: WindowsComPtr,
     pub texture: WindowsComPtr,
     pub array_index: u32,
+}
+
+#[cfg(target_os = "windows")]
+impl Clone for WindowsD3d11Frame {
+    fn clone(&self) -> Self {
+        Self {
+            width: self.width,
+            height: self.height,
+            format: self.format,
+            device: self.device.clone(),
+            video_device: self.video_device.clone(),
+            video_context: self.video_context.clone(),
+            texture: self.texture.clone(),
+            array_index: self.array_index,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -317,6 +377,16 @@ unsafe fn cf_retain(ptr: *mut c_void) {
 unsafe fn cf_release(ptr: *mut c_void) {
     if !ptr.is_null() {
         CFRelease(ptr.cast_const());
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn dup_owned_fd(fd: &OwnedFd) -> io::Result<OwnedFd> {
+    let duplicated = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
     }
 }
 

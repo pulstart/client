@@ -6,10 +6,11 @@ use metal::{
     MTLLoadAction, MTLPixelFormat, MTLPrimitiveType, MTLResourceOptions, MTLStoreAction,
     MetalLayer, RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState, TextureRef,
 };
+use metal::foreign_types::ForeignType;
 use objc::{
-    class, msg_send,
+    class, msg_send, sel, sel_impl,
     rc::{autoreleasepool, StrongPtr},
-    runtime::{Object, YES},
+    runtime::{Object, NO, YES},
 };
 use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 use std::{ffi::c_void, ptr::NonNull};

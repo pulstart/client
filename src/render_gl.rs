@@ -3,12 +3,14 @@ use crate::render_macos::{MacosDirectVideoPresenter, MacosVideoToolboxImporter, 
 #[cfg(target_os = "macos")]
 use crate::render_macos_metal::MacosMetalVideoPresenter;
 #[cfg(target_os = "windows")]
-use crate::render_windows::WindowsD3d11Importer;
+use crate::render_windows::{WindowsD3d11Importer, WindowsDirectVideoPresenter};
 #[cfg(target_os = "linux")]
 use crate::video_frame::{LinuxDmaBufFormat, LinuxDmaBufFrame, LinuxDmaBufPlane};
 use crate::video_frame::{
     NativeSurfaceCapabilities, NativeSurfaceControl, VideoFormat, VideoFrameBuffer,
 };
+#[cfg(target_os = "linux")]
+use eframe::egui_glow;
 use eframe::{egui, glow};
 use glow::{HasContext as _, PixelUnpackData};
 #[cfg(target_os = "linux")]
@@ -18,6 +20,8 @@ use std::ffi::c_void;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
 
 pub struct NativeVideoTexture {
     texture: Option<glow::Texture>,
@@ -29,6 +33,8 @@ pub struct NativeVideoTexture {
     linux_dmabuf_supported: bool,
     #[cfg(target_os = "linux")]
     dmabuf_importer: Option<LinuxDmabufImporter>,
+    #[cfg(target_os = "linux")]
+    linux_direct_presenter: Option<LinuxDirectVideoPresenter>,
     #[cfg(target_os = "macos")]
     macos_videotoolbox_supported: bool,
     #[cfg(target_os = "macos")]
@@ -43,6 +49,8 @@ pub struct NativeVideoTexture {
     windows_d3d11_supported: bool,
     #[cfg(target_os = "windows")]
     windows_d3d11_importer: Option<WindowsD3d11Importer>,
+    #[cfg(target_os = "windows")]
+    windows_direct_presenter: Option<WindowsDirectVideoPresenter>,
 }
 
 struct YuvPipeline {
@@ -71,6 +79,152 @@ struct LinuxDmabufImporter {
 #[cfg(target_os = "linux")]
 type GlEglImageTargetTexture2DOes = unsafe extern "system" fn(u32, *const c_void);
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Default)]
+struct LinuxDirectVideoPresenter {
+    inner: Arc<Mutex<LinuxDirectVideoPresenterState>>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct LinuxDirectVideoPresenterState {
+    enabled: bool,
+    logged_success: bool,
+    frame: Option<LinuxDmaBufFrame>,
+    importer: Option<LinuxDmabufImporter>,
+    pipeline: Option<YuvPipeline>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxDirectVideoPresenter {
+    fn new() -> Self {
+        let mut state = LinuxDirectVideoPresenterState::default();
+        state.enabled = true;
+        Self {
+            inner: Arc::new(Mutex::new(state)),
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.inner.lock().unwrap().enabled
+    }
+
+    fn has_frame(&self) -> bool {
+        let state = self.inner.lock().unwrap();
+        state.enabled && state.frame.is_some()
+    }
+
+    fn clear(&self) {
+        let mut state = self.inner.lock().unwrap();
+        state.frame = None;
+    }
+
+    fn stage_frame(&self, frame: &LinuxDmaBufFrame) -> bool {
+        let mut state = self.inner.lock().unwrap();
+        if !state.enabled {
+            return false;
+        }
+
+        match frame.try_clone() {
+            Ok(frame) => {
+                state.frame = Some(frame);
+                true
+            }
+            Err(err) => {
+                eprintln!("[render] disabling Linux direct present path: {err}");
+                state.disable();
+                false
+            }
+        }
+    }
+
+    fn paint_callback(&self, rect: egui::Rect) -> egui::PaintCallback {
+        let inner = Arc::clone(&self.inner);
+        egui::PaintCallback {
+            rect,
+            callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
+                let mut state = inner.lock().unwrap();
+                state.render(info, painter);
+            })),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxDirectVideoPresenterState {
+    fn render(&mut self, info: egui::PaintCallbackInfo, painter: &egui_glow::Painter) {
+        if !self.enabled {
+            return;
+        }
+        let Some(frame) = self.frame.as_ref() else {
+            return;
+        };
+        let gl = painter.gl();
+
+        if self.importer.is_none() {
+            match LinuxDmabufImporter::new(gl.as_ref()) {
+                Ok(importer) => self.importer = Some(importer),
+                Err(err) => {
+                    eprintln!("[render] disabling Linux direct present path: {err}");
+                    self.disable();
+                    return;
+                }
+            }
+        }
+        if self.pipeline.is_none() {
+            match YuvPipeline::new(gl.as_ref()) {
+                Ok(pipeline) => self.pipeline = Some(pipeline),
+                Err(err) => {
+                    eprintln!("[render] disabling Linux direct present path: {err}");
+                    self.disable();
+                    return;
+                }
+            }
+        }
+
+        let clip_rect = info.clip_rect_in_pixels();
+        unsafe {
+            gl.enable(glow::SCISSOR_TEST);
+            gl.scissor(
+                clip_rect.left_px,
+                clip_rect.from_bottom_px,
+                clip_rect.width_px,
+                clip_rect.height_px,
+            );
+        }
+
+        let result = self
+            .importer
+            .as_mut()
+            .expect("importer set")
+            .import_and_render_to_current(
+                gl.as_ref(),
+                self.pipeline.as_mut().expect("pipeline set"),
+                frame,
+            );
+
+        unsafe {
+            gl.disable(glow::SCISSOR_TEST);
+        }
+
+        if let Err(err) = result {
+            eprintln!("[render] disabling Linux direct present path: {err}");
+            self.disable();
+        } else if !self.logged_success {
+            eprintln!("[render] Linux direct present path enabled");
+            self.logged_success = true;
+        }
+    }
+
+    fn disable(&mut self) {
+        self.enabled = false;
+        self.logged_success = false;
+        self.frame = None;
+        self.importer = None;
+        self.pipeline = None;
+    }
+}
+
 impl NativeVideoTexture {
     pub fn new(gl: Option<&Arc<glow::Context>>) -> Self {
         Self {
@@ -83,6 +237,8 @@ impl NativeVideoTexture {
             linux_dmabuf_supported: gl.map(|gl| LinuxDmabufImporter::probe(gl)).unwrap_or(false),
             #[cfg(target_os = "linux")]
             dmabuf_importer: None,
+            #[cfg(target_os = "linux")]
+            linux_direct_presenter: Some(LinuxDirectVideoPresenter::new()),
             #[cfg(target_os = "macos")]
             macos_videotoolbox_supported: MacosMetalVideoPresenter::supported()
                 || gl
@@ -102,12 +258,24 @@ impl NativeVideoTexture {
                 .unwrap_or(false),
             #[cfg(target_os = "windows")]
             windows_d3d11_importer: None,
+            #[cfg(target_os = "windows")]
+            windows_direct_presenter: Some(WindowsDirectVideoPresenter::new()),
         }
     }
 
     pub fn has_frame(&self) -> bool {
         if self.width == 0 || self.height == 0 {
             return false;
+        }
+
+        #[cfg(target_os = "linux")]
+        if self
+            .linux_direct_presenter
+            .as_ref()
+            .map(|presenter| presenter.has_frame())
+            .unwrap_or(false)
+        {
+            return true;
         }
 
         #[cfg(target_os = "macos")]
@@ -130,6 +298,16 @@ impl NativeVideoTexture {
             return true;
         }
 
+        #[cfg(target_os = "windows")]
+        if self
+            .windows_direct_presenter
+            .as_ref()
+            .map(|presenter| presenter.has_frame())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+
         self.texture_id.is_some()
     }
 
@@ -144,6 +322,10 @@ impl NativeVideoTexture {
     pub fn clear_frame(&mut self) {
         self.width = 0;
         self.height = 0;
+        #[cfg(target_os = "linux")]
+        if let Some(presenter) = self.linux_direct_presenter.as_ref() {
+            presenter.clear();
+        }
         #[cfg(target_os = "macos")]
         if let Some(presenter) = self.macos_metal_presenter.as_mut() {
             presenter.clear();
@@ -152,59 +334,136 @@ impl NativeVideoTexture {
         if let Some(presenter) = self.macos_direct_presenter.as_ref() {
             presenter.clear();
         }
+        #[cfg(target_os = "windows")]
+        if let Some(presenter) = self.windows_direct_presenter.as_ref() {
+            presenter.clear();
+        }
     }
 
-    #[cfg(target_os = "macos")]
     pub fn stage_direct_frame(&mut self, video: &VideoFrameBuffer) -> bool {
-        if !self.macos_videotoolbox_supported {
-            return false;
-        }
-        let Some(frame) = video.videotoolbox.as_ref() else {
-            return false;
-        };
-        if let Some(presenter) = self.macos_metal_presenter.as_mut() {
-            if presenter.is_enabled() && presenter.stage_frame(frame) {
-                self.width = video.width;
-                self.height = video.height;
-                return true;
+        #[cfg(target_os = "linux")]
+        {
+            if self.linux_dmabuf_supported {
+                if let Some(frame) = video.dmabuf.as_ref() {
+                    if let Some(presenter) = self.linux_direct_presenter.as_ref() {
+                        if presenter.is_enabled() && presenter.stage_frame(frame) {
+                            self.width = video.width;
+                            self.height = video.height;
+                            return true;
+                        }
+                    }
+                }
             }
         }
-        let Some(presenter) = self.macos_direct_presenter.as_ref() else {
-            return false;
-        };
-        if !presenter.is_enabled() {
-            return false;
+
+        #[cfg(target_os = "macos")]
+        {
+            if !self.macos_videotoolbox_supported {
+                return false;
+            }
+            let Some(frame) = video.videotoolbox.as_ref() else {
+                return false;
+            };
+            if let Some(presenter) = self.macos_metal_presenter.as_mut() {
+                if presenter.is_enabled() && presenter.stage_frame(frame) {
+                    self.width = video.width;
+                    self.height = video.height;
+                    return true;
+                }
+            }
+            let Some(presenter) = self.macos_direct_presenter.as_ref() else {
+                return false;
+            };
+            if !presenter.is_enabled() {
+                return false;
+            }
+
+            presenter.stage_frame(frame);
+            self.width = video.width;
+            self.height = video.height;
+            return true;
         }
 
-        presenter.stage_frame(frame);
-        self.width = video.width;
-        self.height = video.height;
-        true
+        #[cfg(target_os = "windows")]
+        {
+            if !self.windows_d3d11_supported {
+                return false;
+            }
+            let Some(frame) = video.d3d11.as_ref() else {
+                return false;
+            };
+            let Some(presenter) = self.windows_direct_presenter.as_ref() else {
+                return false;
+            };
+            if !presenter.is_enabled() {
+                return false;
+            }
+
+            presenter.stage_frame(frame);
+            self.width = video.width;
+            self.height = video.height;
+            return true;
+        }
+
+        #[allow(unreachable_code)]
+        false
     }
 
-    #[cfg(target_os = "macos")]
     pub fn paint_direct_if_available(
         &mut self,
-        frame: &eframe::Frame,
+        _frame: &eframe::Frame,
         ui: &egui::Ui,
         rect: egui::Rect,
     ) -> bool {
-        if let Some(presenter) = self.macos_metal_presenter.as_mut() {
-            if presenter.has_frame() && presenter.present(frame, rect, ui.ctx().pixels_per_point())
-            {
-                return true;
+        #[cfg(target_os = "linux")]
+        {
+            let Some(presenter) = self.linux_direct_presenter.as_ref() else {
+                return false;
+            };
+            if !presenter.has_frame() {
+                return false;
             }
+
+            ui.painter().add(presenter.paint_callback(rect));
+            return true;
         }
 
-        let Some(presenter) = self.macos_direct_presenter.as_ref() else {
-            return false;
-        };
-        if !presenter.has_frame() {
-            return false;
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(presenter) = self.macos_metal_presenter.as_mut() {
+                if presenter.has_frame()
+                    && presenter.present(_frame, rect, ui.ctx().pixels_per_point())
+                {
+                    return true;
+                }
+            }
+
+            let Some(presenter) = self.macos_direct_presenter.as_ref() else {
+                return false;
+            };
+            if !presenter.has_frame() {
+                return false;
+            }
+
+            ui.painter().add(presenter.paint_callback(rect));
+            return true;
         }
 
-        ui.painter().add(presenter.paint_callback(rect));
-        true
+        #[cfg(target_os = "windows")]
+        {
+            let Some(presenter) = self.windows_direct_presenter.as_ref() else {
+                return false;
+            };
+            if !presenter.has_frame() {
+                return false;
+            }
+
+            ui.painter().add(presenter.paint_callback(rect));
+            return true;
+        }
+
+        #[allow(unreachable_code)]
+        false
     }
 
     pub fn native_surface_capabilities(&self) -> NativeSurfaceCapabilities {
@@ -658,6 +917,51 @@ impl YuvPipeline {
 
         Ok(())
     }
+
+    fn render_textures_to_current(
+        &mut self,
+        gl: &glow::Context,
+        format: VideoFormat,
+        luma_tex: glow::Texture,
+        chroma_tex: glow::Texture,
+        chroma_v_tex: glow::Texture,
+    ) -> Result<(), String> {
+        unsafe {
+            gl.disable(glow::BLEND);
+            gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::CULL_FACE);
+            gl.use_program(Some(self.program));
+            gl.uniform_1_i32(
+                Some(&self.mode_uniform),
+                match format {
+                    VideoFormat::Yuv420p8 => 0,
+                    VideoFormat::Nv12 => 1,
+                    VideoFormat::Rgba8 => 0,
+                },
+            );
+
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(luma_tex));
+            gl.active_texture(glow::TEXTURE1);
+            gl.bind_texture(glow::TEXTURE_2D, Some(chroma_tex));
+            gl.active_texture(glow::TEXTURE2);
+            gl.bind_texture(
+                glow::TEXTURE_2D,
+                match format {
+                    VideoFormat::Yuv420p8 => Some(chroma_v_tex),
+                    VideoFormat::Nv12 | VideoFormat::Rgba8 => Some(chroma_tex),
+                },
+            );
+
+            gl.bind_vertex_array(Some(self.vao));
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            gl.bind_vertex_array(None);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.use_program(None);
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -711,6 +1015,50 @@ impl LinuxDmabufImporter {
                 output_texture,
                 frame.width,
                 frame.height,
+                dmabuf_video_format(frame.format),
+                self.luma_tex,
+                self.chroma_tex,
+                self.chroma_v_tex,
+            )
+        })();
+
+        for image in images {
+            let _ = self.egl.destroy_image(display, image);
+        }
+
+        render_result
+    }
+
+    fn import_and_render_to_current(
+        &mut self,
+        gl: &glow::Context,
+        pipeline: &mut YuvPipeline,
+        frame: &LinuxDmaBufFrame,
+    ) -> Result<(), String> {
+        let display = self
+            .egl
+            .get_current_display()
+            .ok_or_else(|| "EGL current display unavailable".to_string())?;
+        let _context = self
+            .egl
+            .get_current_context()
+            .ok_or_else(|| "EGL current context unavailable".to_string())?;
+
+        let images = self.import_images(display, frame)?;
+        let render_result = (|| {
+            bind_egl_image(gl, self.image_target_texture_2d, self.luma_tex, images[0])?;
+            bind_egl_image(gl, self.image_target_texture_2d, self.chroma_tex, images[1])?;
+            if matches!(frame.format, LinuxDmaBufFormat::Yuv420p8) {
+                bind_egl_image(
+                    gl,
+                    self.image_target_texture_2d,
+                    self.chroma_v_tex,
+                    images[2],
+                )?;
+            }
+
+            pipeline.render_textures_to_current(
+                gl,
                 dmabuf_video_format(frame.format),
                 self.luma_tex,
                 self.chroma_tex,

@@ -2239,26 +2239,10 @@ impl eframe::App for StreamApp {
             let mut fb = self.frame.lock().unwrap();
             if fb.dirty && fb.width > 0 {
                 fb.dirty = false;
-                #[cfg(target_os = "macos")]
-                {
-                    if self.video_texture.stage_direct_frame(&fb) {
-                        self.debug_state.record_present(&fb, unix_time_micros());
-                        None
-                    } else {
-                        match self
-                            .video_texture
-                            .upload(frame, &fb, self.native_surfaces.as_ref())
-                        {
-                            Ok(()) => {
-                                self.debug_state.record_present(&fb, unix_time_micros());
-                                None
-                            }
-                            Err(err) => Some(err),
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
+                if self.video_texture.stage_direct_frame(&fb) {
+                    self.debug_state.record_present(&fb, unix_time_micros());
+                    None
+                } else {
                     match self
                         .video_texture
                         .upload(frame, &fb, self.native_surfaces.as_ref())
@@ -2310,12 +2294,9 @@ impl eframe::App for StreamApp {
                     let sized = egui::Vec2::new(tex_size.x * scale, tex_size.y * scale);
                     ui.centered_and_justified(|ui| {
                         let (rect, response) = ui.allocate_exact_size(sized, egui::Sense::click());
-                        #[cfg(target_os = "macos")]
                         let painted_direct = self
                             .video_texture
                             .paint_direct_if_available(frame, ui, rect);
-                        #[cfg(not(target_os = "macos"))]
-                        let painted_direct = false;
 
                         if !painted_direct {
                             if let Some(texture_id) = self.video_texture.texture_id() {

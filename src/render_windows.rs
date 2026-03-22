@@ -1,11 +1,18 @@
 use crate::video_frame::{WindowsComPtr, WindowsD3d11Frame};
-use eframe::glow;
+use eframe::{egui, egui_glow, glow};
+use glow::HasContext as _;
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::{Arc, Mutex};
 
 pub struct WindowsD3d11Importer {
     interop: WglDxInterop,
     state: Option<InteropState>,
+}
+
+#[derive(Clone, Default)]
+pub struct WindowsDirectVideoPresenter {
+    inner: Arc<Mutex<WindowsDirectVideoPresenterState>>,
 }
 
 struct InteropState {
@@ -22,6 +29,23 @@ struct InteropState {
     processor: WindowsComPtr,
     output_view: WindowsComPtr,
     registered_object: Handle,
+}
+
+#[derive(Default)]
+struct WindowsDirectVideoPresenterState {
+    enabled: bool,
+    logged_success: bool,
+    frame: Option<WindowsD3d11Frame>,
+    importer: Option<WindowsD3d11Importer>,
+    blit_pipeline: Option<DirectTextureBlitPipeline>,
+    output_texture: Option<glow::Texture>,
+    output_size: (u32, u32),
+}
+
+struct DirectTextureBlitPipeline {
+    program: glow::Program,
+    vao: glow::VertexArray,
+    _vbo: glow::Buffer,
 }
 
 type Handle = *mut c_void;
@@ -150,6 +174,48 @@ impl Drop for WindowsD3d11Importer {
     }
 }
 
+impl WindowsDirectVideoPresenter {
+    pub fn new() -> Self {
+        let mut state = WindowsDirectVideoPresenterState::default();
+        state.enabled = true;
+        Self {
+            inner: Arc::new(Mutex::new(state)),
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.inner.lock().unwrap().enabled
+    }
+
+    pub fn has_frame(&self) -> bool {
+        let state = self.inner.lock().unwrap();
+        state.enabled && state.frame.is_some()
+    }
+
+    pub fn clear(&self) {
+        let mut state = self.inner.lock().unwrap();
+        state.frame = None;
+    }
+
+    pub fn stage_frame(&self, frame: &WindowsD3d11Frame) {
+        let mut state = self.inner.lock().unwrap();
+        if state.enabled {
+            state.frame = Some(frame.clone());
+        }
+    }
+
+    pub fn paint_callback(&self, rect: egui::Rect) -> egui::PaintCallback {
+        let inner = Arc::clone(&self.inner);
+        egui::PaintCallback {
+            rect,
+            callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
+                let mut state = inner.lock().unwrap();
+                state.render(info, painter);
+            })),
+        }
+    }
+}
+
 impl InteropState {
     fn new(
         interop: &WglDxInterop,
@@ -215,6 +281,196 @@ impl InteropState {
             output_view,
             registered_object,
         })
+    }
+}
+
+impl WindowsDirectVideoPresenterState {
+    fn render(&mut self, info: egui::PaintCallbackInfo, painter: &egui_glow::Painter) {
+        if !self.enabled {
+            return;
+        }
+        let Some(frame) = self.frame.as_ref() else {
+            return;
+        };
+        let gl = painter.gl();
+
+        if self.importer.is_none() {
+            match WindowsD3d11Importer::new(gl.as_ref()) {
+                Ok(importer) => self.importer = Some(importer),
+                Err(err) => {
+                    eprintln!("[render] disabling Windows direct present path: {err}");
+                    self.disable();
+                    return;
+                }
+            }
+        }
+        if self.blit_pipeline.is_none() {
+            match DirectTextureBlitPipeline::new(gl.as_ref()) {
+                Ok(pipeline) => self.blit_pipeline = Some(pipeline),
+                Err(err) => {
+                    eprintln!("[render] disabling Windows direct present path: {err}");
+                    self.disable();
+                    return;
+                }
+            }
+        }
+
+        let output_texture =
+            match self.ensure_output_texture(gl.as_ref(), frame.width, frame.height) {
+                Ok(texture) => texture,
+                Err(err) => {
+                    eprintln!("[render] disabling Windows direct present path: {err}");
+                    self.disable();
+                    return;
+                }
+            };
+
+        let clip_rect = info.clip_rect_in_pixels();
+        unsafe {
+            gl.enable(glow::SCISSOR_TEST);
+            gl.scissor(
+                clip_rect.left_px,
+                clip_rect.from_bottom_px,
+                clip_rect.width_px,
+                clip_rect.height_px,
+            );
+        }
+
+        let result = (|| {
+            self.importer
+                .as_mut()
+                .expect("importer set")
+                .import_and_render(output_texture, frame)?;
+            self.blit_pipeline
+                .as_mut()
+                .expect("pipeline set")
+                .render_to_current(gl.as_ref(), output_texture)
+        })();
+
+        unsafe {
+            gl.disable(glow::SCISSOR_TEST);
+        }
+
+        if let Err(err) = result {
+            eprintln!("[render] disabling Windows direct present path: {err}");
+            self.disable();
+        } else if !self.logged_success {
+            eprintln!("[render] Windows direct present path enabled");
+            self.logged_success = true;
+        }
+    }
+
+    fn ensure_output_texture(
+        &mut self,
+        gl: &glow::Context,
+        width: u32,
+        height: u32,
+    ) -> Result<glow::Texture, String> {
+        if self.output_texture.is_none() {
+            self.output_texture = Some(unsafe { create_gl_texture(gl)? });
+        }
+
+        let texture = self
+            .output_texture
+            .ok_or_else(|| "missing direct-present output texture".to_string())?;
+        if self.output_size != (width, height) {
+            unsafe {
+                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA8 as i32,
+                    width as i32,
+                    height as i32,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(None),
+                );
+                gl.bind_texture(glow::TEXTURE_2D, None);
+            }
+            self.output_size = (width, height);
+        }
+
+        Ok(texture)
+    }
+
+    fn disable(&mut self) {
+        self.enabled = false;
+        self.logged_success = false;
+        self.frame = None;
+        self.importer = None;
+        self.blit_pipeline = None;
+        self.output_texture = None;
+        self.output_size = (0, 0);
+    }
+}
+
+impl DirectTextureBlitPipeline {
+    fn new(gl: &glow::Context) -> Result<Self, String> {
+        let program = unsafe { create_direct_texture_program(gl)? };
+        let vao = unsafe {
+            gl.create_vertex_array()
+                .map_err(|err| format!("create_vertex_array: {err}"))?
+        };
+        let vbo = unsafe {
+            gl.create_buffer()
+                .map_err(|err| format!("create_buffer: {err}"))?
+        };
+        let vertices: [f32; 16] = [
+            -1.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        ];
+        let vertex_bytes = unsafe {
+            std::slice::from_raw_parts(
+                vertices.as_ptr() as *const u8,
+                std::mem::size_of_val(&vertices),
+            )
+        };
+        let texture_uniform = unsafe { gl.get_uniform_location(program, "u_texture") }
+            .ok_or_else(|| "missing u_texture uniform".to_string())?;
+
+        unsafe {
+            gl.bind_vertex_array(Some(vao));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, vertex_bytes, glow::STATIC_DRAW);
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 16, 0);
+            gl.enable_vertex_attrib_array(1);
+            gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, 16, 8);
+            gl.bind_vertex_array(None);
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
+
+            gl.use_program(Some(program));
+            gl.uniform_1_i32(Some(&texture_uniform), 0);
+            gl.use_program(None);
+        }
+
+        Ok(Self {
+            program,
+            vao,
+            _vbo: vbo,
+        })
+    }
+
+    fn render_to_current(
+        &mut self,
+        gl: &glow::Context,
+        texture: glow::Texture,
+    ) -> Result<(), String> {
+        unsafe {
+            gl.disable(glow::BLEND);
+            gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::CULL_FACE);
+            gl.use_program(Some(self.program));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.bind_vertex_array(Some(self.vao));
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            gl.bind_vertex_array(None);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.use_program(None);
+        }
+        Ok(())
     }
 }
 
@@ -415,6 +671,92 @@ fn check_hr(hr: HRESULT, op: &str) -> Result<(), String> {
     } else {
         Err(format!("{op} failed: 0x{:08x}", hr as u32))
     }
+}
+
+unsafe fn create_gl_texture(gl: &glow::Context) -> Result<glow::Texture, String> {
+    let texture = gl
+        .create_texture()
+        .map_err(|err| format!("create_texture: {err}"))?;
+    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_MIN_FILTER,
+        glow::LINEAR as i32,
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_MAG_FILTER,
+        glow::LINEAR as i32,
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_WRAP_S,
+        glow::CLAMP_TO_EDGE as i32,
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_WRAP_T,
+        glow::CLAMP_TO_EDGE as i32,
+    );
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    Ok(texture)
+}
+
+unsafe fn create_direct_texture_program(gl: &glow::Context) -> Result<glow::Program, String> {
+    let version = gl.version();
+    let shader_header = if version.is_embedded {
+        "#version 300 es\nprecision mediump float;\n"
+    } else {
+        "#version 330 core\n"
+    };
+    let vertex_src = format!(
+        "{shader_header}layout(location = 0) in vec2 a_pos;\nlayout(location = 1) in vec2 a_uv;\nout vec2 v_uv;\nvoid main() {{\n    v_uv = a_uv;\n    gl_Position = vec4(a_pos, 0.0, 1.0);\n}}\n"
+    );
+    let fragment_src = format!(
+        "{shader_header}in vec2 v_uv;\nout vec4 frag_color;\nuniform sampler2D u_texture;\nvoid main() {{\n    frag_color = texture(u_texture, v_uv);\n}}\n"
+    );
+
+    let vertex = gl
+        .create_shader(glow::VERTEX_SHADER)
+        .map_err(|err| format!("create vertex shader: {err}"))?;
+    gl.shader_source(vertex, &vertex_src);
+    gl.compile_shader(vertex);
+    if !gl.get_shader_compile_status(vertex) {
+        let log = gl.get_shader_info_log(vertex);
+        gl.delete_shader(vertex);
+        return Err(format!("vertex shader compile failed: {log}"));
+    }
+
+    let fragment = gl
+        .create_shader(glow::FRAGMENT_SHADER)
+        .map_err(|err| format!("create fragment shader: {err}"))?;
+    gl.shader_source(fragment, &fragment_src);
+    gl.compile_shader(fragment);
+    if !gl.get_shader_compile_status(fragment) {
+        let log = gl.get_shader_info_log(fragment);
+        gl.delete_shader(vertex);
+        gl.delete_shader(fragment);
+        return Err(format!("fragment shader compile failed: {log}"));
+    }
+
+    let program = gl
+        .create_program()
+        .map_err(|err| format!("create program: {err}"))?;
+    gl.attach_shader(program, vertex);
+    gl.attach_shader(program, fragment);
+    gl.link_program(program);
+    gl.detach_shader(program, vertex);
+    gl.detach_shader(program, fragment);
+    gl.delete_shader(vertex);
+    gl.delete_shader(fragment);
+
+    if !gl.get_program_link_status(program) {
+        let log = gl.get_program_info_log(program);
+        gl.delete_program(program);
+        return Err(format!("shader link failed: {log}"));
+    }
+
+    Ok(program)
 }
 
 fn texture_name(texture: glow::Texture) -> GLuint {
