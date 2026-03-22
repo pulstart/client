@@ -209,6 +209,7 @@ struct MetalVideoRenderer {
 impl MetalVideoRenderer {
     fn new(frame: &Frame) -> Result<Self, String> {
         let root_view = root_ns_view(frame)?;
+        configure_window_for_underlay(root_view)?;
         let parent_view = superview(root_view)?;
         let device =
             Device::system_default().ok_or_else(|| "Metal device unavailable".to_string())?;
@@ -513,6 +514,33 @@ fn root_ns_view(frame: &Frame) -> Result<NonNull<Object>, String> {
         RawWindowHandle::AppKit(appkit) => Ok(appkit.ns_view.cast()),
         other => Err(format!("unsupported macOS window handle: {other:?}")),
     }
+}
+
+fn configure_window_for_underlay(view: NonNull<Object>) -> Result<(), String> {
+    let window: *mut Object = unsafe { msg_send![view.as_ptr(), window] };
+    let window =
+        NonNull::new(window).ok_or_else(|| "AppKit window unavailable for Metal presenter".to_string())?;
+    let clear_color: *mut Object = unsafe { msg_send![class!(NSColor), clearColor] };
+
+    unsafe {
+        let () = msg_send![window.as_ptr(), setOpaque: NO];
+        if !clear_color.is_null() {
+            let () = msg_send![window.as_ptr(), setBackgroundColor: clear_color];
+        }
+
+        let root_layer: *mut Object = msg_send![view.as_ptr(), layer];
+        if let Some(root_layer) = NonNull::new(root_layer) {
+            let () = msg_send![root_layer.as_ptr(), setOpaque: NO];
+            if !clear_color.is_null() {
+                let cg_color: *mut c_void = msg_send![clear_color, CGColor];
+                if !cg_color.is_null() {
+                    let () = msg_send![root_layer.as_ptr(), setBackgroundColor: cg_color];
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn superview(view: NonNull<Object>) -> Result<NonNull<Object>, String> {

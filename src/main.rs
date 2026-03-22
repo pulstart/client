@@ -2359,6 +2359,10 @@ impl eframe::App for StreamApp {
         if *self.state.lock().unwrap() == ConnectionState::Connected {
             [0.0, 0.0, 0.0, 0.0]
         } else {
+            #[cfg(target_os = "macos")]
+            {
+                return egui::Color32::from_rgb(12, 12, 12).to_normalized_gamma_f32();
+            }
             egui::Color32::from_rgba_unmultiplied(12, 12, 12, 180).to_normalized_gamma_f32()
         }
     }
@@ -2544,10 +2548,18 @@ impl eframe::App for StreamApp {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    let viewport = egui::ViewportBuilder::default()
+        .with_title("Stream Client")
+        .with_inner_size([1280.0, 720.0])
+        .with_transparent(true);
+    #[cfg(not(target_os = "macos"))]
+    let viewport = egui::ViewportBuilder::default()
+        .with_title("Stream Client")
+        .with_inner_size([1280.0, 720.0]);
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Stream Client")
-            .with_inner_size([1280.0, 720.0]),
+        viewport,
         renderer: eframe::Renderer::Glow,
         vsync: display::vsync_enabled(),
         ..Default::default()
