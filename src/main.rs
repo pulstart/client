@@ -3,6 +3,7 @@ mod debug_state;
 mod decode;
 mod display;
 mod input;
+mod keep_awake;
 mod pipeline;
 mod render_gl;
 #[cfg(target_os = "macos")]
@@ -16,6 +17,7 @@ mod video_frame;
 
 use eframe::egui;
 use input::{LocalCaptureMode, LocalKeyboardState, RemoteCursorTexture, SharedInputState};
+use keep_awake::KeepAwakeController;
 use render_gl::NativeVideoTexture;
 use st_protocol::{
     ClientDisplayInfo, ClockSyncPing, ControlMessage, ControllerState, InputPacket, KeyboardKey,
@@ -39,6 +41,8 @@ use crate::debug_state::{unix_time_micros, ConnectionDebugSnapshot, ConnectionDe
 
 const UDP_PORT: u16 = 5000;
 const MAX_REMOTE_CURSOR_TEXTURES: usize = 8;
+const CURSOR_PREDICTION_RECENT_MS: u64 = 120;
+const CURSOR_PREDICTION_SNAP_DISTANCE: f32 = 96.0;
 
 fn trace_enabled() -> bool {
     std::env::var_os("ST_TRACE").is_some()
@@ -82,6 +86,7 @@ struct StreamApp {
     frame: Arc<Mutex<VideoFrameBuffer>>,
     debug_state: Arc<ConnectionDebugState>,
     video_texture: NativeVideoTexture,
+    keep_awake: KeepAwakeController,
     native_surfaces: Arc<NativeSurfaceControl>,
     disconnect_flag: Arc<AtomicBool>,
     connection_epoch: Arc<AtomicU64>,
@@ -96,6 +101,9 @@ struct StreamApp {
     remote_cursor_textures: BTreeMap<u64, RemoteCursorTexture>,
     latest_remote_cursor_serial: Option<u64>,
     seen_cursor_shape_version: u64,
+    seen_cursor_state_version: u64,
+    predicted_cursor_stream_pos: Option<egui::Pos2>,
+    last_local_cursor_motion: Option<Instant>,
     debug_overlay_tab: DebugOverlayTab,
     menu_open: bool,
     local_overlay_hit_rects: Vec<egui::Rect>,
@@ -188,6 +196,7 @@ impl StreamApp {
             frame: Arc::new(Mutex::new(VideoFrameBuffer::default())),
             debug_state: Arc::new(ConnectionDebugState::new()),
             video_texture,
+            keep_awake: KeepAwakeController::new(),
             native_surfaces,
             disconnect_flag: Arc::new(AtomicBool::new(false)),
             connection_epoch: Arc::new(AtomicU64::new(0)),
@@ -202,6 +211,9 @@ impl StreamApp {
             remote_cursor_textures: BTreeMap::new(),
             latest_remote_cursor_serial: None,
             seen_cursor_shape_version: 0,
+            seen_cursor_state_version: 0,
+            predicted_cursor_stream_pos: None,
+            last_local_cursor_motion: None,
             debug_overlay_tab: DebugOverlayTab::General,
             menu_open: false,
             local_overlay_hit_rects: Vec::new(),
@@ -228,6 +240,9 @@ impl StreamApp {
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
         self.seen_cursor_shape_version = 0;
+        self.seen_cursor_state_version = 0;
+        self.predicted_cursor_stream_pos = None;
+        self.last_local_cursor_motion = None;
         self.shared_input.reset();
         self.audio_enabled_flag
             .store(self.audio_enabled, Ordering::SeqCst);
@@ -292,6 +307,9 @@ impl StreamApp {
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
         self.seen_cursor_shape_version = 0;
+        self.seen_cursor_state_version = 0;
+        self.predicted_cursor_stream_pos = None;
+        self.last_local_cursor_motion = None;
         self.menu_open = false;
         self.local_overlay_hit_rects.clear();
         let mut s = self.state.lock().unwrap();
@@ -314,6 +332,9 @@ impl StreamApp {
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
         self.seen_cursor_shape_version = 0;
+        self.seen_cursor_state_version = 0;
+        self.predicted_cursor_stream_pos = None;
+        self.last_local_cursor_motion = None;
         self.last_video_rect = None;
         self.menu_open = false;
         self.local_overlay_hit_rects.clear();
@@ -362,6 +383,67 @@ impl StreamApp {
             .any(|rect| rect.contains(pos))
     }
 
+    fn stream_bounds(&self) -> Option<(f32, f32)> {
+        let size = self.video_texture.size_vec2();
+        if size.x >= 1.0 && size.y >= 1.0 {
+            Some((size.x, size.y))
+        } else {
+            None
+        }
+    }
+
+    fn clamp_stream_pos(&self, pos: egui::Pos2) -> egui::Pos2 {
+        if let Some((width, height)) = self.stream_bounds() {
+            egui::pos2(
+                pos.x.clamp(0.0, (width - 1.0).max(0.0)),
+                pos.y.clamp(0.0, (height - 1.0).max(0.0)),
+            )
+        } else {
+            pos
+        }
+    }
+
+    fn map_video_pos_to_stream(&self, pos: egui::Pos2, rect: egui::Rect) -> egui::Pos2 {
+        let (width, height) = self
+            .stream_bounds()
+            .unwrap_or((rect.width().max(1.0), rect.height().max(1.0)));
+        let x = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0) * width;
+        let y = ((pos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0) * height;
+        self.clamp_stream_pos(egui::pos2(x, y))
+    }
+
+    fn sync_cursor_prediction(&mut self) {
+        let snapshot = self.shared_input.snapshot();
+        if snapshot.cursor_state_version == self.seen_cursor_state_version {
+            return;
+        }
+
+        self.seen_cursor_state_version = snapshot.cursor_state_version;
+        let server_pos = self.clamp_stream_pos(egui::pos2(
+            snapshot.cursor_state.x as f32,
+            snapshot.cursor_state.y as f32,
+        ));
+        let local_motion_recent = self
+            .last_local_cursor_motion
+            .map(|t| t.elapsed() <= Duration::from_millis(CURSOR_PREDICTION_RECENT_MS))
+            .unwrap_or(false);
+
+        self.predicted_cursor_stream_pos = match self.predicted_cursor_stream_pos {
+            None => Some(server_pos),
+            Some(predicted)
+                if self.capture_mode == LocalCaptureMode::CapturedRelative && local_motion_recent =>
+            {
+                let delta = server_pos - predicted;
+                if delta.length() > CURSOR_PREDICTION_SNAP_DISTANCE {
+                    Some(server_pos)
+                } else {
+                    Some(predicted)
+                }
+            }
+            Some(_) => Some(server_pos),
+        };
+    }
+
     fn remote_cursor_texture_for_serial(&self, serial: u64) -> Option<&RemoteCursorTexture> {
         if serial != 0 {
             if let Some(texture) = self.remote_cursor_textures.get(&serial) {
@@ -388,7 +470,7 @@ impl StreamApp {
             LocalCaptureMode::HoverAbsolute => ctx
                 .input(|i| i.pointer.latest_pos())
                 .zip(self.last_video_rect)
-                .map(|(pos, rect)| rect.contains(pos))
+                .map(|(pos, rect)| rect.contains(pos) && !self.pointer_over_local_overlay(pos))
                 .unwrap_or(false),
             LocalCaptureMode::CapturedRelative => true,
             _ => false,
@@ -531,13 +613,19 @@ impl StreamApp {
         {
             let pointer_pos = ctx
                 .input(|i| i.pointer.latest_pos())
-                .filter(|pos| video_rect.contains(*pos))?;
+                .filter(|pos| video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos))?;
             (pointer_pos, true)
         } else {
+            let predicted_stream_pos = self.predicted_cursor_stream_pos.unwrap_or_else(|| {
+                self.clamp_stream_pos(egui::pos2(
+                    input_snapshot.cursor_state.x as f32,
+                    input_snapshot.cursor_state.y as f32,
+                ))
+            });
             (
                 egui::pos2(
-                    video_rect.left() + input_snapshot.cursor_state.x as f32 * scale_x,
-                    video_rect.top() + input_snapshot.cursor_state.y as f32 * scale_y,
+                    video_rect.left() + predicted_stream_pos.x * scale_x,
+                    video_rect.top() + predicted_stream_pos.y * scale_y,
                 ),
                 false,
             )
@@ -658,6 +746,29 @@ impl StreamApp {
             lines.push("mapped: -".to_string());
         }
 
+        lines.push(format!(
+            "predict: pos={} local_recent={} server_delta={}",
+            format_pos_opt(self.predicted_cursor_stream_pos),
+            if self
+                .last_local_cursor_motion
+                .map(|t| t.elapsed() <= Duration::from_millis(CURSOR_PREDICTION_RECENT_MS))
+                .unwrap_or(false)
+            {
+                "y"
+            } else {
+                "n"
+            },
+            self.predicted_cursor_stream_pos
+                .map(|predicted| {
+                    let server = egui::pos2(
+                        input_snapshot.cursor_state.x as f32,
+                        input_snapshot.cursor_state.y as f32,
+                    );
+                    format_vec2(server - predicted)
+                })
+                .unwrap_or_else(|| "-".to_string()),
+        ));
+
         lines
     }
 
@@ -675,7 +786,7 @@ impl StreamApp {
             snapshot.capabilities.mouse_absolute && snapshot.capabilities.separate_cursor;
         let pointer_over_video = ctx
             .input(|i| i.pointer.latest_pos())
-            .map(|pos| response.rect.contains(pos))
+            .map(|pos| response.rect.contains(pos) && !self.pointer_over_local_overlay(pos))
             .unwrap_or(false);
         if snapshot.controller_state != ControllerState::OwnedByYou
             && matches!(
@@ -2491,8 +2602,11 @@ impl eframe::App for StreamApp {
             self.clear_local_session_interaction();
             self.video_texture.clear_frame();
         }
+        self.keep_awake
+            .set_active(matches!(state, ConnectionState::Connected));
         self.apply_pointer_capture_mode(ctx);
         self.sync_remote_cursor_texture(ctx);
+        self.sync_cursor_prediction();
         let recent_pointer_activity = self
             .last_pointer_move
             .map(|t| t.elapsed() < Duration::from_secs(3))
@@ -2648,7 +2762,7 @@ impl eframe::App for StreamApp {
         }
     }
 
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         if *self.state.lock().unwrap() != ConnectionState::Connected {
             return;
         }
@@ -2723,6 +2837,9 @@ impl eframe::App for StreamApp {
                     {
                         if let Some(rect) = video_rect {
                             if rect.contains(pos) && !self.pointer_over_local_overlay(pos) {
+                                self.predicted_cursor_stream_pos =
+                                    Some(self.map_video_pos_to_stream(pos, rect));
+                                self.last_local_cursor_motion = Some(Instant::now());
                                 self.send_input_packet(InputPacket::MouseAbsolute(
                                     MouseAbsoluteInput {
                                         client_id,
@@ -2742,6 +2859,16 @@ impl eframe::App for StreamApp {
                         let dx = delta.x.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                         let dy = delta.y.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                         if dx != 0 || dy != 0 {
+                            let base = self.predicted_cursor_stream_pos.unwrap_or_else(|| {
+                                self.clamp_stream_pos(egui::pos2(
+                                    snapshot.cursor_state.x as f32,
+                                    snapshot.cursor_state.y as f32,
+                                ))
+                            });
+                            self.predicted_cursor_stream_pos = Some(self.clamp_stream_pos(
+                                egui::pos2(base.x + dx as f32, base.y + dy as f32),
+                            ));
+                            self.last_local_cursor_motion = Some(Instant::now());
                             self.send_input_packet(InputPacket::MouseRelative(
                                 MouseRelativeInput {
                                     client_id,
@@ -2750,6 +2877,7 @@ impl eframe::App for StreamApp {
                                     buttons: self.pointer_buttons,
                                 },
                             ));
+                            ctx.request_repaint();
                         }
                     }
                 }

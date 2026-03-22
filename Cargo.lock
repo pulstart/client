@@ -2996,6 +2996,7 @@ dependencies = [
 name = "st-client"
 version = "0.1.0"
 dependencies = [
+ "core-foundation 0.10.1",
  "core-graphics-types 0.2.0",
  "cpal",
  "crossbeam-channel",
@@ -3008,6 +3009,8 @@ dependencies = [
  "opus",
  "raw-window-handle",
  "st-protocol",
+ "windows-sys 0.61.2",
+ "zbus",
 ]
 
 [[package]]

@@ -14,7 +14,14 @@ khronos-egl = { version = "6", features = ["dynamic"] }
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
 core-graphics-types = "0.2"
 metal = "0.32"
 objc = "0.2"
 raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5.14"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
