@@ -58,6 +58,7 @@ impl RepaintPacer {
 pub fn run_receive_pipeline(
     frame_buf: Arc<Mutex<VideoFrameBuffer>>,
     debug_state: Arc<ConnectionDebugState>,
+    debug_enabled: Arc<AtomicBool>,
     ctx: egui::Context,
     shutdown_rx: Receiver<()>,
     audio_tx: Sender<AudioPacket>,
@@ -104,7 +105,9 @@ pub fn run_receive_pipeline(
             Some(d) => d,
             None => {
                 if let Some(stats) = receiver.take_stats() {
-                    debug_state.update_transport_window(&stats);
+                    if debug_enabled.load(Ordering::Relaxed) {
+                        debug_state.update_transport_window(&stats);
+                    }
                     maybe_request_transport_recovery_keyframe(
                         stats,
                         &control_tx,
@@ -119,7 +122,9 @@ pub fn run_receive_pipeline(
         };
 
         if let Some(stats) = receiver.take_stats() {
-            debug_state.update_transport_window(&stats);
+            if debug_enabled.load(Ordering::Relaxed) {
+                debug_state.update_transport_window(&stats);
+            }
             maybe_request_transport_recovery_keyframe(
                 stats,
                 &control_tx,
@@ -212,8 +217,10 @@ pub fn run_receive_pipeline(
 
                 if produced_frame {
                     decoded_frame.debug_timing = latest_timing;
-                    if let Some(timing) = decoded_frame.debug_timing.as_ref() {
-                        debug_state.record_decoded(timing);
+                    if debug_enabled.load(Ordering::Relaxed) {
+                        if let Some(timing) = decoded_frame.debug_timing.as_ref() {
+                            debug_state.record_decoded(timing);
+                        }
                     }
                     let mut fb = frame_buf.lock().unwrap();
                     std::mem::swap(&mut *fb, &mut decoded_frame);

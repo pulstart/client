@@ -52,12 +52,32 @@ enum ConnectionState {
     Error(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DebugOverlayTab {
+    General,
+    Cursor,
+}
+
+struct CursorOverlayGeometry {
+    texture_id: egui::TextureId,
+    serial: u64,
+    rect: egui::Rect,
+    source_size: egui::Vec2,
+    hotspot: egui::Vec2,
+    cursor_pos: egui::Pos2,
+    scale_x: f32,
+    scale_y: f32,
+    display_scale: f32,
+    using_pointer_pos: bool,
+}
+
 struct StreamApp {
     server_addr: String,
     audio_enabled: bool,
     debug_enabled: bool,
     display_refresh_millihz: Option<u32>,
     audio_enabled_flag: Arc<AtomicBool>,
+    debug_enabled_flag: Arc<AtomicBool>,
     state: Arc<Mutex<ConnectionState>>,
     frame: Arc<Mutex<VideoFrameBuffer>>,
     debug_state: Arc<ConnectionDebugState>,
@@ -76,6 +96,7 @@ struct StreamApp {
     remote_cursor_textures: BTreeMap<u64, RemoteCursorTexture>,
     latest_remote_cursor_serial: Option<u64>,
     seen_cursor_shape_version: u64,
+    debug_overlay_tab: DebugOverlayTab,
     menu_open: bool,
     local_overlay_hit_rects: Vec<egui::Rect>,
     last_pointer_move: Option<Instant>,
@@ -162,6 +183,7 @@ impl StreamApp {
             debug_enabled,
             display_refresh_millihz,
             audio_enabled_flag: Arc::new(AtomicBool::new(audio)),
+            debug_enabled_flag: Arc::new(AtomicBool::new(debug_enabled)),
             state: Arc::new(Mutex::new(ConnectionState::Disconnected)),
             frame: Arc::new(Mutex::new(VideoFrameBuffer::default())),
             debug_state: Arc::new(ConnectionDebugState::new()),
@@ -180,6 +202,7 @@ impl StreamApp {
             remote_cursor_textures: BTreeMap::new(),
             latest_remote_cursor_serial: None,
             seen_cursor_shape_version: 0,
+            debug_overlay_tab: DebugOverlayTab::General,
             menu_open: false,
             local_overlay_hit_rects: Vec::new(),
             last_pointer_move: None,
@@ -223,6 +246,7 @@ impl StreamApp {
         let disconnect = disconnect_flag;
         let connection_epoch = Arc::clone(&self.connection_epoch);
         let audio_flag = Arc::clone(&self.audio_enabled_flag);
+        let debug_enabled_flag = Arc::clone(&self.debug_enabled_flag);
         let debug_state = Arc::clone(&self.debug_state);
         let native_surfaces = Arc::clone(&self.native_surfaces);
         let display_refresh_millihz = self.display_refresh_millihz;
@@ -240,6 +264,7 @@ impl StreamApp {
                 connection_epoch,
                 session_epoch,
                 audio_flag,
+                debug_enabled_flag,
                 native_surfaces,
                 shared_input,
                 control_rx,
@@ -455,6 +480,187 @@ impl StreamApp {
         }
     }
 
+    fn compute_cursor_overlay_geometry(
+        &self,
+        ctx: &egui::Context,
+        stream_size: egui::Vec2,
+        input_snapshot: &input::SharedInputSnapshot,
+    ) -> Option<CursorOverlayGeometry> {
+        if !matches!(
+            self.capture_mode,
+            LocalCaptureMode::HoverAbsolute | LocalCaptureMode::CapturedRelative
+        ) {
+            return None;
+        }
+        if input_snapshot.controller_state != ControllerState::OwnedByYou
+            || !input_snapshot.capabilities.separate_cursor
+            || !input_snapshot.cursor_state.visible
+        {
+            return None;
+        }
+
+        let texture = self.remote_cursor_texture_for_serial(input_snapshot.cursor_state.serial)?;
+        let video_rect = self.last_video_rect?;
+        let scale_x = if stream_size.x > 0.0 {
+            video_rect.width() / stream_size.x
+        } else {
+            1.0
+        };
+        let scale_y = if stream_size.y > 0.0 {
+            video_rect.height() / stream_size.y
+        } else {
+            1.0
+        };
+        let display_scale = if stream_size.x > 0.0 && stream_size.y > 0.0 {
+            (video_rect.width() / stream_size.x).min(video_rect.height() / stream_size.y)
+        } else {
+            1.0
+        };
+        let pixels_per_point = ctx.pixels_per_point().max(1.0);
+        let snap = |value: f32| (value * pixels_per_point).round() / pixels_per_point;
+        let size = egui::vec2(
+            snap((texture.size.x * display_scale).max(1.0)),
+            snap((texture.size.y * display_scale).max(1.0)),
+        );
+        let hotspot = egui::vec2(
+            snap(texture.hotspot.x * display_scale),
+            snap(texture.hotspot.y * display_scale),
+        );
+
+        let (cursor_pos, using_pointer_pos) = if self.capture_mode == LocalCaptureMode::HoverAbsolute
+        {
+            let pointer_pos = ctx
+                .input(|i| i.pointer.latest_pos())
+                .filter(|pos| video_rect.contains(*pos))?;
+            (pointer_pos, true)
+        } else {
+            (
+                egui::pos2(
+                    video_rect.left() + input_snapshot.cursor_state.x as f32 * scale_x,
+                    video_rect.top() + input_snapshot.cursor_state.y as f32 * scale_y,
+                ),
+                false,
+            )
+        };
+
+        let top_left = egui::pos2(snap(cursor_pos.x - hotspot.x), snap(cursor_pos.y - hotspot.y));
+        let rect = egui::Rect::from_min_size(top_left, size);
+        if rect.max.x <= video_rect.left()
+            || rect.max.y <= video_rect.top()
+            || rect.min.x >= video_rect.right()
+            || rect.min.y >= video_rect.bottom()
+        {
+            return None;
+        }
+
+        Some(CursorOverlayGeometry {
+            texture_id: texture.texture.id(),
+            serial: input_snapshot.cursor_state.serial,
+            rect,
+            source_size: texture.size,
+            hotspot,
+            cursor_pos,
+            scale_x,
+            scale_y,
+            display_scale,
+            using_pointer_pos,
+        })
+    }
+
+    fn cursor_debug_lines(
+        &self,
+        ctx: &egui::Context,
+        input_snapshot: &input::SharedInputSnapshot,
+    ) -> Vec<String> {
+        let stream_size = self.video_texture.size_vec2();
+        let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
+        let over_video = pointer_pos
+            .zip(self.last_video_rect)
+            .map(|(pos, rect)| rect.contains(pos))
+            .unwrap_or(false);
+        let over_local_overlay = pointer_pos
+            .map(|pos| self.pointer_over_local_overlay(pos))
+            .unwrap_or(false);
+        let active_texture = self.remote_cursor_texture_for_serial(input_snapshot.cursor_state.serial);
+        let overlay_geometry =
+            self.compute_cursor_overlay_geometry(ctx, stream_size, input_snapshot);
+        let mut lines = vec![
+            format!(
+                "cursor: mode={} controller={:?} visible={} separate={} overlay_active={} native_fallback={}",
+                self.capture_mode.label(),
+                input_snapshot.controller_state,
+                if input_snapshot.cursor_state.visible { "y" } else { "n" },
+                if input_snapshot.capabilities.separate_cursor { "y" } else { "n" },
+                if overlay_geometry.is_some() { "y" } else { "n" },
+                if self.native_cursor_fallback_active() { "y" } else { "n" },
+            ),
+            format!(
+                "cursor: serial={} shape_cached={} latest_shape={} shape_ver={} state_ver={}",
+                input_snapshot.cursor_state.serial,
+                if active_texture.is_some() { "y" } else { "n" },
+                self.latest_remote_cursor_serial
+                    .map(|serial| serial.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                input_snapshot.cursor_shape_version,
+                input_snapshot.cursor_state_version,
+            ),
+            format!(
+                "stream: size={}x{}  video_rect={}",
+                stream_size.x.round() as i32,
+                stream_size.y.round() as i32,
+                format_rect_opt(self.last_video_rect),
+            ),
+            format!(
+                "pointer: pos={} over_video={} over_local_ui={}",
+                format_pos_opt(pointer_pos),
+                if over_video { "y" } else { "n" },
+                if over_local_overlay { "y" } else { "n" },
+            ),
+            format!(
+                "server: pos=({}, {}) visible={} serial={}",
+                input_snapshot.cursor_state.x,
+                input_snapshot.cursor_state.y,
+                if input_snapshot.cursor_state.visible { "y" } else { "n" },
+                input_snapshot.cursor_state.serial,
+            ),
+        ];
+
+        if let Some(texture) = active_texture {
+            lines.push(format!(
+                "shape: source={}x{} hotspot=({}, {})",
+                texture.size.x.round() as i32,
+                texture.size.y.round() as i32,
+                texture.hotspot.x.round() as i32,
+                texture.hotspot.y.round() as i32,
+            ));
+        } else {
+            lines.push("shape: -".to_string());
+        }
+
+        if let Some(geometry) = overlay_geometry {
+            lines.push(format!(
+                "mapped: serial={} pos={} rect={} pointer_driven={}",
+                geometry.serial,
+                format_pos(geometry.cursor_pos),
+                format_rect(geometry.rect),
+                if geometry.using_pointer_pos { "y" } else { "n" },
+            ));
+            lines.push(format!(
+                "mapped: source={}x{} hotspot={} scale=({:.4}, {:.4}) display_scale={:.4}",
+                geometry.source_size.x.round() as i32,
+                geometry.source_size.y.round() as i32,
+                format_vec2(geometry.hotspot),
+                geometry.scale_x,
+                geometry.scale_y,
+                geometry.display_scale,
+            ));
+        } else {
+            lines.push("mapped: -".to_string());
+        }
+
+        lines
+    }
+
     fn handle_connected_video_response(
         &mut self,
         ctx: &egui::Context,
@@ -540,81 +746,16 @@ impl StreamApp {
     }
 
     fn draw_remote_cursor_overlay(&self, ctx: &egui::Context, stream_size: egui::Vec2) {
-        if !matches!(
-            self.capture_mode,
-            LocalCaptureMode::HoverAbsolute | LocalCaptureMode::CapturedRelative
-        ) {
-            return;
-        }
-
         let snapshot = self.shared_input.snapshot();
-        if snapshot.controller_state != ControllerState::OwnedByYou
-            || !snapshot.capabilities.separate_cursor
-            || !snapshot.cursor_state.visible
-        {
-            return;
-        }
-        let Some(texture) = self.remote_cursor_texture_for_serial(snapshot.cursor_state.serial)
-        else {
+        let Some(geometry) = self.compute_cursor_overlay_geometry(ctx, stream_size, &snapshot) else {
             return;
         };
-        let Some(video_rect) = self.last_video_rect else {
-            return;
-        };
-
-        let scale_x = if stream_size.x > 0.0 {
-            video_rect.width() / stream_size.x
-        } else {
-            1.0
-        };
-        let scale_y = if stream_size.y > 0.0 {
-            video_rect.height() / stream_size.y
-        } else {
-            1.0
-        };
-        let display_scale = if stream_size.x > 0.0 && stream_size.y > 0.0 {
-            (video_rect.width() / stream_size.x).min(video_rect.height() / stream_size.y)
-        } else {
-            1.0
-        };
-        let pixels_per_point = ctx.pixels_per_point().max(1.0);
-        let snap = |value: f32| (value * pixels_per_point).round() / pixels_per_point;
-        let size = egui::vec2(
-            snap((texture.size.x * display_scale).max(1.0)),
-            snap((texture.size.y * display_scale).max(1.0)),
-        );
-        let hotspot = egui::vec2(
-            snap(texture.hotspot.x * display_scale),
-            snap(texture.hotspot.y * display_scale),
-        );
-        let cursor_pos = if self.capture_mode == LocalCaptureMode::HoverAbsolute {
-            let Some(pointer_pos) = ctx
-                .input(|i| i.pointer.latest_pos())
-                .filter(|pos| video_rect.contains(*pos))
-            else {
-                return;
-            };
-            pointer_pos
-        } else {
-            egui::pos2(
-                video_rect.left() + snapshot.cursor_state.x as f32 * scale_x,
-                video_rect.top() + snapshot.cursor_state.y as f32 * scale_y,
-            )
-        };
-        let top_left = egui::pos2(snap(cursor_pos.x - hotspot.x), snap(cursor_pos.y - hotspot.y));
-        let rect = egui::Rect::from_min_size(top_left, size);
-        if rect.max.x <= video_rect.left()
-            || rect.max.y <= video_rect.top()
-            || rect.min.x >= video_rect.right()
-            || rect.min.y >= video_rect.bottom()
-        {
-            return;
-        }
         egui::Area::new(egui::Id::new("remote_cursor_overlay"))
             .order(egui::Order::Tooltip)
-            .fixed_pos(rect.min)
+            .fixed_pos(geometry.rect.min)
             .show(ctx, |ui| {
-                let sized = egui::load::SizedTexture::new(texture.texture.id(), size);
+                let sized =
+                    egui::load::SizedTexture::new(geometry.texture_id, geometry.rect.size());
                 ui.image(sized);
             });
     }
@@ -932,6 +1073,8 @@ impl StreamApp {
                 if debug_changed {
                     self.debug_enabled = !self.debug_enabled;
                     save_debug_enabled(self.debug_enabled);
+                    self.debug_enabled_flag
+                        .store(self.debug_enabled, Ordering::SeqCst);
                 }
 
                 ui.add_space(14.0);
@@ -1096,6 +1239,8 @@ impl StreamApp {
             if debug_toggled {
                 self.debug_enabled = !self.debug_enabled;
                 save_debug_enabled(self.debug_enabled);
+                self.debug_enabled_flag
+                    .store(self.debug_enabled, Ordering::SeqCst);
             }
             if request_disconnect {
                 self.disconnect();
@@ -1135,6 +1280,7 @@ fn start_media_threads(
     socket_addr: std::net::SocketAddr,
     frame_buf: Arc<Mutex<VideoFrameBuffer>>,
     debug_state: Arc<ConnectionDebugState>,
+    debug_enabled: Arc<AtomicBool>,
     ctx: egui::Context,
     display_refresh_millihz: Option<u32>,
     audio_enabled: Arc<AtomicBool>,
@@ -1167,6 +1313,7 @@ fn start_media_threads(
         pipeline::run_receive_pipeline(
             pipeline_frame,
             pipeline_debug_state,
+            debug_enabled,
             pipeline_ctx,
             video_stop_rx,
             audio_data_tx,
@@ -1217,6 +1364,7 @@ fn run_connection(
     connection_epoch: Arc<AtomicU64>,
     session_epoch: u64,
     audio_enabled: Arc<AtomicBool>,
+    debug_enabled: Arc<AtomicBool>,
     native_surfaces: Arc<NativeSurfaceControl>,
     shared_input: Arc<SharedInputState>,
     control_rx: crossbeam_channel::Receiver<ControlMessage>,
@@ -1380,6 +1528,7 @@ fn run_connection(
                                     socket_addr,
                                     Arc::clone(&frame_buf),
                                     Arc::clone(&debug_state),
+                                    Arc::clone(&debug_enabled),
                                     ctx.clone(),
                                     display_refresh_millihz,
                                     Arc::clone(&audio_enabled),
@@ -1433,7 +1582,9 @@ fn run_connection(
                             debug_state.set_session_info(info);
                         }
                         ControlMessage::ClockSyncPong(pong) => {
-                            debug_state.update_clock_sync(pong, unix_time_micros());
+                            if debug_enabled.load(Ordering::Relaxed) {
+                                debug_state.update_clock_sync(pong, unix_time_micros());
+                            }
                         }
                         ControlMessage::InputSession(session) => {
                             shared_input.set_client_id(session.client_id);
@@ -1575,6 +1726,7 @@ fn run_connection(
     // TCP control loop — check for server messages, disconnect flag, and audio toggle
     control_buf.clear();
     let mut last_audio_state = initial_audio;
+    let mut last_debug_enabled = debug_enabled.load(Ordering::SeqCst);
     let mut next_clock_ping = Instant::now();
     loop {
         if session_cancelled(
@@ -1591,6 +1743,11 @@ fn run_connection(
             last_audio_state = current_audio;
             let _ = tcp.write_all(&ControlMessage::SetAudio(current_audio).serialize());
         }
+        let current_debug_enabled = debug_enabled.load(Ordering::SeqCst);
+        if current_debug_enabled && !last_debug_enabled {
+            next_clock_ping = Instant::now();
+        }
+        last_debug_enabled = current_debug_enabled;
         while let Ok(msg) = control_rx.try_recv() {
             let _ = tcp.write_all(&msg.serialize());
         }
@@ -1605,7 +1762,7 @@ fn run_connection(
                 break;
             }
         }
-        if Instant::now() >= next_clock_ping {
+        if current_debug_enabled && Instant::now() >= next_clock_ping {
             let ping = ControlMessage::ClockSyncPing(ClockSyncPing {
                 client_send_micros: unix_time_micros(),
             });
@@ -1627,7 +1784,9 @@ fn run_connection(
                             debug_state.set_session_info(info);
                         }
                         ControlMessage::ClockSyncPong(pong) => {
-                            debug_state.update_clock_sync(pong, unix_time_micros());
+                            if current_debug_enabled {
+                                debug_state.update_clock_sync(pong, unix_time_micros());
+                            }
                         }
                         ControlMessage::InputSession(session) => {
                             shared_input.set_client_id(session.client_id);
@@ -1853,6 +2012,31 @@ fn format_opt_kbps(value: Option<u32>) -> String {
     value
         .map(|v| format!("{v} kbps"))
         .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_pos(pos: egui::Pos2) -> String {
+    format!("({:.1}, {:.1})", pos.x, pos.y)
+}
+
+fn format_pos_opt(pos: Option<egui::Pos2>) -> String {
+    pos.map(format_pos).unwrap_or_else(|| "-".to_string())
+}
+
+fn format_vec2(value: egui::Vec2) -> String {
+    format!("({:.1}, {:.1})", value.x, value.y)
+}
+
+fn format_rect(rect: egui::Rect) -> String {
+    format!(
+        "min={} size=({:.1}, {:.1})",
+        format_pos(rect.min),
+        rect.width(),
+        rect.height()
+    )
+}
+
+fn format_rect_opt(rect: Option<egui::Rect>) -> String {
+    rect.map(format_rect).unwrap_or_else(|| "-".to_string())
 }
 
 fn codec_label(stream_config: &StreamConfig) -> &'static str {
@@ -2120,6 +2304,8 @@ fn render_debug_overlay(
     pointer_buttons: u8,
     pressed_keys: usize,
     top_offset: f32,
+    debug_tab: &mut DebugOverlayTab,
+    cursor_lines: &[String],
 ) {
     let stream_line = snapshot
         .stream_config
@@ -2147,7 +2333,7 @@ fn render_debug_overlay(
         0.0
     };
 
-    let lines = [
+    let general_lines = vec![
         format!("server: {}", snapshot.server_addr),
         format!("stream: {stream_line}"),
         format!(
@@ -2273,7 +2459,16 @@ fn render_debug_overlay(
                 .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 220))
                 .show(ui, |ui| {
                     ui.set_width(max_width);
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(debug_tab, DebugOverlayTab::General, "General");
+                        ui.selectable_value(debug_tab, DebugOverlayTab::Cursor, "Cursor");
+                    });
+                    ui.separator();
                     ui.vertical(|ui| {
+                        let lines: &[String] = match *debug_tab {
+                            DebugOverlayTab::General => &general_lines,
+                            DebugOverlayTab::Cursor => cursor_lines,
+                        };
                         for line in lines {
                             ui.monospace(line);
                         }
@@ -2319,7 +2514,9 @@ impl eframe::App for StreamApp {
             if fb.dirty && fb.width > 0 {
                 fb.dirty = false;
                 if self.video_texture.stage_direct_frame(&fb) {
-                    self.debug_state.record_present(&fb, unix_time_micros());
+                    if self.debug_enabled {
+                        self.debug_state.record_present(&fb, unix_time_micros());
+                    }
                     None
                 } else {
                     match self
@@ -2327,7 +2524,9 @@ impl eframe::App for StreamApp {
                         .upload(frame, &fb, self.native_surfaces.as_ref())
                     {
                         Ok(()) => {
-                            self.debug_state.record_present(&fb, unix_time_micros());
+                            if self.debug_enabled {
+                                self.debug_state.record_present(&fb, unix_time_micros());
+                            }
                             None
                         }
                         Err(err) => Some(err),
@@ -2420,6 +2619,7 @@ impl eframe::App for StreamApp {
             if self.debug_enabled {
                 let snapshot = self.debug_state.snapshot();
                 let input_snapshot = self.shared_input.snapshot();
+                let cursor_lines = self.cursor_debug_lines(ctx, &input_snapshot);
                 render_debug_overlay(
                     ctx,
                     &snapshot,
@@ -2429,6 +2629,8 @@ impl eframe::App for StreamApp {
                     self.pointer_buttons,
                     self.keyboard_state.pressed_count(),
                     debug_top,
+                    &mut self.debug_overlay_tab,
+                    &cursor_lines,
                 );
             }
         }
