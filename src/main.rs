@@ -30,7 +30,7 @@ use st_protocol::{
 };
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{Ipv6Addr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -42,7 +42,7 @@ use video_frame::{NativeSurfaceCapabilities, NativeSurfaceControl, VideoFrameBuf
 
 use crate::debug_state::{unix_time_micros, ConnectionDebugSnapshot, ConnectionDebugState};
 
-const UDP_PORT: u16 = 5000;
+const DEFAULT_APP_PORT: u16 = 28_480;
 const MAX_REMOTE_CURSOR_TEXTURES: usize = 8;
 fn trace_enabled() -> bool {
     std::env::var_os("ST_TRACE").is_some()
@@ -159,6 +159,37 @@ fn default_menu_button_pos() -> egui::Pos2 {
     egui::pos2(FLOATING_MENU_BUTTON_MARGIN, FLOATING_MENU_BUTTON_MARGIN)
 }
 
+fn default_server_addr() -> String {
+    format!("127.0.0.1:{DEFAULT_APP_PORT}")
+}
+
+fn normalize_server_addr(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if let Some(host) = trimmed.strip_prefix('[').and_then(|value| value.strip_suffix(']')) {
+        return format!("[{host}]:{DEFAULT_APP_PORT}");
+    }
+
+    if trimmed.starts_with('[') && trimmed.contains("]:") {
+        return trimmed.to_string();
+    }
+
+    if trimmed.parse::<Ipv6Addr>().is_ok() {
+        return format!("[{trimmed}]:{DEFAULT_APP_PORT}");
+    }
+
+    if let Some((host, port)) = trimmed.rsplit_once(':') {
+        if !host.is_empty() && !host.contains(':') && port.parse::<u16>().is_ok() {
+            return trimmed.to_string();
+        }
+    }
+
+    format!("{trimmed}:{DEFAULT_APP_PORT}")
+}
+
 fn load_last_server() -> Option<String> {
     std::fs::read_to_string(state_dir().join("last_server"))
         .ok()
@@ -231,7 +262,7 @@ fn clamp_menu_button_pos(pos: egui::Pos2, content_rect: egui::Rect) -> egui::Pos
 
 impl StreamApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let saved = load_last_server().unwrap_or_else(|| "127.0.0.1:8080".to_string());
+        let saved = load_last_server().unwrap_or_else(default_server_addr);
         let audio = load_audio_enabled();
         let debug_enabled = load_debug_enabled();
         let menu_button_pos = load_menu_button_pos().unwrap_or_else(default_menu_button_pos);
@@ -295,7 +326,8 @@ impl StreamApp {
     }
 
     fn connect(&mut self, ctx: egui::Context) {
-        save_last_server(&self.server_addr);
+        let saved_addr = self.server_addr.trim().to_string();
+        save_last_server(&saved_addr);
 
         self.disconnect_flag.store(true, Ordering::SeqCst);
         let disconnect_flag = Arc::new(AtomicBool::new(false));
@@ -326,7 +358,7 @@ impl StreamApp {
         self.control_tx = Some(control_tx);
         self.input_tx = Some(input_tx);
 
-        let addr = self.server_addr.clone();
+        let addr = normalize_server_addr(&self.server_addr);
         let state = Arc::clone(&self.state);
         let frame_buf = Arc::clone(&self.frame);
         let disconnect = disconnect_flag;
@@ -1402,7 +1434,7 @@ impl StreamApp {
                 );
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.server_addr)
-                        .hint_text("127.0.0.1:8080")
+                        .hint_text("127.0.0.1 or host[:port]")
                         .desired_width(f32::INFINITY),
                 );
                 let can_connect = !self.server_addr.trim().is_empty();
@@ -1466,8 +1498,10 @@ impl StreamApp {
                 ui.add_space(10.0);
                 ui.label(egui::RichText::new(format!("last target: {}", self.server_addr)).monospace());
                 ui.label(
-                    egui::RichText::new(format!("server udp: {UDP_PORT}, client udp: auto"))
-                        .monospace(),
+                    egui::RichText::new(format!(
+                        "If the port is omitted, the client uses {DEFAULT_APP_PORT}. TCP and UDP share the same server port; client UDP stays auto."
+                    ))
+                    .monospace(),
                 );
                 ui.label(
                     egui::RichText::new(
@@ -1919,7 +1953,7 @@ fn start_media_threads(
     let input_socket = udp_socket
         .try_clone()
         .map_err(|err| format!("Failed to clone UDP socket: {err}"))?;
-    let input_target = std::net::SocketAddr::new(socket_addr.ip(), UDP_PORT);
+    let input_target = std::net::SocketAddr::new(socket_addr.ip(), socket_addr.port());
     let (input_stop_tx, input_stop_rx) = crossbeam_channel::bounded::<()>(1);
     let input_thread = std::thread::spawn(move || {
         run_input_sender(input_socket, input_target, input_rx, input_stop_rx);
