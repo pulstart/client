@@ -41,6 +41,10 @@ use crate::debug_state::{unix_time_micros, ConnectionDebugSnapshot, ConnectionDe
 
 const UDP_PORT: u16 = 5000;
 const MAX_REMOTE_CURSOR_TEXTURES: usize = 8;
+const CURSOR_SYNC_RECENT_MS: u64 = 120;
+const CURSOR_SYNC_SNAP_DISTANCE: f32 = 96.0;
+const CURSOR_SYNC_ACTIVE_BLEND: f32 = 0.12;
+const CURSOR_SYNC_IDLE_BLEND: f32 = 0.45;
 fn trace_enabled() -> bool {
     std::env::var_os("ST_TRACE").is_some()
 }
@@ -98,7 +102,9 @@ struct StreamApp {
     remote_cursor_textures: BTreeMap<u64, RemoteCursorTexture>,
     latest_remote_cursor_serial: Option<u64>,
     seen_cursor_shape_version: u64,
+    seen_cursor_state_version: u64,
     local_cursor_stream_pos: Option<egui::Pos2>,
+    last_local_cursor_motion: Option<Instant>,
     debug_overlay_tab: DebugOverlayTab,
     menu_open: bool,
     local_overlay_hit_rects: Vec<egui::Rect>,
@@ -206,7 +212,9 @@ impl StreamApp {
             remote_cursor_textures: BTreeMap::new(),
             latest_remote_cursor_serial: None,
             seen_cursor_shape_version: 0,
+            seen_cursor_state_version: 0,
             local_cursor_stream_pos: None,
+            last_local_cursor_motion: None,
             debug_overlay_tab: DebugOverlayTab::General,
             menu_open: false,
             local_overlay_hit_rects: Vec::new(),
@@ -233,7 +241,9 @@ impl StreamApp {
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
         self.seen_cursor_shape_version = 0;
+        self.seen_cursor_state_version = 0;
         self.local_cursor_stream_pos = None;
+        self.last_local_cursor_motion = None;
         self.shared_input.reset();
         self.audio_enabled_flag
             .store(self.audio_enabled, Ordering::SeqCst);
@@ -298,7 +308,9 @@ impl StreamApp {
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
         self.seen_cursor_shape_version = 0;
+        self.seen_cursor_state_version = 0;
         self.local_cursor_stream_pos = None;
+        self.last_local_cursor_motion = None;
         self.menu_open = false;
         self.local_overlay_hit_rects.clear();
         let mut s = self.state.lock().unwrap();
@@ -321,7 +333,9 @@ impl StreamApp {
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
         self.seen_cursor_shape_version = 0;
+        self.seen_cursor_state_version = 0;
         self.local_cursor_stream_pos = None;
+        self.last_local_cursor_motion = None;
         self.last_video_rect = None;
         self.menu_open = false;
         self.local_overlay_hit_rects.clear();
@@ -406,16 +420,56 @@ impl StreamApp {
         ))
     }
 
+    fn reconcile_local_cursor_stream_pos(
+        &self,
+        local_pos: egui::Pos2,
+        server_pos: egui::Pos2,
+        local_motion_recent: bool,
+    ) -> egui::Pos2 {
+        let delta = server_pos - local_pos;
+        let distance = delta.length();
+        if distance <= 0.5 || distance >= CURSOR_SYNC_SNAP_DISTANCE {
+            return server_pos;
+        }
+
+        let blend = if local_motion_recent {
+            CURSOR_SYNC_ACTIVE_BLEND
+        } else {
+            CURSOR_SYNC_IDLE_BLEND
+        };
+        let synced = local_pos + delta * blend;
+        let synced = if (server_pos - synced).length() <= 0.5 {
+            server_pos
+        } else {
+            synced
+        };
+        self.clamp_stream_pos(egui::pos2(synced.x, synced.y))
+    }
+
     fn sync_local_cursor_stream_pos(&mut self) {
         let snapshot = self.shared_input.snapshot();
+        if snapshot.cursor_state_version == self.seen_cursor_state_version {
+            return;
+        }
+        self.seen_cursor_state_version = snapshot.cursor_state_version;
+
+        let server_pos = self.server_cursor_stream_pos(&snapshot);
         let local_control_active = snapshot.controller_state == ControllerState::OwnedByYou
             && matches!(
                 self.capture_mode,
                 LocalCaptureMode::HoverAbsolute | LocalCaptureMode::CapturedRelative
             );
-        if !local_control_active || self.local_cursor_stream_pos.is_none() {
-            self.local_cursor_stream_pos = Some(self.server_cursor_stream_pos(&snapshot));
-        }
+        let local_motion_recent = self
+            .last_local_cursor_motion
+            .map(|t| t.elapsed() <= Duration::from_millis(CURSOR_SYNC_RECENT_MS))
+            .unwrap_or(false);
+        self.local_cursor_stream_pos = Some(match self.local_cursor_stream_pos {
+            None => server_pos,
+            Some(_) if !local_control_active => server_pos,
+            Some(local_pos) => {
+                self.reconcile_local_cursor_stream_pos(local_pos, server_pos, local_motion_recent)
+            }
+        });
     }
 
     fn remote_cursor_texture_for_serial(&self, serial: u64) -> Option<&RemoteCursorTexture> {
@@ -2803,6 +2857,7 @@ impl eframe::App for StreamApp {
                             if rect.contains(pos) && !self.pointer_over_local_overlay(pos) {
                                 self.local_cursor_stream_pos =
                                     Some(self.map_video_pos_to_stream(pos, rect));
+                                self.last_local_cursor_motion = Some(Instant::now());
                                 self.send_input_packet(InputPacket::MouseAbsolute(
                                     MouseAbsoluteInput {
                                         client_id,
@@ -2828,6 +2883,7 @@ impl eframe::App for StreamApp {
                             self.local_cursor_stream_pos = Some(self.clamp_stream_pos(
                                 egui::pos2(base.x + dx as f32, base.y + dy as f32),
                             ));
+                            self.last_local_cursor_motion = Some(Instant::now());
                             self.send_input_packet(InputPacket::MouseRelative(
                                 MouseRelativeInput {
                                     client_id,
