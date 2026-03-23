@@ -95,6 +95,7 @@ struct StreamApp {
     keyboard_state: LocalKeyboardState,
     pending_capture_click: bool,
     last_video_rect: Option<egui::Rect>,
+    last_sent_absolute_cursor: Option<(u16, u16)>,
     remote_cursor_textures: BTreeMap<u64, RemoteCursorTexture>,
     latest_remote_cursor_serial: Option<u64>,
     seen_cursor_shape_version: u64,
@@ -202,6 +203,7 @@ impl StreamApp {
             keyboard_state: LocalKeyboardState::default(),
             pending_capture_click: false,
             last_video_rect: None,
+            last_sent_absolute_cursor: None,
             remote_cursor_textures: BTreeMap::new(),
             latest_remote_cursor_serial: None,
             seen_cursor_shape_version: 0,
@@ -228,6 +230,7 @@ impl StreamApp {
         self.pending_capture_click = false;
         self.capture_mode = LocalCaptureMode::Idle;
         self.last_video_rect = None;
+        self.last_sent_absolute_cursor = None;
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
         self.seen_cursor_shape_version = 0;
@@ -292,6 +295,7 @@ impl StreamApp {
         self.pending_capture_click = false;
         self.capture_mode = LocalCaptureMode::Idle;
         self.last_video_rect = None;
+        self.last_sent_absolute_cursor = None;
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
         self.seen_cursor_shape_version = 0;
@@ -307,6 +311,7 @@ impl StreamApp {
         self.capture_mode = LocalCaptureMode::Idle;
         self.pointer_buttons = 0;
         self.pending_capture_click = false;
+        self.last_sent_absolute_cursor = None;
     }
 
     fn clear_local_session_interaction(&mut self) {
@@ -318,6 +323,7 @@ impl StreamApp {
         self.latest_remote_cursor_serial = None;
         self.seen_cursor_shape_version = 0;
         self.last_video_rect = None;
+        self.last_sent_absolute_cursor = None;
         self.menu_open = false;
         self.local_overlay_hit_rects.clear();
     }
@@ -326,6 +332,7 @@ impl StreamApp {
         self.capture_mode = LocalCaptureMode::ForceReleased;
         self.pending_capture_click = false;
         self.pointer_buttons = 0;
+        self.last_sent_absolute_cursor = None;
         self.clear_remote_keyboard();
         if let Some(client_id) = self.shared_input.snapshot().client_id {
             self.send_input_packet(InputPacket::MouseButtons(MouseButtonsInput {
@@ -383,20 +390,6 @@ impl StreamApp {
         }
     }
 
-    fn current_video_rect(&self, ctx: &egui::Context) -> Option<egui::Rect> {
-        let video_size = self.video_space_size()?;
-        let content_rect = ctx.content_rect();
-        let scale = (content_rect.width() / video_size.x).min(content_rect.height() / video_size.y);
-        if !scale.is_finite() || scale <= 0.0 {
-            return None;
-        }
-
-        Some(egui::Rect::from_center_size(
-            content_rect.center(),
-            egui::vec2(video_size.x * scale, video_size.y * scale),
-        ))
-    }
-
     fn clamp_stream_pos(&self, pos: egui::Pos2) -> egui::Pos2 {
         if let Some((width, height)) = self.stream_bounds() {
             egui::pos2(
@@ -406,15 +399,6 @@ impl StreamApp {
         } else {
             pos
         }
-    }
-
-    fn map_video_pos_to_stream(&self, pos: egui::Pos2, rect: egui::Rect) -> egui::Pos2 {
-        let (width, height) = self
-            .stream_bounds()
-            .unwrap_or((rect.width().max(1.0), rect.height().max(1.0)));
-        let x = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0) * width;
-        let y = ((pos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0) * height;
-        self.clamp_stream_pos(egui::pos2(x, y))
     }
 
     fn server_cursor_stream_pos(&self, snapshot: &input::SharedInputSnapshot) -> egui::Pos2 {
@@ -449,7 +433,7 @@ impl StreamApp {
         match self.capture_mode {
             LocalCaptureMode::HoverAbsolute => ctx
                 .input(|i| i.pointer.latest_pos())
-                .zip(self.current_video_rect(ctx).or(self.last_video_rect))
+                .zip(self.last_video_rect)
                 .map(|(pos, rect)| rect.contains(pos) && !self.pointer_over_local_overlay(pos))
                 .unwrap_or(false),
             LocalCaptureMode::CapturedRelative => true,
@@ -561,7 +545,7 @@ impl StreamApp {
         }
 
         let texture = self.remote_cursor_texture_for_serial(input_snapshot.cursor_state.serial)?;
-        let video_rect = self.current_video_rect(ctx).or(self.last_video_rect)?;
+        let video_rect = self.last_video_rect?;
         let stream_size = self.video_space_size()?;
         let scale_x = if stream_size.x > 0.0 {
             video_rect.width() / stream_size.x
@@ -636,7 +620,7 @@ impl StreamApp {
         input_snapshot: &input::SharedInputSnapshot,
     ) -> Vec<String> {
         let stream_size = self.video_space_size().unwrap_or_default();
-        let video_rect = self.current_video_rect(ctx).or(self.last_video_rect);
+        let video_rect = self.last_video_rect;
         let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
         let over_video = pointer_pos
             .zip(video_rect)
@@ -809,6 +793,34 @@ impl StreamApp {
             self.clear_remote_keyboard();
         }
 
+        if self.capture_mode == LocalCaptureMode::HoverAbsolute
+            && snapshot.controller_state == ControllerState::OwnedByYou
+            && self.capture_mode != LocalCaptureMode::ForceReleased
+        {
+            if let (Some(client_id), Some(pos)) =
+                (snapshot.client_id, ctx.input(|i| i.pointer.latest_pos()))
+            {
+                if response.rect.contains(pos) && !self.pointer_over_local_overlay(pos) {
+                    let absolute_x = normalized_coord(pos.x, response.rect.left(), response.rect.right());
+                    let absolute_y = normalized_coord(pos.y, response.rect.top(), response.rect.bottom());
+                    let next = (absolute_x, absolute_y);
+                    if self.last_sent_absolute_cursor != Some(next) {
+                        self.last_sent_absolute_cursor = Some(next);
+                        self.send_input_packet(InputPacket::MouseAbsolute(MouseAbsoluteInput {
+                            client_id,
+                            x: absolute_x,
+                            y: absolute_y,
+                            buttons: self.pointer_buttons,
+                        }));
+                    }
+                } else {
+                    self.last_sent_absolute_cursor = None;
+                }
+            }
+        } else {
+            self.last_sent_absolute_cursor = None;
+        }
+
         self.draw_remote_cursor_overlay(ctx);
     }
 
@@ -825,6 +837,25 @@ impl StreamApp {
                     egui::load::SizedTexture::new(geometry.texture_id, geometry.rect.size());
                 ui.image(sized);
             });
+    }
+
+    fn paint_connected_background(&self, ui: &mut egui::Ui) {
+        let rect = ui.max_rect();
+        let painter = ui.painter();
+        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(7, 10, 14));
+        painter.circle_filled(
+            egui::pos2(rect.left() + rect.width() * 0.18, rect.top() + rect.height() * 0.22),
+            rect.width().min(rect.height()) * 0.16,
+            egui::Color32::from_rgba_unmultiplied(54, 156, 255, 20),
+        );
+        painter.circle_filled(
+            egui::pos2(
+                rect.right() - rect.width() * 0.16,
+                rect.bottom() - rect.height() * 0.18,
+            ),
+            rect.width().min(rect.height()) * 0.20,
+            egui::Color32::from_rgba_unmultiplied(34, 198, 140, 16),
+        );
     }
 
     fn render_home_screen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -2613,7 +2644,11 @@ impl eframe::App for StreamApp {
         }
 
         let central_panel = if state == ConnectionState::Connected {
-            egui::CentralPanel::default().frame(egui::Frame::NONE)
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::NONE
+                        .fill(egui::Color32::from_rgb(7, 10, 14)),
+                )
         } else {
             egui::CentralPanel::default()
         };
@@ -2634,6 +2669,7 @@ impl eframe::App for StreamApp {
                 });
             }
             ConnectionState::Connected => {
+                self.paint_connected_background(ui);
                 if self.video_texture.has_frame() {
                     let available = ui.available_size();
                     let tex_size = self.video_space_size().unwrap_or_else(|| self.video_texture.size_vec2());
@@ -2757,7 +2793,7 @@ impl eframe::App for StreamApp {
             self.clear_remote_keyboard();
         }
 
-        let video_rect = self.current_video_rect(ctx).or(self.last_video_rect);
+        let video_rect = self.last_video_rect;
         let mut last_pointer_pos = raw_input.events.iter().rev().find_map(|event| match event {
             egui::Event::PointerMoved(pos) => Some(*pos),
             _ => None,
@@ -2786,34 +2822,6 @@ impl eframe::App for StreamApp {
                 }
                 egui::Event::PointerMoved(pos) => {
                     last_pointer_pos = Some(pos);
-                    if self.capture_mode == LocalCaptureMode::HoverAbsolute
-                        && snapshot.controller_state == ControllerState::OwnedByYou
-                        && self.capture_mode != LocalCaptureMode::ForceReleased
-                    {
-                        if let Some(rect) = video_rect {
-                            if rect.contains(pos) && !self.pointer_over_local_overlay(pos) {
-                                let stream_pos = self.map_video_pos_to_stream(pos, rect);
-                                let (stream_width, stream_height) =
-                                    self.stream_bounds().unwrap_or((1.0, 1.0));
-                                self.send_input_packet(InputPacket::MouseAbsolute(
-                                    MouseAbsoluteInput {
-                                        client_id,
-                                        x: normalized_coord(
-                                            stream_pos.x,
-                                            0.0,
-                                            (stream_width - 1.0).max(0.0),
-                                        ),
-                                        y: normalized_coord(
-                                            stream_pos.y,
-                                            0.0,
-                                            (stream_height - 1.0).max(0.0),
-                                        ),
-                                        buttons: self.pointer_buttons,
-                                    },
-                                ));
-                            }
-                        }
-                    }
                 }
                 egui::Event::MouseMoved(delta) => {
                     if self.capture_mode == LocalCaptureMode::CapturedRelative
