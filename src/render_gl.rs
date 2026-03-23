@@ -319,6 +319,20 @@ impl NativeVideoTexture {
         egui::vec2(self.width as f32, self.height as f32)
     }
 
+    #[allow(dead_code)]
+    #[cfg(target_os = "macos")]
+    pub fn current_native_video_rect(&self) -> Option<egui::Rect> {
+        self.macos_metal_presenter
+            .as_ref()
+            .and_then(MacosMetalVideoPresenter::current_rect)
+    }
+
+    #[allow(dead_code)]
+    #[cfg(not(target_os = "macos"))]
+    pub fn current_native_video_rect(&self) -> Option<egui::Rect> {
+        None
+    }
+
     pub fn clear_frame(&mut self) {
         self.width = 0;
         self.height = 0;

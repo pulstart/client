@@ -192,6 +192,10 @@ impl MacosMetalVideoPresenter {
         self.frame = None;
         self.renderer = None;
     }
+
+    pub fn current_rect(&self) -> Option<egui::Rect> {
+        self.renderer.as_ref().and_then(MetalVideoRenderer::current_rect)
+    }
 }
 
 struct MetalVideoRenderer {
@@ -376,6 +380,24 @@ impl MetalVideoRenderer {
         });
 
         Ok(())
+    }
+
+    fn current_rect(&self) -> Option<egui::Rect> {
+        let host_rect_in_parent: CGRect = unsafe { msg_send![*self.host_view, frame] };
+        let host_rect_in_root = parent_rect_in_root_view(self.root_view, self.parent_view, host_rect_in_parent);
+        let width = host_rect_in_root.size.width as f32;
+        let height = host_rect_in_root.size.height as f32;
+        if width < 1.0 || height < 1.0 {
+            return None;
+        }
+
+        Some(egui::Rect::from_min_size(
+            egui::pos2(
+                host_rect_in_root.origin.x as f32,
+                host_rect_in_root.origin.y as f32,
+            ),
+            egui::vec2(width, height),
+        ))
     }
 
     fn import_textures(
@@ -655,6 +677,14 @@ fn superview(view: NonNull<Object>) -> Result<NonNull<Object>, String> {
 fn root_view_rect_in_parent(root_view: NonNull<Object>, parent_view: NonNull<Object>) -> CGRect {
     let root_bounds: CGRect = unsafe { msg_send![root_view.as_ptr(), bounds] };
     unsafe { msg_send![root_view.as_ptr(), convertRect: root_bounds toView: parent_view.as_ptr()] }
+}
+
+fn parent_rect_in_root_view(
+    root_view: NonNull<Object>,
+    parent_view: NonNull<Object>,
+    rect: CGRect,
+) -> CGRect {
+    unsafe { msg_send![root_view.as_ptr(), convertRect: rect fromView: parent_view.as_ptr()] }
 }
 
 fn create_host_view(

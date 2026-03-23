@@ -527,6 +527,11 @@ impl StreamApp {
     }
 
     fn current_video_rect(&self, ctx: &egui::Context) -> Option<egui::Rect> {
+        #[cfg(target_os = "macos")]
+        if let Some(rect) = self.video_texture.current_native_video_rect() {
+            return Some(rect);
+        }
+
         self.video_rect_for_container(ctx.content_rect())
     }
 
