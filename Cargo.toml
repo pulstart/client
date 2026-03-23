@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 eframe = "0.33"
 st-protocol = { path = "../protocol" }
-ffmpeg-next = "8.1"
+ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "software-scaling"] }
 crossbeam-channel = "0.5"
 cpal = "0.15"
 opus = "0.3"
