@@ -39,6 +39,11 @@ case "$platform" in
 esac
 
 client_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ "$platform" == macos-x64 || "$platform" == macos-arm64 ]]; then
+    exec bash "$client_root/scripts/package-macos-app.sh" --platform "$platform"
+fi
+
 binary_path="$client_root/target/release/st-client"
 version="$(
     sed -n 's/^version = "\(.*\)"/\1/p' "$client_root/Cargo.toml" \
@@ -79,53 +84,6 @@ EOF
         archive_path="$dist_root/${package_name}.tar.gz"
         rm -f "$archive_path"
         tar -C "$staging_root" -czf "$archive_path" "$package_name"
-        ;;
-    macos-x64|macos-arm64)
-        app_root="$package_root/st-client.app"
-        mkdir -p "$app_root/Contents/MacOS"
-        cp "$binary_path" "$app_root/Contents/MacOS/st-client"
-        chmod 755 "$app_root/Contents/MacOS/st-client"
-        cat > "$app_root/Contents/Info.plist" <<'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleDevelopmentRegion</key>
-    <string>en</string>
-    <key>CFBundleExecutable</key>
-    <string>st-client</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.pulstart.st-client</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>CFBundleName</key>
-    <string>st-client</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
-    <key>CFBundleVersion</key>
-    <string>0.1.0</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>12.0</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-</dict>
-</plist>
-EOF
-        perl -0pi -e "s#<string>0\\.1\\.0</string>#<string>${version}</string>#g" \
-            "$app_root/Contents/Info.plist"
-        cat > "$package_root/README.txt" <<'EOF'
-This archive contains the macOS build of st-client packaged as a .app bundle.
-
-The app bundle is created on GitHub Actions macOS runners. Runtime Homebrew dependencies are
-not bundled yet. Install them on the target machine before launching the client:
-
-    brew install ffmpeg opus
-EOF
-        archive_path="$dist_root/${package_name}.zip"
-        rm -f "$archive_path"
-        ditto -c -k --sequesterRsrc --keepParent "$package_root" "$archive_path"
         ;;
 esac
 

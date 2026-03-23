@@ -889,7 +889,7 @@ impl VideoDecoder {
             }
         };
 
-        let raw = decoded.as_ptr();
+        let raw = unsafe { decoded.as_ptr() };
         let texture = unsafe {
             crate::video_frame::WindowsComPtr::retain((*raw).data[0].cast())
                 .ok_or_else(|| "D3D11 frame missing ID3D11Texture2D".to_string())?

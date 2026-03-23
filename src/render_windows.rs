@@ -70,8 +70,7 @@ const D3D11_VPOV_DIMENSION_TEXTURE2D: u32 = 1;
 
 impl WindowsD3d11Importer {
     pub fn probe(_gl: &glow::Context) -> bool {
-        unsafe { !wglGetCurrentContext().is_null() }
-        &&WglDxInterop::load().is_ok()
+        unsafe { !wglGetCurrentContext().is_null() } && WglDxInterop::load().is_ok()
     }
 
     pub fn new(_gl: &glow::Context) -> Result<Self, String> {
@@ -284,12 +283,16 @@ impl InteropState {
     }
 }
 
+// The presenter state is guarded by a mutex and only used by the egui paint callback
+// on the active GL thread, but egui requires the callback capture to be Send.
+unsafe impl Send for WindowsDirectVideoPresenterState {}
+
 impl WindowsDirectVideoPresenterState {
     fn render(&mut self, info: egui::PaintCallbackInfo, painter: &egui_glow::Painter) {
         if !self.enabled {
             return;
         }
-        let Some(frame) = self.frame.as_ref() else {
+        let Some(frame) = self.frame.clone() else {
             return;
         };
         let gl = painter.gl();
@@ -340,7 +343,7 @@ impl WindowsDirectVideoPresenterState {
             self.importer
                 .as_mut()
                 .expect("importer set")
-                .import_and_render(output_texture, frame)?;
+                .import_and_render(output_texture, &frame)?;
             self.blit_pipeline
                 .as_mut()
                 .expect("pipeline set")

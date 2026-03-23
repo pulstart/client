@@ -317,19 +317,23 @@ fn process_exists(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn process_exists(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, SYNCHRONIZE};
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
 
-    let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
-    if handle == 0 {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle == null_mut() {
         return false;
     }
 
-    let wait_result = unsafe { WaitForSingleObject(handle, 0) };
+    let mut exit_code = 0u32;
+    let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
     unsafe {
         CloseHandle(handle);
     }
-    wait_result == WAIT_TIMEOUT
+    ok && exit_code == STILL_ACTIVE
 }
 
 fn sync_package_contents(source_root: &Path, install_root: &Path) -> Result<(), String> {

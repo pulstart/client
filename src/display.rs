@@ -352,7 +352,7 @@ fn detect_windows_refresh_millihz() -> Option<u32> {
         ) -> i32;
     }
 
-    let mut best = None;
+    let mut best: Option<u32> = None;
     let mut index = 0u32;
 
     loop {

@@ -45,6 +45,35 @@ If `pulstart/protocol` is private, add this repository secret in `pulstart/clien
 Without that secret, the workflows fall back to the standard `GITHUB_TOKEN`, which only works when
 the protocol repo is public or otherwise accessible to the workflow token.
 
+## macOS Release Signing
+
+macOS release archives now build unsigned by default. If you want a proper
+Developer ID signed and notarized download, provide the Apple secrets below and
+the packaging script will use them automatically.
+
+Optional signing secrets:
+
+- `MACOS_CERTIFICATE_P12_BASE64`
+  - Base64-encoded Developer ID Application certificate export (`.p12`)
+- `MACOS_CERTIFICATE_PASSWORD`
+  - Password for that `.p12`
+- `MACOS_CODESIGN_IDENTITY`
+  - Full signing identity, for example `Developer ID Application: Example, Inc. (TEAMID)`
+
+Optional notarization secrets, choose one set:
+
+- App Store Connect API key:
+  - `MACOS_NOTARY_KEY_ID`
+  - `MACOS_NOTARY_ISSUER`
+  - `MACOS_NOTARY_API_KEY_BASE64`
+- Apple ID / app-specific password:
+  - `MACOS_NOTARY_APPLE_ID`
+  - `MACOS_NOTARY_APP_PASSWORD`
+  - `MACOS_TEAM_ID`
+
+Without those secrets, both CI and tagged releases still produce macOS `.app`
+archives, but Gatekeeper may require a manual allow/open step on the target Mac.
+
 ## Release Artifacts
 
 Tagging `v0.1.0` produces these files:
@@ -62,7 +91,8 @@ they do not bundle every runtime multimedia dependency yet. The package README f
 out explicitly:
 
 - Linux expects the target machine to provide FFmpeg, Opus, and the usual desktop OpenGL/audio stack
-- macOS expects the target machine to provide Homebrew `ffmpeg` and `opus`
+- macOS release archives are unsigned unless the Apple secrets above are configured
+- macOS still expects the target machine to provide FFmpeg and Opus runtime libraries for now
 
 ## Releasing
 
