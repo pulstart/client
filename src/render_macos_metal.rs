@@ -16,6 +16,7 @@ use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 use std::{ffi::c_void, ptr::NonNull};
 
 const NS_WINDOW_BELOW: i64 = -1;
+const NS_WINDOW_ABOVE: i64 = 1;
 const K_CV_PIXEL_FORMAT_TYPE_420YP_CBCR8_BI_PLANAR_VIDEO_RANGE: u32 = 0x34323076;
 const K_CV_PIXEL_FORMAT_TYPE_420YP_CBCR8_PLANAR: u32 = 0x79343230;
 const METAL_SHADER_SOURCE: &str = r#"
@@ -194,6 +195,7 @@ impl MacosMetalVideoPresenter {
 struct MetalVideoRenderer {
     root_view: NonNull<Object>,
     parent_view: NonNull<Object>,
+    background_view: NativeBackgroundView,
     host_view: StrongPtr,
     layer: MetalLayer,
     _device: Device,
@@ -226,12 +228,19 @@ impl MetalVideoRenderer {
         layer.set_maximum_drawable_count(2);
         layer.remove_all_animations();
 
-        let host_view = create_host_view(parent_view, root_view, &layer)?;
+        let background_view = NativeBackgroundView::new(parent_view, root_view)?;
+        let host_view = create_host_view(
+            parent_view,
+            NonNull::new(*background_view.view)
+                .ok_or_else(|| "background NSView unexpectedly null".to_string())?,
+            &layer,
+        )?;
         let texture_cache = create_texture_cache(&device)?;
 
         Ok(Self {
             root_view,
             parent_view,
+            background_view,
             host_view,
             layer,
             _device: device,
@@ -287,6 +296,8 @@ impl MetalVideoRenderer {
         let parent_rect: CGRect = unsafe {
             msg_send![self.root_view.as_ptr(), convertRect: local_rect toView: self.parent_view.as_ptr()]
         };
+        let background_rect = root_view_rect_in_parent(self.root_view, self.parent_view);
+        self.background_view.update(background_rect);
 
         let changed = self.last_rect != Some(rect)
             || (self.last_scale - pixels_per_point).abs() > f32::EPSILON;
@@ -478,6 +489,7 @@ impl Drop for MetalVideoRenderer {
         self.hide();
         unsafe {
             let () = msg_send![*self.host_view, removeFromSuperview];
+            let () = msg_send![*self.background_view.view, removeFromSuperview];
         }
         for submission in &self.pending_submissions {
             submission.command_buffer.wait_until_completed();
@@ -504,6 +516,96 @@ struct ImportedTextures<'a> {
 struct ImportedPlane<'a> {
     texture: &'a TextureRef,
     cv_texture: NonNull<c_void>,
+}
+
+struct NativeBackgroundView {
+    view: StrongPtr,
+    _layer: StrongPtr,
+    accent_primary: StrongPtr,
+    accent_secondary: StrongPtr,
+}
+
+impl NativeBackgroundView {
+    fn new(parent_view: NonNull<Object>, root_view: NonNull<Object>) -> Result<Self, String> {
+        let frame = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(0.0, 0.0));
+        let view: *mut Object = unsafe {
+            let alloc: *mut Object = msg_send![class!(NSView), alloc];
+            msg_send![alloc, initWithFrame: frame]
+        };
+        let view = NonNull::new(view)
+            .ok_or_else(|| "failed to create NSView for macOS background".to_string())?;
+        let layer = new_ca_layer("failed to create background CALayer")?;
+        let accent_primary = new_ca_layer("failed to create primary accent CALayer")?;
+        let accent_secondary = new_ca_layer("failed to create secondary accent CALayer")?;
+
+        unsafe {
+            let () = msg_send![view.as_ptr(), setAutoresizingMask: 0usize];
+            let () = msg_send![view.as_ptr(), setHidden: YES];
+            let () = msg_send![view.as_ptr(), setWantsLayer: YES];
+            let () = msg_send![*layer, setOpaque: YES];
+
+            set_layer_color(
+                *layer,
+                ns_color(7.0 / 255.0, 10.0 / 255.0, 14.0 / 255.0, 1.0),
+            );
+            let () = msg_send![*accent_primary, setOpaque: NO];
+            set_layer_color(
+                *accent_primary,
+                ns_color(54.0 / 255.0, 156.0 / 255.0, 1.0, 20.0 / 255.0),
+            );
+            let () = msg_send![*accent_secondary, setOpaque: NO];
+            set_layer_color(
+                *accent_secondary,
+                ns_color(34.0 / 255.0, 198.0 / 255.0, 140.0 / 255.0, 16.0 / 255.0),
+            );
+
+            let () = msg_send![*layer, addSublayer: *accent_primary];
+            let () = msg_send![*layer, addSublayer: *accent_secondary];
+            let () = msg_send![view.as_ptr(), setLayer: *layer];
+            let () = msg_send![
+                parent_view.as_ptr(),
+                addSubview: view.as_ptr()
+                positioned: NS_WINDOW_BELOW
+                relativeTo: root_view.as_ptr()
+            ];
+        }
+
+        Ok(Self {
+            view: unsafe { StrongPtr::new(view.as_ptr()) },
+            _layer: layer,
+            accent_primary,
+            accent_secondary,
+        })
+    }
+
+    fn update(&mut self, frame: CGRect) {
+        let width = frame.size.width.max(1.0);
+        let height = frame.size.height.max(1.0);
+        let min_dimension = width.min(height);
+
+        let primary_radius = min_dimension * 0.16;
+        let primary_frame = circle_frame(
+            CGPoint::new(width * 0.18, height * 0.22),
+            primary_radius,
+        );
+        let secondary_radius = min_dimension * 0.20;
+        let secondary_frame = circle_frame(
+            CGPoint::new(width * 0.84, height * 0.82),
+            secondary_radius,
+        );
+
+        unsafe {
+            let () = msg_send![class!(CATransaction), begin];
+            let () = msg_send![class!(CATransaction), setDisableActions: YES];
+            let () = msg_send![*self.view, setFrame: frame];
+            let () = msg_send![*self.view, setHidden: NO];
+            let () = msg_send![*self.accent_primary, setFrame: primary_frame];
+            let () = msg_send![*self.accent_primary, setCornerRadius: primary_radius];
+            let () = msg_send![*self.accent_secondary, setFrame: secondary_frame];
+            let () = msg_send![*self.accent_secondary, setCornerRadius: secondary_radius];
+            let () = msg_send![class!(CATransaction), commit];
+        }
+    }
 }
 
 fn root_ns_view(frame: &Frame) -> Result<NonNull<Object>, String> {
@@ -548,9 +650,14 @@ fn superview(view: NonNull<Object>) -> Result<NonNull<Object>, String> {
     NonNull::new(superview).ok_or_else(|| "AppKit superview unavailable".to_string())
 }
 
+fn root_view_rect_in_parent(root_view: NonNull<Object>, parent_view: NonNull<Object>) -> CGRect {
+    let root_bounds: CGRect = unsafe { msg_send![root_view.as_ptr(), bounds] };
+    unsafe { msg_send![root_view.as_ptr(), convertRect: root_bounds toView: parent_view.as_ptr()] }
+}
+
 fn create_host_view(
     parent_view: NonNull<Object>,
-    root_view: NonNull<Object>,
+    background_view: NonNull<Object>,
     layer: &MetalLayer,
 ) -> Result<StrongPtr, String> {
     let frame = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(0.0, 0.0));
@@ -568,11 +675,51 @@ fn create_host_view(
         let () = msg_send![
             parent_view.as_ptr(),
             addSubview: view.as_ptr()
-            positioned: NS_WINDOW_BELOW
-            relativeTo: root_view.as_ptr()
+            positioned: NS_WINDOW_ABOVE
+            relativeTo: background_view.as_ptr()
         ];
         Ok(StrongPtr::new(view.as_ptr()))
     }
+}
+
+fn new_ca_layer(error_message: &'static str) -> Result<StrongPtr, String> {
+    let layer: *mut Object = unsafe { msg_send![class!(CALayer), new] };
+    let layer = NonNull::new(layer).ok_or_else(|| error_message.to_string())?;
+    Ok(unsafe { StrongPtr::new(layer.as_ptr()) })
+}
+
+fn ns_color(red: f64, green: f64, blue: f64, alpha: f64) -> *mut Object {
+    unsafe {
+        msg_send![
+            class!(NSColor),
+            colorWithSRGBRed: red
+            green: green
+            blue: blue
+            alpha: alpha
+        ]
+    }
+}
+
+fn set_layer_color(layer: *mut Object, color: *mut Object) {
+    if color.is_null() {
+        return;
+    }
+
+    let cg_color: *mut c_void = unsafe { msg_send![color, CGColor] };
+    if cg_color.is_null() {
+        return;
+    }
+
+    unsafe {
+        let () = msg_send![layer, setBackgroundColor: cg_color];
+    }
+}
+
+fn circle_frame(center: CGPoint, radius: f64) -> CGRect {
+    CGRect::new(
+        &CGPoint::new(center.x - radius, center.y - radius),
+        &CGSize::new(radius * 2.0, radius * 2.0),
+    )
 }
 
 fn compile_library(device: &Device) -> Result<Library, String> {
