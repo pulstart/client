@@ -141,12 +141,12 @@ pub fn prepare_and_spawn_update(release: &ReleaseInfo) -> Result<(), String> {
 
     extract_archive(&archive_path, temp_dir.path())?;
     let package_root = locate_package_root(temp_dir.path())?;
-    let package_root_name = package_root
-        .file_name()
-        .ok_or_else(|| "Extracted package root has no file name.".to_string())?
-        .to_os_string();
+    let package_root_relative = package_root
+        .strip_prefix(temp_dir.path())
+        .map_err(|err| format!("Extracted package root is outside the staging dir: {err}"))?
+        .to_path_buf();
     let staging_root = temp_dir.keep();
-    let package_root = staging_root.join(package_root_name);
+    let package_root = staging_root.join(package_root_relative);
 
     let helper_executable = packaged_executable_path(&package_root)?;
     let install_target = current_install_target()?;
@@ -223,11 +223,26 @@ fn packaged_executable_path(package_root: &Path) -> Result<PathBuf, String> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Ok(package_root.join("st-client")),
         ("windows", "x86_64") => Ok(package_root.join("st-client.exe")),
-        ("macos", "x86_64") | ("macos", "aarch64") => {
-            Ok(package_root.join("st-client.app/Contents/MacOS/st-client"))
-        }
+        ("macos", "x86_64") | ("macos", "aarch64") => packaged_macos_executable_path(package_root),
         _ => Err(supported_target_label().unwrap_err()),
     }
+}
+
+fn packaged_macos_executable_path(package_root: &Path) -> Result<PathBuf, String> {
+    let direct_bundle_path = package_root.join("Contents/MacOS/st-client");
+    if direct_bundle_path.is_file() {
+        return Ok(direct_bundle_path);
+    }
+
+    let nested_bundle_path = package_root.join("st-client.app/Contents/MacOS/st-client");
+    if nested_bundle_path.is_file() {
+        return Ok(nested_bundle_path);
+    }
+
+    Err(format!(
+        "Could not find the macOS app executable inside '{}'.",
+        package_root.display()
+    ))
 }
 
 fn current_install_target() -> Result<InstallTarget, String> {
@@ -461,6 +476,10 @@ fn extract_tar_gz(archive_path: &Path, destination_root: &Path) -> Result<(), St
 }
 
 fn locate_package_root(extract_root: &Path) -> Result<PathBuf, String> {
+    if cfg!(target_os = "macos") {
+        return locate_macos_package_root(extract_root);
+    }
+
     let entries =
         fs::read_dir(extract_root).map_err(|err| format!("Failed to inspect extracted archive: {err}"))?;
     for entry in entries {
@@ -474,6 +493,31 @@ fn locate_package_root(extract_root: &Path) -> Result<PathBuf, String> {
         }
     }
     Err("Could not find the extracted package root in the downloaded archive.".to_string())
+}
+
+fn locate_macos_package_root(extract_root: &Path) -> Result<PathBuf, String> {
+    let entries =
+        fs::read_dir(extract_root).map_err(|err| format!("Failed to inspect extracted archive: {err}"))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("Failed to read extracted entry: {err}"))?;
+        let path = entry.path();
+        if entry.file_name() == "st-client.app" && path.is_dir() {
+            return Ok(path);
+        }
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(PACKAGE_PREFIX)
+        {
+            let bundle_root = path.join("st-client.app");
+            if bundle_root.is_dir() {
+                return Ok(bundle_root);
+            }
+        }
+    }
+
+    Err("Could not find the extracted macOS app bundle in the downloaded archive.".to_string())
 }
 
 fn download_to_path(url: &str, path: &Path) -> Result<(), String> {
