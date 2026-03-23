@@ -1,6 +1,7 @@
 use eframe::egui;
 use st_protocol::{
-    ControllerState, CursorShape, CursorState, InputCapabilities, KeyboardKey, KEYBOARD_STATE_BYTES,
+    ControllerState, CursorShape, CursorState, InputCapabilities, KeyboardKey, StreamConfig,
+    KEYBOARD_STATE_BYTES,
 };
 use std::sync::Mutex;
 
@@ -34,6 +35,7 @@ pub struct SharedInputSnapshot {
     pub client_id: Option<u32>,
     pub controller_state: ControllerState,
     pub capabilities: InputCapabilities,
+    pub stream_config: Option<StreamConfig>,
     pub cursor_shape: Option<CursorShape>,
     pub cursor_state: CursorState,
     pub cursor_shape_version: u64,
@@ -46,6 +48,7 @@ impl Default for SharedInputSnapshot {
             client_id: None,
             controller_state: ControllerState::Unavailable,
             capabilities: InputCapabilities::default(),
+            stream_config: None,
             cursor_shape: None,
             cursor_state: CursorState::default(),
             cursor_shape_version: 0,
@@ -83,6 +86,10 @@ impl SharedInputState {
 
     pub fn set_capabilities(&self, capabilities: InputCapabilities) {
         self.inner.lock().unwrap().capabilities = capabilities;
+    }
+
+    pub fn set_stream_config(&self, stream_config: StreamConfig) {
+        self.inner.lock().unwrap().stream_config = Some(stream_config);
     }
 
     pub fn set_cursor_shape(&self, cursor_shape: CursorShape) {

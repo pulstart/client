@@ -126,6 +126,7 @@ struct StreamApp {
     menu_open: bool,
     local_overlay_hit_rects: Vec<egui::Rect>,
     last_pointer_move: Option<Instant>,
+    await_pointer_exit_after_auto_release: bool,
     applied_cursor_visible: Option<bool>,
     applied_cursor_grab: Option<egui::CursorGrab>,
     update_ui_state: UpdateUiState,
@@ -243,6 +244,7 @@ impl StreamApp {
             menu_open: false,
             local_overlay_hit_rects: Vec::new(),
             last_pointer_move: None,
+            await_pointer_exit_after_auto_release: false,
             applied_cursor_visible: None,
             applied_cursor_grab: None,
             update_ui_state,
@@ -267,6 +269,7 @@ impl StreamApp {
         self.last_video_rect = None;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
+        self.await_pointer_exit_after_auto_release = false;
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
         self.seen_cursor_shape_version = 0;
@@ -350,6 +353,7 @@ impl StreamApp {
         self.pending_capture_click = false;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
+        self.await_pointer_exit_after_auto_release = false;
     }
 
     fn clear_local_session_interaction(&mut self) {
@@ -364,6 +368,7 @@ impl StreamApp {
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
         self.menu_open = false;
+        self.await_pointer_exit_after_auto_release = false;
         self.local_overlay_hit_rects.clear();
     }
 
@@ -373,6 +378,19 @@ impl StreamApp {
         self.pointer_buttons = 0;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
+        self.await_pointer_exit_after_auto_release = false;
+        self.clear_remote_keyboard();
+        if let Some(client_id) = self.shared_input.snapshot().client_id {
+            self.send_input_packet(InputPacket::MouseButtons(MouseButtonsInput {
+                client_id,
+                buttons: 0,
+            }));
+        }
+    }
+
+    fn auto_release_capture(&mut self, await_pointer_exit_before_recapture: bool) {
+        self.release_pointer_capture();
+        self.await_pointer_exit_after_auto_release = await_pointer_exit_before_recapture;
         self.clear_remote_keyboard();
         if let Some(client_id) = self.shared_input.snapshot().client_id {
             self.send_input_packet(InputPacket::MouseButtons(MouseButtonsInput {
@@ -413,7 +431,7 @@ impl StreamApp {
     }
 
     fn cursor_space_size(&self) -> Option<egui::Vec2> {
-        if let Some(stream_config) = self.debug_state.snapshot().stream_config {
+        if let Some(stream_config) = self.shared_input.snapshot().stream_config {
             if stream_config.width > 0 && stream_config.height > 0 {
                 return Some(egui::vec2(
                     stream_config.width as f32,
@@ -452,7 +470,7 @@ impl StreamApp {
     fn uses_virtual_hover_cursor(&self, snapshot: &input::SharedInputSnapshot) -> bool {
         cfg!(target_os = "macos")
             && snapshot.controller_state == ControllerState::OwnedByYou
-            && snapshot.capabilities.mouse_absolute
+            && snapshot.capabilities.hover_capture
             && !snapshot.capabilities.separate_cursor
     }
 
@@ -797,11 +815,12 @@ impl StreamApp {
         let overlay_geometry = self.compute_cursor_overlay_geometry(ctx, input_snapshot);
         let mut lines = vec![
             format!(
-                "cursor: mode={} controller={:?} visible={} separate={} overlay_active={} native_fallback={}",
+                "cursor: mode={} controller={:?} visible={} separate={} hover={} overlay_active={} native_fallback={}",
                 self.capture_mode.label(),
                 input_snapshot.controller_state,
                 if input_snapshot.cursor_state.visible { "y" } else { "n" },
                 if input_snapshot.capabilities.separate_cursor { "y" } else { "n" },
+                if input_snapshot.capabilities.hover_capture { "y" } else { "n" },
                 if overlay_geometry.is_some() { "y" } else { "n" },
                 if self.native_cursor_fallback_active() { "y" } else { "n" },
             ),
@@ -884,9 +903,8 @@ impl StreamApp {
         let previous_capture_mode = self.capture_mode;
 
         let snapshot = self.shared_input.snapshot();
-        let hover_supported = snapshot.capabilities.mouse_absolute;
-        let prefer_hover_absolute =
-            snapshot.capabilities.mouse_absolute && !snapshot.capabilities.separate_cursor;
+        let hover_supported = snapshot.capabilities.hover_capture;
+        let prefer_hover_absolute = snapshot.capabilities.hover_capture;
         let virtual_hover = self.uses_virtual_hover_cursor(&snapshot);
         let actual_pointer_pos = ctx.input(|i| i.pointer.latest_pos());
         let mut pointer_pos = if virtual_hover && previous_capture_mode == LocalCaptureMode::HoverAbsolute
@@ -943,6 +961,9 @@ impl StreamApp {
             .unwrap_or(false);
         let pointer_over_video = pointer_inside_video_rect && !pointer_over_local_overlay;
         let clicked_video = response.clicked_by(egui::PointerButton::Primary) && pointer_over_video;
+        if self.await_pointer_exit_after_auto_release && !pointer_inside_video_rect {
+            self.await_pointer_exit_after_auto_release = false;
+        }
         if snapshot.controller_state != ControllerState::OwnedByYou
             && matches!(
                 self.capture_mode,
@@ -951,10 +972,9 @@ impl StreamApp {
         {
             self.capture_mode = LocalCaptureMode::Idle;
         }
-        if (!pointer_inside_video_rect || !hover_supported)
-            && self.capture_mode == LocalCaptureMode::HoverAbsolute
+        if (!pointer_over_video || !hover_supported) && self.capture_mode == LocalCaptureMode::HoverAbsolute
         {
-            self.capture_mode = LocalCaptureMode::Idle;
+            self.auto_release_capture(false);
         }
 
         if self.capture_mode == LocalCaptureMode::CapturedRelative && !ctx.input(|i| i.focused) {
@@ -964,7 +984,8 @@ impl StreamApp {
         if hover_supported
             && self.capture_mode != LocalCaptureMode::CapturedRelative
             && self.capture_mode != LocalCaptureMode::ForceReleased
-            && pointer_inside_video_rect
+            && !self.await_pointer_exit_after_auto_release
+            && pointer_over_video
             && snapshot.controller_state == ControllerState::OwnedByYou
         {
             self.capture_mode = LocalCaptureMode::HoverAbsolute;
@@ -979,6 +1000,7 @@ impl StreamApp {
                 } else if hover_supported {
                     self.capture_mode = LocalCaptureMode::HoverAbsolute;
                 }
+                self.await_pointer_exit_after_auto_release = false;
                 self.pending_capture_click = false;
             } else {
                 self.send_control_message(ControlMessage::AcquireControl);
@@ -995,6 +1017,7 @@ impl StreamApp {
             } else if hover_supported {
                 self.capture_mode = LocalCaptureMode::HoverAbsolute;
             }
+            self.await_pointer_exit_after_auto_release = false;
             self.pending_capture_click = false;
         }
 
@@ -1073,7 +1096,7 @@ impl StreamApp {
         };
         if self.capture_mode != LocalCaptureMode::HoverAbsolute
             || snapshot.controller_state != ControllerState::OwnedByYou
-            || !snapshot.capabilities.mouse_absolute
+            || !snapshot.capabilities.hover_capture
             || !video_rect.contains(pos)
         {
             return;
@@ -2028,7 +2051,7 @@ fn run_connection(
                                     cfg.hdr
                                 );
                             }
-                            debug_state.set_stream_config(cfg);
+                            shared_input.set_stream_config(cfg);
                             stream_config = Some(cfg);
                             if media_threads.is_none() {
                                 let media = match start_media_threads(
@@ -2101,11 +2124,12 @@ fn run_connection(
                         }
                         ControlMessage::InputCapabilities(capabilities) => {
                             eprintln!(
-                                "[cursor] capabilities: abs={} rel={} kbd={} separate_cursor={}",
+                                "[cursor] capabilities: abs={} rel={} kbd={} separate_cursor={} hover_capture={}",
                                 capabilities.mouse_absolute,
                                 capabilities.mouse_relative,
                                 capabilities.keyboard,
-                                capabilities.separate_cursor
+                                capabilities.separate_cursor,
+                                capabilities.hover_capture
                             );
                             shared_input.set_capabilities(capabilities);
                         }
@@ -2285,7 +2309,7 @@ fn run_connection(
                 for msg in drain_control_messages(&mut control_buf) {
                     match msg {
                         ControlMessage::StreamConfig(cfg) => {
-                            debug_state.set_stream_config(cfg);
+                            shared_input.set_stream_config(cfg);
                         }
                         ControlMessage::SessionDebugInfo(info) => {
                             debug_state.set_session_info(info);
@@ -2303,11 +2327,12 @@ fn run_connection(
                         }
                         ControlMessage::InputCapabilities(capabilities) => {
                             eprintln!(
-                                "[cursor] capabilities: abs={} rel={} kbd={} separate_cursor={}",
+                                "[cursor] capabilities: abs={} rel={} kbd={} separate_cursor={} hover_capture={}",
                                 capabilities.mouse_absolute,
                                 capabilities.mouse_relative,
                                 capabilities.keyboard,
-                                capabilities.separate_cursor
+                                capabilities.separate_cursor,
+                                capabilities.hover_capture
                             );
                             shared_input.set_capabilities(capabilities);
                         }
@@ -2565,6 +2590,42 @@ fn clamp_pos_to_video_rect(pos: egui::Pos2, rect: egui::Rect, pixels_per_point: 
     let max_x = (rect.right() - inset).max(rect.left());
     let max_y = (rect.bottom() - inset).max(rect.top());
     egui::pos2(pos.x.clamp(rect.left(), max_x), pos.y.clamp(rect.top(), max_y))
+}
+
+fn pointer_escape_position(
+    rect: egui::Rect,
+    attempted_pos: egui::Pos2,
+    pixels_per_point: f32,
+) -> egui::Pos2 {
+    let outward = 6.0 / pixels_per_point.max(1.0);
+    let clamped_x = attempted_pos.x.clamp(rect.left(), rect.right());
+    let clamped_y = attempted_pos.y.clamp(rect.top(), rect.bottom());
+    let overflow_left = (rect.left() - attempted_pos.x).max(0.0);
+    let overflow_right = (attempted_pos.x - rect.right()).max(0.0);
+    let overflow_top = (rect.top() - attempted_pos.y).max(0.0);
+    let overflow_bottom = (attempted_pos.y - rect.bottom()).max(0.0);
+
+    let horizontal_overflow = overflow_left.max(overflow_right);
+    let vertical_overflow = overflow_top.max(overflow_bottom);
+    if horizontal_overflow >= vertical_overflow {
+        if overflow_left > 0.0 {
+            egui::pos2(rect.left() - outward, clamped_y)
+        } else if overflow_right > 0.0 {
+            egui::pos2(rect.right() + outward, clamped_y)
+        } else if overflow_top > 0.0 {
+            egui::pos2(clamped_x, rect.top() - outward)
+        } else {
+            egui::pos2(clamped_x, rect.bottom() + outward)
+        }
+    } else if overflow_top > 0.0 {
+        egui::pos2(clamped_x, rect.top() - outward)
+    } else if overflow_bottom > 0.0 {
+        egui::pos2(clamped_x, rect.bottom() + outward)
+    } else if overflow_left > 0.0 {
+        egui::pos2(rect.left() - outward, clamped_y)
+    } else {
+        egui::pos2(rect.right() + outward, clamped_y)
+    }
 }
 
 fn remap_pos_between_video_rects(
@@ -2840,7 +2901,7 @@ fn render_debug_overlay(
     debug_tab: &mut DebugOverlayTab,
     cursor_lines: &[String],
 ) {
-    let stream_line = snapshot
+    let stream_line = input_snapshot
         .stream_config
         .as_ref()
         .map(|cfg| {
@@ -2895,7 +2956,7 @@ fn render_debug_overlay(
             }
         ),
         format!(
-            "input: controller={:?} mode={} client_id={} keys={} buttons=0x{pointer_buttons:02x} caps=abs:{} rel:{} kb:{} cursor:{}",
+            "input: controller={:?} mode={} client_id={} keys={} buttons=0x{pointer_buttons:02x} caps=abs:{} rel:{} kb:{} cursor:{} hover:{}",
             input_snapshot.controller_state,
             capture_mode.label(),
             input_snapshot
@@ -2922,6 +2983,11 @@ fn render_debug_overlay(
                 "y"
             } else {
                 "n"
+            },
+            if input_snapshot.capabilities.hover_capture {
+                "y"
+            } else {
+                "n"
             }
         ),
         format!(
@@ -2933,7 +2999,7 @@ fn render_debug_overlay(
         ),
         format!(
             "fps: stream={}  rx={:.1}  decode={:.1}  present={:.1}",
-            snapshot
+            input_snapshot
                 .stream_config
                 .as_ref()
                 .map(|cfg| cfg.framerate.to_string())
@@ -3088,6 +3154,12 @@ impl eframe::App for StreamApp {
             ctx.request_repaint();
         }
 
+        let debug_top = if state == ConnectionState::Connected {
+            self.render_floating_menu(ctx)
+        } else {
+            0.0
+        };
+
         let central_panel = if state == ConnectionState::Connected {
             #[cfg(target_os = "macos")]
             let frame = egui::Frame::NONE;
@@ -3165,8 +3237,6 @@ impl eframe::App for StreamApp {
         });
 
         if state == ConnectionState::Connected {
-            let debug_top = self.render_floating_menu(ctx);
-
             if self.debug_enabled {
                 let snapshot = self.debug_state.snapshot();
                 let input_snapshot = self.shared_input.snapshot();
@@ -3185,6 +3255,8 @@ impl eframe::App for StreamApp {
                 );
             }
         }
+
+        self.apply_pointer_capture_mode(ctx);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -3307,8 +3379,29 @@ impl eframe::App for StreamApp {
                                 .hover_cursor_pos
                                 .or(last_pointer_pos)
                                 .unwrap_or_else(|| rect.center());
+                            let unclamped =
+                                egui::pos2(base_pos.x + delta.x, base_pos.y + delta.y);
+                            if self.pointer_over_local_overlay(unclamped) {
+                                self.auto_release_capture(false);
+                                last_pointer_pos = Some(unclamped);
+                                ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(unclamped));
+                                ctx.request_repaint();
+                                continue;
+                            }
+                            if unclamped.x < rect.left()
+                                || unclamped.x > rect.right()
+                                || unclamped.y < rect.top()
+                                || unclamped.y > rect.bottom()
+                            {
+                                let escape_pos = pointer_escape_position(rect, unclamped, ctx.pixels_per_point());
+                                self.auto_release_capture(true);
+                                last_pointer_pos = Some(escape_pos);
+                                ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(escape_pos));
+                                ctx.request_repaint();
+                                continue;
+                            }
                             let next_pos = clamp_pos_to_video_rect(
-                                egui::pos2(base_pos.x + delta.x, base_pos.y + delta.y),
+                                unclamped,
                                 rect,
                                 ctx.pixels_per_point(),
                             );

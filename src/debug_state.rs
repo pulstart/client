@@ -1,6 +1,6 @@
 use crate::transport::TransportWindowStats;
 use crate::video_frame::{FrameDebugTiming, VideoFormat, VideoFrameBuffer};
-use st_protocol::{ClockSyncPong, SessionDebugInfo, StreamConfig};
+use st_protocol::{ClockSyncPong, SessionDebugInfo};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -8,7 +8,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub struct ConnectionDebugSnapshot {
     pub server_addr: String,
     pub display_refresh_millihz: Option<u32>,
-    pub stream_config: Option<StreamConfig>,
     pub decoder_name: String,
     pub encoder_name: String,
     pub capture_backend: String,
@@ -115,10 +114,6 @@ impl ConnectionDebugState {
 
     pub fn snapshot(&self) -> ConnectionDebugSnapshot {
         self.inner.lock().unwrap().snapshot.clone()
-    }
-
-    pub fn set_stream_config(&self, stream_config: StreamConfig) {
-        self.inner.lock().unwrap().snapshot.stream_config = Some(stream_config);
     }
 
     pub fn set_decoder_name(&self, decoder_name: &str) {
