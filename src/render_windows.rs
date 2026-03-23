@@ -421,7 +421,7 @@ impl DirectTextureBlitPipeline {
                 .map_err(|err| format!("create_buffer: {err}"))?
         };
         let vertices: [f32; 16] = [
-            -1.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+            -1.0, -1.0, 0.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0,
         ];
         let vertex_bytes = unsafe {
             std::slice::from_raw_parts(

@@ -3210,12 +3210,11 @@ impl eframe::App for StreamApp {
 
         let force_release = raw_input.events.iter().any(|event| match event {
             egui::Event::Key {
-                key: egui::Key::Escape,
+                key: egui::Key::Z,
                 pressed: true,
+                modifiers,
                 ..
-            } => {
-                raw_input.modifiers.ctrl || cfg!(target_os = "macos") && raw_input.modifiers.mac_cmd
-            }
+            } => modifiers.ctrl && modifiers.alt,
             _ => false,
         });
         if force_release {
@@ -3226,7 +3225,7 @@ impl eframe::App for StreamApp {
                 !matches!(
                     event,
                     egui::Event::Key {
-                        key: egui::Key::Escape,
+                        key: egui::Key::Z,
                         pressed: true,
                         ..
                     }
