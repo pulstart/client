@@ -44,6 +44,10 @@ use crate::debug_state::{unix_time_micros, ConnectionDebugSnapshot, ConnectionDe
 
 const DEFAULT_APP_PORT: u16 = 28_480;
 const MAX_REMOTE_CURSOR_TEXTURES: usize = 8;
+const INPUT_SENDER_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const INPUT_STATE_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
+const INPUT_STATE_REPAIR_WINDOW: Duration = Duration::from_millis(200);
+
 fn trace_enabled() -> bool {
     std::env::var_os("ST_TRACE").is_some()
 }
@@ -753,28 +757,42 @@ impl StreamApp {
         });
     }
 
+    fn send_absolute_cursor(
+        &mut self,
+        client_id: u32,
+        pos: egui::Pos2,
+        video_rect: egui::Rect,
+        force: bool,
+    ) -> bool {
+        if !video_rect.contains(pos) || self.pointer_over_local_overlay(pos) {
+            self.last_sent_absolute_cursor = None;
+            return false;
+        }
+
+        let absolute_x = normalized_coord(pos.x, video_rect.left(), video_rect.right());
+        let absolute_y = normalized_coord(pos.y, video_rect.top(), video_rect.bottom());
+        let next = (absolute_x, absolute_y);
+        if force || self.last_sent_absolute_cursor != Some(next) {
+            self.last_sent_absolute_cursor = Some(next);
+            self.send_input_packet(InputPacket::MouseAbsolute(MouseAbsoluteInput {
+                client_id,
+                x: absolute_x,
+                y: absolute_y,
+                buttons: self.pointer_buttons,
+            }));
+            true
+        } else {
+            false
+        }
+    }
+
     fn send_absolute_cursor_if_needed(
         &mut self,
         client_id: u32,
         pos: egui::Pos2,
         video_rect: egui::Rect,
     ) {
-        if video_rect.contains(pos) && !self.pointer_over_local_overlay(pos) {
-            let absolute_x = normalized_coord(pos.x, video_rect.left(), video_rect.right());
-            let absolute_y = normalized_coord(pos.y, video_rect.top(), video_rect.bottom());
-            let next = (absolute_x, absolute_y);
-            if self.last_sent_absolute_cursor != Some(next) {
-                self.last_sent_absolute_cursor = Some(next);
-                self.send_input_packet(InputPacket::MouseAbsolute(MouseAbsoluteInput {
-                    client_id,
-                    x: absolute_x,
-                    y: absolute_y,
-                    buttons: self.pointer_buttons,
-                }));
-            }
-        } else {
-            self.last_sent_absolute_cursor = None;
-        }
+        let _ = self.send_absolute_cursor(client_id, pos, video_rect, false);
     }
 
     fn sync_remote_cursor_texture(&mut self, ctx: &egui::Context) {
@@ -2605,6 +2623,156 @@ fn drain_control_messages(buf: &mut Vec<u8>) -> Vec<ControlMessage> {
     messages
 }
 
+#[derive(Clone, Copy, Default)]
+struct MouseInputHeartbeat {
+    packet: Option<InputPacket>,
+    buttons: u8,
+    resend_until: Option<Instant>,
+    last_sent_at: Option<Instant>,
+}
+
+impl MouseInputHeartbeat {
+    fn observe(&mut self, packet: InputPacket, now: Instant) {
+        let Some(heartbeat_packet) = mouse_heartbeat_packet(packet) else {
+            return;
+        };
+        let next_buttons = mouse_heartbeat_buttons(heartbeat_packet);
+        if next_buttons != self.buttons {
+            self.resend_until = Some(now + INPUT_STATE_REPAIR_WINDOW);
+        }
+        self.packet = Some(heartbeat_packet);
+        self.buttons = next_buttons;
+    }
+
+    fn mark_sent(&mut self, packet: InputPacket, now: Instant) {
+        if matches!(
+            packet,
+            InputPacket::MouseAbsolute(_)
+                | InputPacket::MouseRelative(_)
+                | InputPacket::MouseButtons(_)
+                | InputPacket::MouseWheel(_)
+        ) {
+            self.last_sent_at = Some(now);
+        }
+    }
+
+    fn due_packet(&mut self, now: Instant) -> Option<InputPacket> {
+        let packet = self.packet?;
+        let resend_due_to_transition = self.repair_window_active(now);
+        if self.buttons == 0 && !resend_due_to_transition {
+            return None;
+        }
+        if let Some(last_sent_at) = self.last_sent_at {
+            if now.saturating_duration_since(last_sent_at) < INPUT_STATE_HEARTBEAT_INTERVAL {
+                return None;
+            }
+        }
+        self.last_sent_at = Some(now);
+        Some(packet)
+    }
+
+    fn repair_window_active(&mut self, now: Instant) -> bool {
+        match self.resend_until {
+            Some(until) if now < until => true,
+            Some(_) => {
+                self.resend_until = None;
+                false
+            }
+            None => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct KeyboardInputHeartbeat {
+    packet: Option<InputPacket>,
+    any_pressed: bool,
+    resend_until: Option<Instant>,
+    last_sent_at: Option<Instant>,
+}
+
+impl KeyboardInputHeartbeat {
+    fn observe(&mut self, packet: InputPacket, now: Instant) {
+        let InputPacket::KeyboardState(state) = packet else {
+            return;
+        };
+
+        let next_packet = InputPacket::KeyboardState(state);
+        if self.packet != Some(next_packet) {
+            self.resend_until = Some(now + INPUT_STATE_REPAIR_WINDOW);
+        }
+        self.packet = Some(next_packet);
+        self.any_pressed = state.pressed.iter().any(|byte| *byte != 0);
+    }
+
+    fn mark_sent(&mut self, packet: InputPacket, now: Instant) {
+        if matches!(packet, InputPacket::KeyboardState(_)) {
+            self.last_sent_at = Some(now);
+        }
+    }
+
+    fn due_packet(&mut self, now: Instant) -> Option<InputPacket> {
+        let packet = self.packet?;
+        let resend_due_to_transition = self.repair_window_active(now);
+        if !self.any_pressed && !resend_due_to_transition {
+            return None;
+        }
+        if let Some(last_sent_at) = self.last_sent_at {
+            if now.saturating_duration_since(last_sent_at) < INPUT_STATE_HEARTBEAT_INTERVAL {
+                return None;
+            }
+        }
+        self.last_sent_at = Some(now);
+        Some(packet)
+    }
+
+    fn repair_window_active(&mut self, now: Instant) -> bool {
+        match self.resend_until {
+            Some(until) if now < until => true,
+            Some(_) => {
+                self.resend_until = None;
+                false
+            }
+            None => false,
+        }
+    }
+}
+
+fn mouse_heartbeat_packet(packet: InputPacket) -> Option<InputPacket> {
+    match packet {
+        InputPacket::MouseAbsolute(packet) => Some(InputPacket::MouseAbsolute(packet)),
+        InputPacket::MouseRelative(packet) => Some(InputPacket::MouseButtons(MouseButtonsInput {
+            client_id: packet.client_id,
+            buttons: packet.buttons,
+        })),
+        InputPacket::MouseButtons(packet) => Some(InputPacket::MouseButtons(packet)),
+        InputPacket::MouseWheel(packet) => Some(InputPacket::MouseButtons(MouseButtonsInput {
+            client_id: packet.client_id,
+            buttons: packet.buttons,
+        })),
+        InputPacket::KeyboardState(_) => None,
+    }
+}
+
+fn mouse_heartbeat_buttons(packet: InputPacket) -> u8 {
+    match packet {
+        InputPacket::MouseAbsolute(packet) => packet.buttons,
+        InputPacket::MouseButtons(packet) => packet.buttons,
+        _ => 0,
+    }
+}
+
+fn send_input_packet_raw(
+    socket: &UdpSocket,
+    target: std::net::SocketAddr,
+    packet: InputPacket,
+    seq: &mut u16,
+) {
+    let raw = packet.serialize(*seq);
+    *seq = seq.wrapping_add(1);
+    let _ = socket.send_to(&raw, target);
+}
+
 fn run_input_sender(
     socket: UdpSocket,
     target: std::net::SocketAddr,
@@ -2612,19 +2780,32 @@ fn run_input_sender(
     shutdown_rx: crossbeam_channel::Receiver<()>,
 ) {
     let mut seq = 0u16;
-    let _ = socket.set_write_timeout(Some(Duration::from_millis(50)));
+    let mut mouse_heartbeat = MouseInputHeartbeat::default();
+    let mut keyboard_heartbeat = KeyboardInputHeartbeat::default();
+    let _ = socket.set_write_timeout(Some(INPUT_STATE_HEARTBEAT_INTERVAL));
     loop {
         if shutdown_rx.try_recv().is_ok() {
             break;
         }
 
-        match input_rx.recv_timeout(Duration::from_millis(50)) {
+        match input_rx.recv_timeout(INPUT_SENDER_POLL_INTERVAL) {
             Ok(packet) => {
-                let raw = packet.serialize(seq);
-                seq = seq.wrapping_add(1);
-                let _ = socket.send_to(&raw, target);
+                let now = Instant::now();
+                mouse_heartbeat.observe(packet, now);
+                keyboard_heartbeat.observe(packet, now);
+                send_input_packet_raw(&socket, target, packet, &mut seq);
+                mouse_heartbeat.mark_sent(packet, now);
+                keyboard_heartbeat.mark_sent(packet, now);
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                let now = Instant::now();
+                if let Some(packet) = mouse_heartbeat.due_packet(now) {
+                    send_input_packet_raw(&socket, target, packet, &mut seq);
+                }
+                if let Some(packet) = keyboard_heartbeat.due_packet(now) {
+                    send_input_packet_raw(&socket, target, packet, &mut seq);
+                }
+            }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -3581,10 +3762,24 @@ impl eframe::App for StreamApp {
                         && (self.capture_mode == LocalCaptureMode::CapturedRelative
                             || self.capture_mode == LocalCaptureMode::HoverAbsolute && over_video)
                     {
-                        self.send_input_packet(InputPacket::MouseButtons(MouseButtonsInput {
-                            client_id,
-                            buttons: self.pointer_buttons,
-                        }));
+                        if self.capture_mode == LocalCaptureMode::HoverAbsolute {
+                            if let (Some(route_pos), Some(rect)) = (route_pos, video_rect) {
+                                let _ =
+                                    self.send_absolute_cursor(client_id, route_pos, rect, true);
+                            } else {
+                                self.send_input_packet(InputPacket::MouseButtons(
+                                    MouseButtonsInput {
+                                        client_id,
+                                        buttons: self.pointer_buttons,
+                                    },
+                                ));
+                            }
+                        } else {
+                            self.send_input_packet(InputPacket::MouseButtons(MouseButtonsInput {
+                                client_id,
+                                buttons: self.pointer_buttons,
+                            }));
+                        }
                     }
                 }
                 egui::Event::MouseWheel { delta, unit, .. } => {
@@ -3656,6 +3851,98 @@ fn is_force_release_shortcut(modifiers: &egui::Modifiers) -> bool {
     #[cfg(not(target_os = "macos"))]
     {
         modifiers.ctrl && modifiers.alt && !modifiers.command
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mouse_heartbeat_uses_safe_packets() {
+        let absolute = InputPacket::MouseAbsolute(MouseAbsoluteInput {
+            client_id: 7,
+            x: 100,
+            y: 200,
+            buttons: MOUSE_BUTTON_PRIMARY,
+        });
+        assert_eq!(mouse_heartbeat_packet(absolute), Some(absolute));
+
+        let relative = InputPacket::MouseRelative(MouseRelativeInput {
+            client_id: 7,
+            dx: 3,
+            dy: -4,
+            buttons: MOUSE_BUTTON_PRIMARY,
+        });
+        assert_eq!(
+            mouse_heartbeat_packet(relative),
+            Some(InputPacket::MouseButtons(MouseButtonsInput {
+                client_id: 7,
+                buttons: MOUSE_BUTTON_PRIMARY,
+            }))
+        );
+    }
+
+    #[test]
+    fn mouse_heartbeat_repeats_release_for_repair_window() {
+        let client_id = 9;
+        let start = Instant::now();
+        let mut heartbeat = MouseInputHeartbeat::default();
+
+        let pressed = InputPacket::MouseButtons(MouseButtonsInput {
+            client_id,
+            buttons: MOUSE_BUTTON_PRIMARY,
+        });
+        heartbeat.observe(pressed, start);
+        heartbeat.mark_sent(pressed, start);
+
+        let release_at = start + Duration::from_millis(10);
+        let released = InputPacket::MouseButtons(MouseButtonsInput {
+            client_id,
+            buttons: 0,
+        });
+        heartbeat.observe(released, release_at);
+        heartbeat.mark_sent(released, release_at);
+
+        assert_eq!(
+            heartbeat.due_packet(release_at + INPUT_STATE_HEARTBEAT_INTERVAL),
+            Some(released)
+        );
+        assert_eq!(
+            heartbeat.due_packet(release_at + INPUT_STATE_REPAIR_WINDOW + Duration::from_millis(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn keyboard_heartbeat_repeats_release_for_repair_window() {
+        let client_id = 11;
+        let start = Instant::now();
+        let mut heartbeat = KeyboardInputHeartbeat::default();
+        let mut pressed = [0u8; st_protocol::KEYBOARD_STATE_BYTES];
+        let (byte, bit) = KeyboardKey::W.bit();
+        pressed[byte] |= bit;
+
+        let down = InputPacket::KeyboardState(KeyboardStateInput { client_id, pressed });
+        heartbeat.observe(down, start);
+        heartbeat.mark_sent(down, start);
+
+        let release_at = start + Duration::from_millis(10);
+        let up = InputPacket::KeyboardState(KeyboardStateInput {
+            client_id,
+            pressed: [0u8; st_protocol::KEYBOARD_STATE_BYTES],
+        });
+        heartbeat.observe(up, release_at);
+        heartbeat.mark_sent(up, release_at);
+
+        assert_eq!(
+            heartbeat.due_packet(release_at + INPUT_STATE_HEARTBEAT_INTERVAL),
+            Some(up)
+        );
+        assert_eq!(
+            heartbeat.due_packet(release_at + INPUT_STATE_REPAIR_WINDOW + Duration::from_millis(1)),
+            None
+        );
     }
 }
 
