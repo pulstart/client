@@ -977,7 +977,8 @@ impl StreamApp {
         response: &egui::Response,
     ) {
         let previous_video_rect = self.last_video_rect;
-        self.last_video_rect = Some(response.rect);
+        let video_rect = self.current_video_rect(ctx).unwrap_or(response.rect);
+        self.last_video_rect = Some(video_rect);
         let previous_capture_mode = self.capture_mode;
 
         let snapshot = self.shared_input.snapshot();
@@ -996,12 +997,12 @@ impl StreamApp {
             && snapshot.controller_state == ControllerState::OwnedByYou
             && hover_supported
         {
-            let base_pos = if previous_video_rect != Some(response.rect) {
+            let base_pos = if previous_video_rect != Some(video_rect) {
                 self.hover_cursor_pos
                     .map(|pos| {
                         previous_video_rect
                             .map(|previous_rect| {
-                                remap_pos_between_video_rects(pos, previous_rect, response.rect)
+                                remap_pos_between_video_rects(pos, previous_rect, video_rect)
                             })
                             .unwrap_or(pos)
                     })
@@ -1014,8 +1015,7 @@ impl StreamApp {
                 self.hover_cursor_pos.or(actual_pointer_pos)
             };
             if let Some(base_pos) = base_pos {
-                let clamped =
-                    clamp_pos_to_video_rect(base_pos, response.rect, ctx.pixels_per_point());
+                let clamped = clamp_pos_to_video_rect(base_pos, video_rect, ctx.pixels_per_point());
                 self.hover_cursor_pos = Some(clamped);
                 pointer_pos = Some(clamped);
             }
@@ -1024,7 +1024,7 @@ impl StreamApp {
             .map(|pos| self.pointer_over_local_overlay(pos))
             .unwrap_or(false);
         let pointer_inside_video_rect = pointer_pos
-            .map(|pos| response.rect.contains(pos))
+            .map(|pos| video_rect.contains(pos))
             .unwrap_or(false);
         let pointer_over_video = pointer_inside_video_rect && !pointer_over_local_overlay;
         let clicked_video = response.clicked_by(egui::PointerButton::Primary) && pointer_over_video;
@@ -1112,27 +1112,27 @@ impl StreamApp {
             if virtual_hover {
                 let desired_hover_pos = if previous_capture_mode == LocalCaptureMode::HoverAbsolute {
                     self.hover_cursor_pos.or(pointer_pos).map(|pos| {
-                        clamp_pos_to_video_rect(pos, response.rect, ctx.pixels_per_point())
+                        clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point())
                     })
                 } else {
                     actual_pointer_pos
                         .or(pointer_pos)
-                        .map(|pos| clamp_pos_to_video_rect(pos, response.rect, ctx.pixels_per_point()))
+                        .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()))
                 };
                 if let Some(pos) = desired_hover_pos {
                     self.hover_cursor_pos = Some(pos);
                 }
 
                 if let (Some(client_id), Some(pos)) = (snapshot.client_id, self.hover_cursor_pos) {
-                    self.send_absolute_cursor_if_needed(client_id, pos, response.rect);
+                    self.send_absolute_cursor_if_needed(client_id, pos, video_rect);
                 }
             } else {
                 let hover_pos = actual_pointer_pos
                     .or(pointer_pos)
-                    .filter(|pos| response.rect.contains(*pos) && !self.pointer_over_local_overlay(*pos));
+                    .filter(|pos| video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos));
                 self.hover_cursor_pos = hover_pos;
                 if let (Some(client_id), Some(pos)) = (snapshot.client_id, hover_pos) {
-                    self.send_absolute_cursor_if_needed(client_id, pos, response.rect);
+                    self.send_absolute_cursor_if_needed(client_id, pos, video_rect);
                 } else {
                     self.last_sent_absolute_cursor = None;
                 }
