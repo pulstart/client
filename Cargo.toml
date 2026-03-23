@@ -12,6 +12,15 @@ cpal = "0.15"
 opus = "0.3"
 khronos-egl = { version = "6", features = ["dynamic"] }
 libc = "0.2"
+flate2 = "1"
+self-replace = "1"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tar = "0.4"
+tempfile = "3"
+ureq = { version = "2", default-features = true }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
@@ -24,4 +33,4 @@ raw-window-handle = "0.6"
 zbus = "5.14"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Power", "Win32_System_Threading"] }

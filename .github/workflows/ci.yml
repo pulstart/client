@@ -100,6 +100,8 @@ jobs:
             vcpkg_installed
             ~\AppData\Local\vcpkg\archives
           key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-
 
       - name: Build Unix release
         if: matrix.build_kind == 'unix'

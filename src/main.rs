@@ -13,6 +13,7 @@ mod render_macos_metal;
 #[cfg(target_os = "windows")]
 mod render_windows;
 mod transport;
+mod updater;
 mod video_frame;
 
 use eframe::egui;
@@ -57,6 +58,27 @@ enum ConnectionState {
 enum DebugOverlayTab {
     General,
     Cursor,
+}
+
+#[derive(Clone, Debug)]
+enum UpdateUiState {
+    Unsupported(String),
+    Idle,
+    Checking,
+    UpToDate { version: String, html_url: String },
+    UpdateAvailable(updater::ReleaseInfo),
+    Downloading { version: String },
+    ClosingForUpdate { version: String },
+    Error(String),
+}
+
+#[derive(Clone, Debug)]
+enum UpdateWorkerEvent {
+    CheckFinished(Result<updater::CheckOutcome, String>),
+    InstallPrepared {
+        version: String,
+        result: Result<(), String>,
+    },
 }
 
 struct CursorOverlayGeometry {
@@ -106,6 +128,9 @@ struct StreamApp {
     last_pointer_move: Option<Instant>,
     applied_cursor_visible: Option<bool>,
     applied_cursor_grab: Option<egui::CursorGrab>,
+    update_ui_state: UpdateUiState,
+    update_tx: crossbeam_channel::Sender<UpdateWorkerEvent>,
+    update_rx: crossbeam_channel::Receiver<UpdateWorkerEvent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +196,11 @@ impl StreamApp {
         let audio = load_audio_enabled();
         let debug_enabled = load_debug_enabled();
         let display_refresh_millihz = display::detect_max_refresh_millihz();
+        let (update_tx, update_rx) = crossbeam_channel::unbounded();
+        let update_ui_state = match updater::supported_target_label() {
+            Ok(_) => UpdateUiState::Idle,
+            Err(err) => UpdateUiState::Unsupported(err),
+        };
         if let Some(rate) = display_refresh_millihz {
             println!(
                 "[display] max client refresh detected: {:.3} Hz",
@@ -215,6 +245,9 @@ impl StreamApp {
             last_pointer_move: None,
             applied_cursor_visible: None,
             applied_cursor_grab: None,
+            update_ui_state,
+            update_tx,
+            update_rx,
         }
     }
 
@@ -521,6 +554,75 @@ impl StreamApp {
         if let Some(tx) = &self.input_tx {
             let _ = tx.try_send(packet);
         }
+    }
+
+    fn process_update_events(&mut self) {
+        while let Ok(event) = self.update_rx.try_recv() {
+            match event {
+                UpdateWorkerEvent::CheckFinished(result) => match result {
+                    Ok(updater::CheckOutcome::UpToDate {
+                        latest_version: version,
+                        html_url,
+                    }) => {
+                        self.update_ui_state = UpdateUiState::UpToDate {
+                            version,
+                            html_url,
+                        };
+                    }
+                    Ok(updater::CheckOutcome::UpdateAvailable(release)) => {
+                        self.update_ui_state = UpdateUiState::UpdateAvailable(release);
+                    }
+                    Err(err) => {
+                        self.update_ui_state = UpdateUiState::Error(err);
+                    }
+                },
+                UpdateWorkerEvent::InstallPrepared { version, result } => match result {
+                    Ok(()) => {
+                        self.update_ui_state = UpdateUiState::ClosingForUpdate { version };
+                    }
+                    Err(err) => {
+                        self.update_ui_state = UpdateUiState::Error(err);
+                    }
+                },
+            }
+        }
+    }
+
+    fn begin_update_check(&mut self, ctx: egui::Context) {
+        if matches!(
+            self.update_ui_state,
+            UpdateUiState::Checking | UpdateUiState::Downloading { .. }
+        ) {
+            return;
+        }
+        if matches!(self.update_ui_state, UpdateUiState::Unsupported(_)) {
+            return;
+        }
+
+        self.update_ui_state = UpdateUiState::Checking;
+        let tx = self.update_tx.clone();
+        std::thread::spawn(move || {
+            let result = updater::check_latest_release();
+            let _ = tx.send(UpdateWorkerEvent::CheckFinished(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn begin_update_install(&mut self, ctx: egui::Context, release: updater::ReleaseInfo) {
+        if matches!(self.update_ui_state, UpdateUiState::Downloading { .. }) {
+            return;
+        }
+
+        let version = release.version.clone();
+        self.update_ui_state = UpdateUiState::Downloading {
+            version: version.clone(),
+        };
+        let tx = self.update_tx.clone();
+        std::thread::spawn(move || {
+            let result = updater::prepare_and_spawn_update(&release);
+            let _ = tx.send(UpdateWorkerEvent::InstallPrepared { version, result });
+            ctx.request_repaint();
+        });
     }
 
     fn send_absolute_cursor_if_needed(
@@ -1130,12 +1232,12 @@ impl StreamApp {
                     if split_cards {
                         ui.columns(2, |columns| {
                             self.render_connection_card(&mut columns[0], ctx);
-                            self.render_client_capabilities_card(&mut columns[1], caps);
+                            self.render_client_capabilities_card(&mut columns[1], ctx, caps);
                         });
                     } else {
                         self.render_connection_card(ui, ctx);
                         ui.add_space(12.0);
-                        self.render_client_capabilities_card(ui, caps);
+                        self.render_client_capabilities_card(ui, ctx, caps);
                     }
 
                     ui.add_space(12.0);
@@ -1286,6 +1388,7 @@ impl StreamApp {
     fn render_client_capabilities_card(
         &mut self,
         ui: &mut egui::Ui,
+        ctx: &egui::Context,
         caps: NativeSurfaceCapabilities,
     ) {
         egui::Frame::popup(ui.style())
@@ -1332,6 +1435,11 @@ impl StreamApp {
                     self.debug_enabled_flag
                         .store(self.debug_enabled, Ordering::SeqCst);
                 }
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(12.0);
+                self.render_update_panel(ui, ctx, false);
 
                 ui.add_space(14.0);
                 ui.separator();
@@ -1389,6 +1497,144 @@ impl StreamApp {
                         });
                 }
             });
+    }
+
+    fn render_update_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, compact: bool) {
+        ui.label(
+            egui::RichText::new("App Update")
+                .strong()
+                .color(egui::Color32::from_rgb(224, 230, 236)),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(format!("installed: v{}", updater::current_version()))
+                .monospace()
+                .color(egui::Color32::from_rgb(228, 234, 240)),
+        );
+        if let Ok(target) = updater::supported_target_label() {
+            ui.label(
+                egui::RichText::new(format!("asset: {target}"))
+                    .monospace()
+                    .color(egui::Color32::from_rgb(174, 186, 198)),
+            );
+        }
+
+        ui.add_space(6.0);
+        match &self.update_ui_state {
+            UpdateUiState::Unsupported(message) => {
+                ui.label(
+                    egui::RichText::new(message)
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(198, 111, 111)),
+                );
+            }
+            UpdateUiState::Idle => {
+                let description = if compact {
+                    "Check GitHub releases and replace the installed package in place."
+                } else {
+                    "Check the client GitHub releases and stage a full in-place package update for this platform."
+                };
+                ui.label(
+                    egui::RichText::new(description)
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(134, 147, 160)),
+                );
+            }
+            UpdateUiState::Checking => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new("Checking GitHub releases...")
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(180, 191, 203)),
+                    );
+                });
+            }
+            UpdateUiState::UpToDate { version, html_url } => {
+                ui.label(
+                    egui::RichText::new(format!("Up to date. Latest release: v{version}"))
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(114, 200, 153)),
+                );
+                ui.hyperlink_to("View releases", html_url);
+            }
+            UpdateUiState::UpdateAvailable(release) => {
+                ui.label(
+                    egui::RichText::new(format!("Update available: v{}", release.version))
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(136, 199, 255)),
+                );
+                if !compact {
+                    ui.label(
+                        egui::RichText::new(format!("package: {}", release.asset_name))
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(134, 147, 160)),
+                    );
+                }
+                ui.hyperlink_to("Open release page", &release.html_url);
+            }
+            UpdateUiState::Downloading { version } => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Downloading and installing v{version}..."
+                        ))
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(180, 191, 203)),
+                    );
+                });
+            }
+            UpdateUiState::ClosingForUpdate { version } => {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "v{version} is staged. Closing the client so the package updater can finish."
+                    ))
+                    .size(12.0)
+                    .color(egui::Color32::from_rgb(114, 200, 153)),
+                );
+            }
+            UpdateUiState::Error(message) => {
+                ui.label(
+                    egui::RichText::new(message)
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(198, 111, 111)),
+                );
+            }
+        }
+
+        ui.add_space(8.0);
+        let busy = matches!(
+            self.update_ui_state,
+            UpdateUiState::Checking | UpdateUiState::Downloading { .. }
+        );
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !busy && !matches!(self.update_ui_state, UpdateUiState::Unsupported(_)),
+                    egui::Button::new("Check For Updates"),
+                )
+                .clicked()
+            {
+                self.begin_update_check(ctx.clone());
+            }
+
+            if let UpdateUiState::UpdateAvailable(release) = &self.update_ui_state {
+                if ui
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new(format!("Update To v{}", release.version)),
+                    )
+                    .clicked()
+                {
+                    self.begin_update_install(ctx.clone(), release.clone());
+                }
+            }
+
+            if compact {
+                ui.hyperlink_to("Releases", updater::releases_page_url());
+            }
+        });
     }
 
     fn render_floating_menu(&mut self, ctx: &egui::Context) -> f32 {
@@ -1479,6 +1725,11 @@ impl StreamApp {
                                 {
                                     debug_toggled = true;
                                 }
+
+                                ui.add_space(8.0);
+                                ui.separator();
+                                ui.add_space(8.0);
+                                self.render_update_panel(ui, ctx, true);
                             });
                         });
                 });
@@ -2534,6 +2785,10 @@ fn render_client_summary_panel(
                     .color(egui::Color32::from_rgb(226, 232, 240)),
             );
             ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(format!("version: v{}", updater::current_version()))
+                    .monospace(),
+            );
             ui.label(egui::RichText::new(format!("platform: {}", platform_label())).monospace());
             ui.label(
                 egui::RichText::new(format!(
@@ -2761,6 +3016,7 @@ fn render_debug_overlay(
 
 impl eframe::App for StreamApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.process_update_events();
         let state = self.state.lock().unwrap().clone();
         if matches!(
             state,
@@ -2781,6 +3037,15 @@ impl eframe::App for StreamApp {
             && (self.debug_enabled || self.menu_open || recent_pointer_activity)
         {
             ctx.request_repaint_after(Duration::from_millis(250));
+        }
+        if matches!(
+            self.update_ui_state,
+            UpdateUiState::Checking | UpdateUiState::Downloading { .. }
+        ) {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if matches!(self.update_ui_state, UpdateUiState::ClosingForUpdate { .. }) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
         // Track pointer movement so the floating launcher can briefly become more visible.
@@ -3157,6 +3422,15 @@ impl eframe::App for StreamApp {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    match updater::maybe_run_apply_update_from_args() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(err) => {
+            eprintln!("[updater] {err}");
+            std::process::exit(1);
+        }
+    }
+
     #[cfg(target_os = "macos")]
     let viewport = egui::ViewportBuilder::default()
         .with_title("Stream Client")
