@@ -126,6 +126,7 @@ struct StreamApp {
     seen_cursor_shape_version: u64,
     debug_overlay_tab: DebugOverlayTab,
     menu_open: bool,
+    menu_button_pos: egui::Pos2,
     local_overlay_hit_rects: Vec<egui::Rect>,
     last_pointer_move: Option<Instant>,
     await_pointer_exit_after_auto_release: bool,
@@ -148,6 +149,13 @@ fn state_dir() -> PathBuf {
             PathBuf::from(home).join(".local/state")
         });
     base.join("st")
+}
+
+const FLOATING_MENU_BUTTON_SIZE: f32 = 40.0;
+const FLOATING_MENU_BUTTON_MARGIN: f32 = 12.0;
+
+fn default_menu_button_pos() -> egui::Pos2 {
+    egui::pos2(FLOATING_MENU_BUTTON_MARGIN, FLOATING_MENU_BUTTON_MARGIN)
 }
 
 fn load_last_server() -> Option<String> {
@@ -189,6 +197,33 @@ fn save_debug_enabled(enabled: bool) {
     let _ = std::fs::write(dir.join("debug_enabled"), if enabled { "1" } else { "0" });
 }
 
+fn load_menu_button_pos() -> Option<egui::Pos2> {
+    let text = std::fs::read_to_string(state_dir().join("menu_button_pos")).ok()?;
+    let mut parts = text.split_whitespace();
+    let x = parts.next()?.parse::<f32>().ok()?;
+    let y = parts.next()?.parse::<f32>().ok()?;
+    if x.is_finite() && y.is_finite() {
+        Some(egui::pos2(x, y))
+    } else {
+        None
+    }
+}
+
+fn save_menu_button_pos(pos: egui::Pos2) {
+    let dir = state_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("menu_button_pos"), format!("{:.1} {:.1}", pos.x, pos.y));
+}
+
+fn clamp_menu_button_pos(pos: egui::Pos2, content_rect: egui::Rect) -> egui::Pos2 {
+    let max_x = (content_rect.right() - FLOATING_MENU_BUTTON_SIZE).max(content_rect.left());
+    let max_y = (content_rect.bottom() - FLOATING_MENU_BUTTON_SIZE).max(content_rect.top());
+    egui::pos2(
+        pos.x.clamp(content_rect.left(), max_x),
+        pos.y.clamp(content_rect.top(), max_y),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // StreamApp
 // ---------------------------------------------------------------------------
@@ -198,6 +233,7 @@ impl StreamApp {
         let saved = load_last_server().unwrap_or_else(|| "127.0.0.1:8080".to_string());
         let audio = load_audio_enabled();
         let debug_enabled = load_debug_enabled();
+        let menu_button_pos = load_menu_button_pos().unwrap_or_else(default_menu_button_pos);
         let display_refresh_millihz = display::detect_max_refresh_millihz();
         let (update_tx, update_rx) = crossbeam_channel::unbounded();
         let update_ui_state = match updater::supported_target_label() {
@@ -244,6 +280,7 @@ impl StreamApp {
             seen_cursor_shape_version: 0,
             debug_overlay_tab: DebugOverlayTab::General,
             menu_open: false,
+            menu_button_pos,
             local_overlay_hit_rects: Vec::new(),
             last_pointer_move: None,
             await_pointer_exit_after_auto_release: false,
@@ -1657,6 +1694,8 @@ impl StreamApp {
 
     fn render_floating_menu(&mut self, ctx: &egui::Context) -> f32 {
         self.local_overlay_hit_rects.clear();
+        let content_rect = ctx.content_rect();
+        self.menu_button_pos = clamp_menu_button_pos(self.menu_button_pos, content_rect);
         let recent_pointer_activity = self
             .last_pointer_move
             .map(|t| t.elapsed() < Duration::from_secs(3))
@@ -1671,12 +1710,15 @@ impl StreamApp {
 
         let button = egui::Area::new(egui::Id::new("floating_menu_button"))
             .order(egui::Order::Foreground)
-            .fixed_pos(egui::pos2(12.0, 12.0))
+            .current_pos(self.menu_button_pos)
+            .movable(true)
+            .constrain_to(content_rect)
             .show(ctx, |ui| {
                 ui.add_sized(
-                    [78.0, 30.0],
+                    [FLOATING_MENU_BUTTON_SIZE, FLOATING_MENU_BUTTON_SIZE],
                     egui::Button::new(
-                        egui::RichText::new("Menu")
+                        egui::RichText::new("M")
+                            .size(18.0)
                             .strong()
                             .color(egui::Color32::from_rgb(235, 238, 242)),
                     )
@@ -1692,9 +1734,18 @@ impl StreamApp {
                     )),
                 )
             });
-        let button_rect = button.inner.rect;
+        let button_rect = button.response.rect;
+        let next_button_pos = clamp_menu_button_pos(button_rect.min, content_rect);
+        let moved = next_button_pos.distance_sq(self.menu_button_pos) > 0.25;
+        if moved {
+            self.menu_button_pos = next_button_pos;
+        }
+        if button.response.drag_stopped() {
+            self.menu_button_pos = next_button_pos;
+            save_menu_button_pos(self.menu_button_pos);
+        }
         self.local_overlay_hit_rects.push(button_rect);
-        if button.inner.clicked() {
+        if button.inner.clicked() && !button.response.dragged() && !button.response.drag_stopped() {
             self.menu_open = !self.menu_open;
             self.last_pointer_move = Some(Instant::now());
         }
@@ -1704,9 +1755,13 @@ impl StreamApp {
             let mut request_disconnect = false;
             let mut audio_toggled = false;
             let mut debug_toggled = false;
+            let menu_left =
+                button_rect
+                    .left()
+                    .clamp(content_rect.left(), (content_rect.right() - 190.0).max(content_rect.left()));
             let menu = egui::Area::new(egui::Id::new("floating_menu_popup"))
                 .order(egui::Order::Foreground)
-                .fixed_pos(egui::pos2(button_rect.left(), button_rect.bottom() + 8.0))
+                .fixed_pos(egui::pos2(menu_left, button_rect.bottom() + 8.0))
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style())
                         .fill(egui::Color32::from_rgba_unmultiplied(20, 24, 28, 232))
