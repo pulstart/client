@@ -452,7 +452,7 @@ fn spawn_elevated_helper(
 
     let result = unsafe {
         ShellExecuteW(
-            0,
+            std::ptr::null_mut(),
             verb.as_ptr(),
             file.as_ptr(),
             params.as_ptr(),
