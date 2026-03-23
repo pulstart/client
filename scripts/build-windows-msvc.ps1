@@ -50,6 +50,11 @@ try {
     $env:VCPKGRS_DYNAMIC = "1"
     $env:OPUS_DYNAMIC = "1"
     $env:LIBOPUS_LIB_DIR = $opusRoot
+    if ($Configuration -eq "release") {
+        $env:VCPKG_BUILD_TYPE = "release"
+    } else {
+        Remove-Item Env:VCPKG_BUILD_TYPE -ErrorAction SilentlyContinue
+    }
 
     & $vcpkgExe install --triplet $Triplet --x-manifest-root=$clientRoot
     if ($LASTEXITCODE -ne 0) {
