@@ -1754,7 +1754,7 @@ impl StreamApp {
         let button_rect =
             egui::Rect::from_min_size(self.menu_button_pos, egui::vec2(FLOATING_MENU_BUTTON_SIZE, FLOATING_MENU_BUTTON_SIZE));
         self.local_overlay_hit_rects.push(button_rect);
-        if button_response.clicked() && !button_response.dragged() && !button_response.drag_stopped() {
+        if button_response.clicked() {
             self.menu_open = !self.menu_open;
             self.last_pointer_move = Some(Instant::now());
         }
