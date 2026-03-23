@@ -507,8 +507,7 @@ impl StreamApp {
         }
     }
 
-    fn current_video_rect(&self, ctx: &egui::Context) -> Option<egui::Rect> {
-        let content_rect = ctx.content_rect();
+    fn video_rect_for_container(&self, content_rect: egui::Rect) -> Option<egui::Rect> {
         let video_size = self.video_space_size()?;
         if video_size.x <= 0.0
             || video_size.y <= 0.0
@@ -525,6 +524,10 @@ impl StreamApp {
 
         let sized = egui::vec2(video_size.x * scale, video_size.y * scale);
         Some(egui::Rect::from_center_size(content_rect.center(), sized))
+    }
+
+    fn current_video_rect(&self, ctx: &egui::Context) -> Option<egui::Rect> {
+        self.video_rect_for_container(ctx.content_rect())
     }
 
     fn server_cursor_stream_top_left(
@@ -3402,7 +3405,11 @@ impl eframe::App for StreamApp {
             self.clear_remote_keyboard();
         }
 
-        let video_rect = self.current_video_rect(ctx).or(self.last_video_rect);
+        let video_rect = raw_input
+            .screen_rect
+            .and_then(|rect| self.video_rect_for_container(rect))
+            .or_else(|| self.current_video_rect(ctx))
+            .or(self.last_video_rect);
         let virtual_hover =
             self.capture_mode == LocalCaptureMode::HoverAbsolute
                 && self.uses_virtual_hover_cursor(&snapshot);
