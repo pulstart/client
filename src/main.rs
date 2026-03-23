@@ -127,6 +127,7 @@ struct StreamApp {
     debug_overlay_tab: DebugOverlayTab,
     menu_open: bool,
     menu_button_pos: egui::Pos2,
+    menu_button_drag_origin: Option<egui::Pos2>,
     local_overlay_hit_rects: Vec<egui::Rect>,
     last_pointer_move: Option<Instant>,
     await_pointer_exit_after_auto_release: bool,
@@ -281,6 +282,7 @@ impl StreamApp {
             debug_overlay_tab: DebugOverlayTab::General,
             menu_open: false,
             menu_button_pos,
+            menu_button_drag_origin: None,
             local_overlay_hit_rects: Vec::new(),
             last_pointer_move: None,
             await_pointer_exit_after_auto_release: false,
@@ -1710,9 +1712,7 @@ impl StreamApp {
 
         let button = egui::Area::new(egui::Id::new("floating_menu_button"))
             .order(egui::Order::Foreground)
-            .current_pos(self.menu_button_pos)
-            .movable(true)
-            .constrain_to(content_rect)
+            .fixed_pos(self.menu_button_pos)
             .show(ctx, |ui| {
                 ui.add_sized(
                     [FLOATING_MENU_BUTTON_SIZE, FLOATING_MENU_BUTTON_SIZE],
@@ -1731,21 +1731,30 @@ impl StreamApp {
                     .stroke(egui::Stroke::new(
                         1.0,
                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36),
-                    )),
+                    ))
+                    .sense(egui::Sense::click_and_drag()),
                 )
             });
-        let button_rect = button.response.rect;
-        let next_button_pos = clamp_menu_button_pos(button_rect.min, content_rect);
-        let moved = next_button_pos.distance_sq(self.menu_button_pos) > 0.25;
-        if moved {
-            self.menu_button_pos = next_button_pos;
+        let button_response = button.inner;
+        if button_response.drag_started() {
+            self.menu_button_drag_origin = Some(self.menu_button_pos);
         }
-        if button.response.drag_stopped() {
-            self.menu_button_pos = next_button_pos;
+        if button_response.dragged() {
+            if let (Some(origin), Some(delta)) =
+                (self.menu_button_drag_origin, button_response.total_drag_delta())
+            {
+                self.menu_button_pos = clamp_menu_button_pos(origin + delta, content_rect);
+                self.last_pointer_move = Some(Instant::now());
+            }
+        }
+        if button_response.drag_stopped() {
+            self.menu_button_drag_origin = None;
             save_menu_button_pos(self.menu_button_pos);
         }
+        let button_rect =
+            egui::Rect::from_min_size(self.menu_button_pos, egui::vec2(FLOATING_MENU_BUTTON_SIZE, FLOATING_MENU_BUTTON_SIZE));
         self.local_overlay_hit_rects.push(button_rect);
-        if button.inner.clicked() && !button.response.dragged() && !button.response.drag_stopped() {
+        if button_response.clicked() && !button_response.dragged() && !button_response.drag_stopped() {
             self.menu_open = !self.menu_open;
             self.last_pointer_move = Some(Instant::now());
         }
