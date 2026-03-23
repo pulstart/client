@@ -720,18 +720,38 @@ impl StreamApp {
         ctx: &egui::Context,
         response: &egui::Response,
     ) {
+        let previous_video_rect = self.last_video_rect;
         self.last_video_rect = Some(response.rect);
         let previous_capture_mode = self.capture_mode;
 
         let snapshot = self.shared_input.snapshot();
         let hover_supported =
             snapshot.capabilities.mouse_absolute && snapshot.capabilities.separate_cursor;
-        let pointer_over_local_overlay = ctx
-            .input(|i| i.pointer.latest_pos())
+        let mut pointer_pos = ctx.input(|i| i.pointer.latest_pos());
+        let mut pointer_over_local_overlay = pointer_pos
             .map(|pos| self.pointer_over_local_overlay(pos))
             .unwrap_or(false);
-        let pointer_over_video = ctx
-            .input(|i| i.pointer.latest_pos())
+        if previous_capture_mode == LocalCaptureMode::HoverAbsolute
+            && snapshot.controller_state == ControllerState::OwnedByYou
+            && hover_supported
+            && !pointer_over_local_overlay
+            && previous_video_rect != Some(response.rect)
+        {
+            if let Some(pos) = pointer_pos {
+                let remapped = previous_video_rect
+                    .map(|previous_rect| remap_pos_between_video_rects(pos, previous_rect, response.rect))
+                    .unwrap_or(pos);
+                let remapped =
+                    clamp_pos_to_video_rect(remapped, response.rect, ctx.pixels_per_point());
+                if remapped.distance_sq(pos) > 0.01 {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(remapped));
+                    ctx.request_repaint();
+                    pointer_pos = Some(remapped);
+                    pointer_over_local_overlay = self.pointer_over_local_overlay(remapped);
+                }
+            }
+        }
+        let pointer_over_video = pointer_pos
             .map(|pos| response.rect.contains(pos) && !pointer_over_local_overlay)
             .unwrap_or(false);
         let clicked_video = response.clicked_by(egui::PointerButton::Primary) && pointer_over_video;
@@ -804,9 +824,7 @@ impl StreamApp {
             && snapshot.controller_state == ControllerState::OwnedByYou
             && self.capture_mode != LocalCaptureMode::ForceReleased
         {
-            if let (Some(client_id), Some(pos)) =
-                (snapshot.client_id, ctx.input(|i| i.pointer.latest_pos()))
-            {
+            if let (Some(client_id), Some(pos)) = (snapshot.client_id, pointer_pos) {
                 if response.rect.contains(pos) && !self.pointer_over_local_overlay(pos) {
                     let absolute_x = normalized_coord(pos.x, response.rect.left(), response.rect.right());
                     let absolute_y = normalized_coord(pos.y, response.rect.top(), response.rect.bottom());
@@ -2160,6 +2178,28 @@ fn normalized_coord(value: f32, min: f32, max: f32) -> u16 {
     let span = (max - min).max(1.0);
     let normalized = ((value - min) / span).clamp(0.0, 1.0);
     (normalized * 65535.0).round() as u16
+}
+
+fn clamp_pos_to_video_rect(pos: egui::Pos2, rect: egui::Rect, pixels_per_point: f32) -> egui::Pos2 {
+    let inset = 0.5 / pixels_per_point.max(1.0);
+    let max_x = (rect.right() - inset).max(rect.left());
+    let max_y = (rect.bottom() - inset).max(rect.top());
+    egui::pos2(pos.x.clamp(rect.left(), max_x), pos.y.clamp(rect.top(), max_y))
+}
+
+fn remap_pos_between_video_rects(
+    pos: egui::Pos2,
+    old_rect: egui::Rect,
+    new_rect: egui::Rect,
+) -> egui::Pos2 {
+    let old_width = old_rect.width().max(1.0);
+    let old_height = old_rect.height().max(1.0);
+    let normalized_x = ((pos.x - old_rect.left()) / old_width).clamp(0.0, 1.0);
+    let normalized_y = ((pos.y - old_rect.top()) / old_height).clamp(0.0, 1.0);
+    egui::pos2(
+        new_rect.left() + normalized_x * new_rect.width().max(1.0),
+        new_rect.top() + normalized_y * new_rect.height().max(1.0),
+    )
 }
 
 fn pointer_button_mask(button: egui::PointerButton) -> u8 {
