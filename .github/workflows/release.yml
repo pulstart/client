@@ -46,6 +46,18 @@ jobs:
           submodules: recursive
           token: ${{ secrets.PROTOCOL_CHECKOUT_TOKEN || github.token }}
 
+      - name: Derive version from git tag
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          else
+            version="0.0.0-dev"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $version"
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -54,6 +66,15 @@ jobs:
         with:
           workspaces: |
             . -> target
+
+      - name: Stamp Cargo.toml version
+        shell: bash
+        run: |
+          sed -i.bak 's/^version = ".*"/version = "${{ steps.version.outputs.version }}"/' Cargo.toml
+          rm -f Cargo.toml.bak
+          echo "Cargo.toml version is now:"
+          grep '^version' Cargo.toml
+          cargo generate-lockfile
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'

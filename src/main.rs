@@ -1,3 +1,5 @@
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 mod audio;
 mod debug_state;
 mod decode;
@@ -3286,7 +3288,7 @@ impl eframe::App for StreamApp {
                 pressed: true,
                 modifiers,
                 ..
-            } => modifiers.ctrl && modifiers.alt,
+            } => is_force_release_shortcut(modifiers),
             _ => false,
         });
         if force_release {
@@ -3510,6 +3512,18 @@ impl eframe::App for StreamApp {
                 )
             });
         }
+    }
+}
+
+fn is_force_release_shortcut(modifiers: &egui::Modifiers) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        modifiers.ctrl && modifiers.command && !modifiers.alt
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        modifiers.ctrl && modifiers.alt && !modifiers.command
     }
 }
 
