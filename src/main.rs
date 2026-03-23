@@ -490,12 +490,41 @@ impl StreamApp {
     }
 
     fn video_space_size(&self) -> Option<egui::Vec2> {
+        if let Some(stream_config) = self.shared_input.snapshot().stream_config {
+            if stream_config.width > 0 && stream_config.height > 0 {
+                return Some(egui::vec2(
+                    stream_config.width as f32,
+                    stream_config.height as f32,
+                ));
+            }
+        }
+
         let size = self.video_texture.size_vec2();
         if size.x >= 1.0 && size.y >= 1.0 {
             Some(size)
         } else {
             None
         }
+    }
+
+    fn current_video_rect(&self, ctx: &egui::Context) -> Option<egui::Rect> {
+        let content_rect = ctx.content_rect();
+        let video_size = self.video_space_size()?;
+        if video_size.x <= 0.0
+            || video_size.y <= 0.0
+            || content_rect.width() <= 0.0
+            || content_rect.height() <= 0.0
+        {
+            return None;
+        }
+
+        let scale = (content_rect.width() / video_size.x).min(content_rect.height() / video_size.y);
+        if !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
+
+        let sized = egui::vec2(video_size.x * scale, video_size.y * scale);
+        Some(egui::Rect::from_center_size(content_rect.center(), sized))
     }
 
     fn server_cursor_stream_top_left(
@@ -543,7 +572,7 @@ impl StreamApp {
                         }
                     });
                 pointer_pos
-                    .zip(self.last_video_rect)
+                    .zip(self.current_video_rect(ctx).or(self.last_video_rect))
                     .map(|(pointer_pos, rect)| {
                         rect.contains(pointer_pos)
                             && !self.pointer_over_local_overlay(pointer_pos)
@@ -764,7 +793,7 @@ impl StreamApp {
         }
 
         let texture = self.remote_cursor_texture_for_serial(input_snapshot.cursor_state.serial)?;
-        let video_rect = self.last_video_rect?;
+        let video_rect = self.current_video_rect(ctx).or(self.last_video_rect)?;
         let stream_size = self.cursor_space_size()?;
         let scale_x = if stream_size.x > 0.0 {
             video_rect.width() / stream_size.x
@@ -843,7 +872,7 @@ impl StreamApp {
     ) -> Vec<String> {
         let decoded_size = self.video_space_size().unwrap_or_default();
         let cursor_space = self.cursor_space_size().unwrap_or_default();
-        let video_rect = self.last_video_rect;
+        let video_rect = self.current_video_rect(ctx).or(self.last_video_rect);
         let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
         let over_video = pointer_pos
             .zip(video_rect)
@@ -1125,7 +1154,7 @@ impl StreamApp {
         let Some(pos) = self.hover_cursor_pos else {
             return;
         };
-        let Some(video_rect) = self.last_video_rect else {
+        let Some(video_rect) = self.current_video_rect(ctx).or(self.last_video_rect) else {
             return;
         };
         if self.capture_mode != LocalCaptureMode::HoverAbsolute
@@ -3373,7 +3402,7 @@ impl eframe::App for StreamApp {
             self.clear_remote_keyboard();
         }
 
-        let video_rect = self.last_video_rect;
+        let video_rect = self.current_video_rect(ctx).or(self.last_video_rect);
         let virtual_hover =
             self.capture_mode == LocalCaptureMode::HoverAbsolute
                 && self.uses_virtual_hover_cursor(&snapshot);
