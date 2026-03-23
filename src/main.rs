@@ -915,7 +915,8 @@ impl StreamApp {
         } else {
             actual_pointer_pos
         };
-        if previous_capture_mode == LocalCaptureMode::HoverAbsolute
+        if virtual_hover
+            && previous_capture_mode == LocalCaptureMode::HoverAbsolute
             && snapshot.controller_state == ControllerState::OwnedByYou
             && hover_supported
         {
@@ -934,23 +935,11 @@ impl StreamApp {
                         actual_pointer_pos
                     })
             } else {
-                if virtual_hover {
-                    self.hover_cursor_pos.or(actual_pointer_pos)
-                } else {
-                    actual_pointer_pos.or(self.hover_cursor_pos)
-                }
+                self.hover_cursor_pos.or(actual_pointer_pos)
             };
             if let Some(base_pos) = base_pos {
                 let clamped =
                     clamp_pos_to_video_rect(base_pos, response.rect, ctx.pixels_per_point());
-                if !virtual_hover
-                    && actual_pointer_pos
-                        .map(|pos| pos.distance_sq(clamped) > 0.01)
-                        .unwrap_or(true)
-                {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(clamped));
-                    ctx.request_repaint();
-                }
                 self.hover_cursor_pos = Some(clamped);
                 pointer_pos = Some(clamped);
             }
@@ -1044,29 +1033,33 @@ impl StreamApp {
             && snapshot.controller_state == ControllerState::OwnedByYou
             && self.capture_mode != LocalCaptureMode::ForceReleased
         {
-            let desired_hover_pos = if previous_capture_mode == LocalCaptureMode::HoverAbsolute {
-                self.hover_cursor_pos.or(pointer_pos).map(|pos| {
-                    clamp_pos_to_video_rect(pos, response.rect, ctx.pixels_per_point())
-                })
-            } else {
-                actual_pointer_pos
-                    .or(pointer_pos)
-                    .map(|pos| clamp_pos_to_video_rect(pos, response.rect, ctx.pixels_per_point()))
-            };
-            if let Some(pos) = desired_hover_pos {
-                if !virtual_hover
-                    && actual_pointer_pos
-                        .map(|pointer| pointer.distance_sq(pos) > 0.01)
-                        .unwrap_or(true)
-                {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(pos));
-                    ctx.request_repaint();
+            if virtual_hover {
+                let desired_hover_pos = if previous_capture_mode == LocalCaptureMode::HoverAbsolute {
+                    self.hover_cursor_pos.or(pointer_pos).map(|pos| {
+                        clamp_pos_to_video_rect(pos, response.rect, ctx.pixels_per_point())
+                    })
+                } else {
+                    actual_pointer_pos
+                        .or(pointer_pos)
+                        .map(|pos| clamp_pos_to_video_rect(pos, response.rect, ctx.pixels_per_point()))
+                };
+                if let Some(pos) = desired_hover_pos {
+                    self.hover_cursor_pos = Some(pos);
                 }
-                self.hover_cursor_pos = Some(pos);
-            }
 
-            if let (Some(client_id), Some(pos)) = (snapshot.client_id, self.hover_cursor_pos) {
-                self.send_absolute_cursor_if_needed(client_id, pos, response.rect);
+                if let (Some(client_id), Some(pos)) = (snapshot.client_id, self.hover_cursor_pos) {
+                    self.send_absolute_cursor_if_needed(client_id, pos, response.rect);
+                }
+            } else {
+                let hover_pos = actual_pointer_pos
+                    .or(pointer_pos)
+                    .filter(|pos| response.rect.contains(*pos) && !self.pointer_over_local_overlay(*pos));
+                self.hover_cursor_pos = hover_pos;
+                if let (Some(client_id), Some(pos)) = (snapshot.client_id, hover_pos) {
+                    self.send_absolute_cursor_if_needed(client_id, pos, response.rect);
+                } else {
+                    self.last_sent_absolute_cursor = None;
+                }
             }
         } else {
             self.hover_cursor_pos = None;
