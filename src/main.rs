@@ -839,6 +839,7 @@ impl StreamApp {
             });
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn paint_connected_background(&self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
         let painter = ui.painter();
@@ -857,6 +858,9 @@ impl StreamApp {
             egui::Color32::from_rgba_unmultiplied(34, 198, 140, 16),
         );
     }
+
+    #[cfg(target_os = "macos")]
+    fn paint_connected_background(&self, _ui: &mut egui::Ui) {}
 
     fn render_home_screen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let rect = ui.max_rect();
@@ -2644,11 +2648,12 @@ impl eframe::App for StreamApp {
         }
 
         let central_panel = if state == ConnectionState::Connected {
-            egui::CentralPanel::default()
-                .frame(
-                    egui::Frame::NONE
-                        .fill(egui::Color32::from_rgb(7, 10, 14)),
-                )
+            #[cfg(target_os = "macos")]
+            let frame = egui::Frame::NONE;
+            #[cfg(not(target_os = "macos"))]
+            let frame = egui::Frame::NONE.fill(egui::Color32::from_rgb(7, 10, 14));
+
+            egui::CentralPanel::default().frame(frame)
         } else {
             egui::CentralPanel::default()
         };
