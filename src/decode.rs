@@ -361,6 +361,7 @@ impl VideoDecoder {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn try_named_probe(
         codec_id: VideoCodec,
         decoder_name: &str,

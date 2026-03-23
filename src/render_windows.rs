@@ -70,7 +70,7 @@ const D3D11_VPOV_DIMENSION_TEXTURE2D: u32 = 1;
 
 impl WindowsD3d11Importer {
     pub fn probe(_gl: &glow::Context) -> bool {
-        unsafe { !wglGetCurrentContext().is_null() } && WglDxInterop::load().is_ok()
+        (unsafe { !wglGetCurrentContext().is_null() }) && WglDxInterop::load().is_ok()
     }
 
     pub fn new(_gl: &glow::Context) -> Result<Self, String> {

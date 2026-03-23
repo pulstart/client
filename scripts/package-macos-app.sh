@@ -100,6 +100,53 @@ copy_app_bundle() {
 </dict>
 </plist>
 EOF
+    cat > "$package_root/install.command" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+app_source="$script_dir/st-client.app"
+
+if [[ ! -d "$app_source" ]]; then
+    echo "st-client.app was not found next to this installer." >&2
+    exit 1
+fi
+
+install_root="/Applications"
+if [[ ! -w "$install_root" ]]; then
+    install_root="$HOME/Applications"
+    mkdir -p "$install_root"
+fi
+
+app_target="$install_root/st-client.app"
+rm -rf "$app_target"
+ditto "$app_source" "$app_target"
+xattr -dr com.apple.quarantine "$app_target" || true
+
+echo "Installed st-client to $app_target"
+echo "Launching app..."
+open "$app_target"
+
+if command -v brew >/dev/null 2>&1; then
+    missing=()
+    if ! brew list ffmpeg >/dev/null 2>&1; then
+        missing+=("ffmpeg")
+    fi
+    if ! brew list opus >/dev/null 2>&1; then
+        missing+=("opus")
+    fi
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo
+        echo "If launch fails, install runtime dependencies with:"
+        echo "  brew install ${missing[*]}"
+    fi
+else
+    echo
+    echo "If launch fails, install Homebrew and then run:"
+    echo "  brew install ffmpeg opus"
+fi
+EOF
+    chmod 755 "$package_root/install.command"
     cat > "$package_root/README.txt" <<'EOF'
 This archive contains the macOS build of st-client packaged as a .app bundle.
 
@@ -107,6 +154,18 @@ The app may be unsigned unless Apple signing credentials were provided during
 the packaging step, so macOS may ask the user to allow it manually on first
 launch. The app currently expects FFmpeg and Opus runtime libraries to be
 available on the target machine.
+
+Use `install.command` in this folder for the easiest install flow.
+
+Recommended install steps:
+
+    mv st-client.app /Applications/
+    xattr -dr com.apple.quarantine /Applications/st-client.app
+    open /Applications/st-client.app
+
+If the app still fails to launch, install the runtime multimedia libraries:
+
+    brew install ffmpeg opus
 EOF
 }
 

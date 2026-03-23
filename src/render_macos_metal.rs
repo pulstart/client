@@ -1,3 +1,5 @@
+#![allow(unexpected_cfgs)]
+
 use crate::video_frame::{MacosVideoToolboxFrame, VideoFormat};
 use core_graphics_types::geometry::{CGPoint, CGRect, CGSize};
 use eframe::{egui, Frame};

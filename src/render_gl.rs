@@ -918,6 +918,7 @@ impl YuvPipeline {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     fn render_textures_to_current(
         &mut self,
         gl: &glow::Context,

@@ -55,10 +55,6 @@ impl MacosVideoToolboxImporter {
             || (version.major >= 3 && !version.is_embedded)
     }
 
-    pub fn probe(gl: &glow::Context) -> bool {
-        Self::supports_extensions(gl) && unsafe { !CGLGetCurrentContext().is_null() }
-    }
-
     pub fn new(gl: &glow::Context) -> Result<Self, String> {
         if !Self::supports_extensions(gl) {
             return Err("macOS rectangle-texture import unavailable".into());

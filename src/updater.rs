@@ -333,7 +333,7 @@ fn process_exists(pid: u32) -> bool {
     unsafe {
         CloseHandle(handle);
     }
-    ok && exit_code == STILL_ACTIVE
+    ok && exit_code == STILL_ACTIVE as u32
 }
 
 fn sync_package_contents(source_root: &Path, install_root: &Path) -> Result<(), String> {
