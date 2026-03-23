@@ -494,20 +494,20 @@ impl StreamApp {
 
         match self.capture_mode {
             LocalCaptureMode::HoverAbsolute => {
-                let pointer_pos = if self.uses_virtual_hover_cursor(&snapshot) {
-                    self.hover_cursor_pos
-                } else {
-                    ctx.input(|i| i.pointer.latest_pos())
-                };
+                let pointer_pos = self
+                    .hover_cursor_pos
+                    .or_else(|| {
+                        if self.uses_virtual_hover_cursor(&snapshot) {
+                            None
+                        } else {
+                            ctx.input(|i| i.pointer.latest_pos())
+                        }
+                    });
                 pointer_pos
                     .zip(self.last_video_rect)
                     .map(|(pointer_pos, rect)| {
                         rect.contains(pointer_pos)
                             && !self.pointer_over_local_overlay(pointer_pos)
-                            && self
-                                .hover_cursor_pos
-                                .map(|cursor_pos| rect.contains(cursor_pos))
-                                .unwrap_or(false)
                     })
                     .unwrap_or(false)
             }
