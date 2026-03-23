@@ -372,10 +372,19 @@ impl StreamApp {
             .any(|rect| rect.contains(pos))
     }
 
-    fn stream_bounds(&self) -> Option<(f32, f32)> {
+    fn cursor_space_size(&self) -> Option<egui::Vec2> {
+        if let Some(stream_config) = self.debug_state.snapshot().stream_config {
+            if stream_config.width > 0 && stream_config.height > 0 {
+                return Some(egui::vec2(
+                    stream_config.width as f32,
+                    stream_config.height as f32,
+                ));
+            }
+        }
+
         let size = self.video_texture.size_vec2();
         if size.x >= 1.0 && size.y >= 1.0 {
-            Some((size.x, size.y))
+            Some(size)
         } else {
             None
         }
@@ -390,22 +399,14 @@ impl StreamApp {
         }
     }
 
-    fn clamp_stream_pos(&self, pos: egui::Pos2) -> egui::Pos2 {
-        if let Some((width, height)) = self.stream_bounds() {
-            egui::pos2(
-                pos.x.clamp(0.0, (width - 1.0).max(0.0)),
-                pos.y.clamp(0.0, (height - 1.0).max(0.0)),
-            )
-        } else {
-            pos
-        }
-    }
-
-    fn server_cursor_stream_pos(&self, snapshot: &input::SharedInputSnapshot) -> egui::Pos2 {
-        self.clamp_stream_pos(egui::pos2(
+    fn server_cursor_stream_top_left(
+        &self,
+        snapshot: &input::SharedInputSnapshot,
+    ) -> egui::Pos2 {
+        egui::pos2(
             snapshot.cursor_state.x as f32,
             snapshot.cursor_state.y as f32,
-        ))
+        )
     }
 
     fn remote_cursor_texture_for_serial(&self, serial: u64) -> Option<&RemoteCursorTexture> {
@@ -546,7 +547,7 @@ impl StreamApp {
 
         let texture = self.remote_cursor_texture_for_serial(input_snapshot.cursor_state.serial)?;
         let video_rect = self.last_video_rect?;
-        let stream_size = self.video_space_size()?;
+        let stream_size = self.cursor_space_size()?;
         let scale_x = if stream_size.x > 0.0 {
             video_rect.width() / stream_size.x
         } else {
@@ -573,24 +574,27 @@ impl StreamApp {
             snap(texture.hotspot.y * display_scale),
         );
 
-        let (cursor_pos, using_pointer_pos) = if self.capture_mode == LocalCaptureMode::HoverAbsolute
-        {
-            let pointer_pos = ctx
-                .input(|i| i.pointer.latest_pos())
-                .filter(|pos| video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos))?;
-            (pointer_pos, true)
-        } else {
-            let server_stream_pos = self.server_cursor_stream_pos(input_snapshot);
-            (
-                egui::pos2(
-                    video_rect.left() + server_stream_pos.x * scale_x,
-                    video_rect.top() + server_stream_pos.y * scale_y,
-                ),
-                false,
-            )
-        };
+        let (top_left, cursor_pos, using_pointer_pos) =
+            if self.capture_mode == LocalCaptureMode::HoverAbsolute {
+                let pointer_pos = ctx.input(|i| i.pointer.latest_pos()).filter(|pos| {
+                    video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
+                })?;
+                (
+                    egui::pos2(pointer_pos.x - hotspot.x, pointer_pos.y - hotspot.y),
+                    pointer_pos,
+                    true,
+                )
+            } else {
+                let server_top_left = self.server_cursor_stream_top_left(input_snapshot);
+                let top_left = egui::pos2(
+                    video_rect.left() + server_top_left.x * scale_x,
+                    video_rect.top() + server_top_left.y * scale_y,
+                );
+                let cursor_pos = egui::pos2(top_left.x + hotspot.x, top_left.y + hotspot.y);
+                (top_left, cursor_pos, false)
+            };
 
-        let top_left = egui::pos2(snap(cursor_pos.x - hotspot.x), snap(cursor_pos.y - hotspot.y));
+        let top_left = egui::pos2(snap(top_left.x), snap(top_left.y));
         let rect = egui::Rect::from_min_size(top_left, size);
         if rect.max.x <= video_rect.left()
             || rect.max.y <= video_rect.top()
@@ -619,7 +623,8 @@ impl StreamApp {
         ctx: &egui::Context,
         input_snapshot: &input::SharedInputSnapshot,
     ) -> Vec<String> {
-        let stream_size = self.video_space_size().unwrap_or_default();
+        let decoded_size = self.video_space_size().unwrap_or_default();
+        let cursor_space = self.cursor_space_size().unwrap_or_default();
         let video_rect = self.last_video_rect;
         let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
         let over_video = pointer_pos
@@ -652,9 +657,11 @@ impl StreamApp {
                 input_snapshot.cursor_state_version,
             ),
             format!(
-                "stream: size={}x{}  video_rect={}",
-                stream_size.x.round() as i32,
-                stream_size.y.round() as i32,
+                "video: decoded={}x{} cursor_space={}x{} video_rect={}",
+                decoded_size.x.round() as i32,
+                decoded_size.y.round() as i32,
+                cursor_space.x.round() as i32,
+                cursor_space.y.round() as i32,
                 format_rect_opt(video_rect),
             ),
             format!(
