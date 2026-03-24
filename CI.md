@@ -100,3 +100,5 @@ out explicitly:
 2. GitHub Actions runs `.github/workflows/release.yml`
 3. The workflow builds all platforms, uploads temporary build artifacts, and publishes the final
    archives to the GitHub release for that tag
+4. If a release for that tag already exists, the workflow deletes it first and recreates it with
+   the freshly built assets
