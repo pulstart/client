@@ -1445,6 +1445,7 @@ impl StreamApp {
                     self.last_sent_absolute_cursor = None;
                 }
             }
+            self.hover_cursor_resync_pending = false;
         } else if !self.resume_hover_after_relative_drag {
             self.hover_cursor_pos = None;
             self.last_sent_absolute_cursor = None;
@@ -4262,20 +4263,6 @@ impl eframe::App for StreamApp {
                 egui::Event::PointerMoved(pos) => {
                     if !virtual_hover {
                         last_pointer_pos = Some(pos);
-                    }
-                    if self.capture_mode == LocalCaptureMode::HoverAbsolute
-                        && self.hover_cursor_resync_pending
-                    {
-                        if let Some(rect) = video_rect {
-                            self.hover_cursor_pos = Some(clamp_pos_to_video_rect(
-                                pos,
-                                rect,
-                                ctx.pixels_per_point(),
-                            ));
-                        } else {
-                            self.hover_cursor_pos = Some(pos);
-                        }
-                        self.hover_cursor_resync_pending = false;
                     }
                 }
                 egui::Event::MouseMoved(delta) => {

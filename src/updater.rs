@@ -205,7 +205,35 @@ fn run_apply_update_command(command: &ApplyUpdateCommand) -> Result<(), String> 
         }
     }
     #[cfg(windows)]
-    sync_package_contents(&command.package_root, &command.install_root)?;
+    {
+        if let Err(direct_err) =
+            sync_package_contents(&command.package_root, &command.install_root)
+        {
+            let elevated_marker = command.staging_root.join(".st-elevated-update");
+            if elevated_marker.exists() {
+                // Already running elevated — do not retry elevation.
+                return Err(direct_err);
+            }
+            eprintln!("[updater] {direct_err}");
+            eprintln!("[updater] Requesting elevated permissions...");
+            let _ = fs::File::create(&elevated_marker);
+            let helper_executable = packaged_executable_path(&command.package_root)?;
+            let helper_dir = helper_executable
+                .parent()
+                .unwrap_or(&command.package_root);
+            spawn_elevated_helper_windows(
+                &helper_executable,
+                std::process::id(),
+                &command.staging_root,
+                &command.package_root,
+                &command.install_root,
+                &command.relaunch_executable,
+                helper_dir,
+            )?;
+            // Exit so the elevated process can take over after we're gone.
+            std::process::exit(0);
+        }
+    }
     if let Some(parent) = command.install_root.parent() {
         let _ = std::env::set_current_dir(parent);
     } else {
@@ -525,6 +553,7 @@ fn sync_package_contents(source_root: &Path, install_root: &Path) -> Result<(), 
         let destination_path = install_root.join(entry.file_name());
         sync_path(&source_path, &destination_path)?;
     }
+    remove_stale_entries(source_root, install_root);
     Ok(())
 }
 
@@ -546,6 +575,7 @@ fn sync_path(source: &Path, destination: &Path) -> Result<(), String> {
             let entry = entry.map_err(|err| format!("Failed to read directory entry: {err}"))?;
             sync_path(&entry.path(), &destination.join(entry.file_name()))?;
         }
+        remove_stale_entries(source, destination);
     } else if source.is_file() {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)
@@ -578,13 +608,46 @@ fn sync_path(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Remove entries in `destination` that do not exist in `source`. This cleans
+/// up files (e.g. renamed DLLs) that were removed between package versions.
+/// Failures are best-effort and silently ignored so they do not block the
+/// update.
+fn remove_stale_entries(source: &Path, destination: &Path) {
+    let Ok(dest_entries) = fs::read_dir(destination) else {
+        return;
+    };
+    for dest_entry in dest_entries.flatten() {
+        let name = dest_entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Skip .st-update-old leftovers — managed by cleanup_old_update_files.
+        if name_str.ends_with(".st-update-old") {
+            continue;
+        }
+        if source.join(&name).exists() {
+            continue;
+        }
+        let stale = dest_entry.path();
+        if stale.is_dir() {
+            let _ = fs::remove_dir_all(&stale);
+        } else {
+            let _ = remove_or_rename_old(&stale);
+        }
+    }
+}
+
 /// Try to remove a file. If removal fails (common on Windows when the file is
 /// still locked by the OS, antivirus, or search indexer), rename it to
 /// `.st-update-old` so the new file can be written. Old files are cleaned up
 /// on next launch via `cleanup_old_update_files()`.
 fn remove_or_rename_old(path: &Path) -> Result<(), String> {
+    let (remove_retries, remove_delay, rename_retries, rename_delay) = if cfg!(windows) {
+        (5, Duration::from_millis(300), 5, Duration::from_millis(300))
+    } else {
+        (2, Duration::from_millis(150), 0, Duration::from_millis(150))
+    };
+
     // Try direct removal first.
-    if retry_io(2, Duration::from_millis(150), || fs::remove_file(path)).is_ok() {
+    if retry_io(remove_retries, remove_delay, || fs::remove_file(path)).is_ok() {
         return Ok(());
     }
 
@@ -593,8 +656,11 @@ fn remove_or_rename_old(path: &Path) -> Result<(), String> {
     old_path.push(".st-update-old");
     let old_path = PathBuf::from(old_path);
     // Remove a previous .old file if present.
-    let _ = fs::remove_file(&old_path);
-    fs::rename(path, &old_path).map_err(|err| {
+    let _ = retry_io(remove_retries, remove_delay, || fs::remove_file(&old_path));
+    retry_io(rename_retries, rename_delay, || {
+        fs::rename(path, &old_path)
+    })
+    .map_err(|err| {
         format!(
             "Failed to move locked file '{}' to '{}': {err}",
             path.display(),
