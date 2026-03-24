@@ -362,10 +362,37 @@ impl VideoDecoder {
         let mut hardware = VideoCodecSupport::empty();
 
         for codec in [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1] {
-            if let Ok(decoder) = Self::new_internal(codec, false) {
-                supported.insert(codec);
-                if decoder.is_hardware_accelerated() {
-                    hardware.insert(codec);
+            let test_bitstream = generate_test_bitstream(codec);
+            if let Ok(mut decoder) = Self::new_internal(codec, false) {
+                match &test_bitstream {
+                    Ok(data) => match decoder.try_test_decode(data) {
+                        Ok(()) => {
+                            eprintln!(
+                                "[probe] {} decoder '{}' validated (hw={})",
+                                codec_label(codec),
+                                decoder.decoder_name,
+                                decoder.hardware_accelerated,
+                            );
+                            supported.insert(codec);
+                            if decoder.is_hardware_accelerated() {
+                                hardware.insert(codec);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[probe] {} decoder '{}' failed decode test: {e}",
+                                codec_label(codec),
+                                decoder.decoder_name,
+                            );
+                        }
+                    },
+                    Err(_) => {
+                        // No test bitstream (encoder lib missing) — trust the probe
+                        supported.insert(codec);
+                        if decoder.is_hardware_accelerated() {
+                            hardware.insert(codec);
+                        }
+                    }
                 }
             }
         }
@@ -374,6 +401,26 @@ impl VideoDecoder {
             supported,
             hardware,
         }
+    }
+
+    fn try_test_decode(&mut self, test_data: &[u8]) -> Result<(), String> {
+        let pkt = BorrowedPacket::new(test_data);
+        self.decoder
+            .send_packet(&pkt)
+            .map_err(|e| format!("send_packet: {e}"))?;
+        let mut frame = VideoFrame::empty();
+        // Hardware decoders may need a second send+receive cycle.
+        for _ in 0..4 {
+            if self.decoder.receive_frame(&mut frame).is_ok() {
+                return Ok(());
+            }
+            // Some decoders need a flush signal before emitting the buffered frame.
+            let _ = self.decoder.send_eof();
+            if self.decoder.receive_frame(&mut frame).is_ok() {
+                return Ok(());
+            }
+        }
+        Err("no frame produced after send_packet".into())
     }
 
     fn try_hint(codec: VideoCodec, hint: &str) -> Result<Self, String> {
@@ -1640,5 +1687,102 @@ unsafe fn apply_flags(ctx: *mut ffmpeg::sys::AVCodecContext, is_hw: bool) {
             .map(|n| n.get() as i32)
             .unwrap_or(1);
         (*ctx).thread_count = cpus.min(4);
+    }
+}
+
+/// Generate a minimal single-keyframe test bitstream using a software encoder.
+/// Returns the raw encoded data suitable for feeding to a decoder, or an error
+/// if the software encoder library is not available.
+fn generate_test_bitstream(codec: VideoCodec) -> Result<Vec<u8>, String> {
+    let encoder_name: &CStr = match codec {
+        VideoCodec::H264 => c"libx264",
+        VideoCodec::Hevc => c"libx265",
+        VideoCodec::Av1 => c"libsvtav1",
+    };
+
+    unsafe {
+        let enc = ffmpeg::sys::avcodec_find_encoder_by_name(encoder_name.as_ptr());
+        if enc.is_null() {
+            return Err(format!("{} encoder not found", encoder_name.to_str().unwrap_or("?")));
+        }
+
+        let mut ctx = ffmpeg::sys::avcodec_alloc_context3(enc);
+        if ctx.is_null() {
+            return Err("avcodec_alloc_context3 failed".into());
+        }
+
+        (*ctx).width = 64;
+        (*ctx).height = 64;
+        (*ctx).pix_fmt = ffmpeg::sys::AVPixelFormat::AV_PIX_FMT_YUV420P;
+        (*ctx).time_base = ffmpeg::sys::AVRational { num: 1, den: 30 };
+        (*ctx).gop_size = 1;
+        (*ctx).bit_rate = 200_000;
+        (*ctx).max_b_frames = 0;
+
+        if ffmpeg::sys::avcodec_open2(ctx, enc, ptr::null_mut()) < 0 {
+            ffmpeg::sys::avcodec_free_context(&mut ctx);
+            return Err("avcodec_open2 failed for test encoder".into());
+        }
+
+        let mut frame = ffmpeg::sys::av_frame_alloc();
+        if frame.is_null() {
+            ffmpeg::sys::avcodec_free_context(&mut ctx);
+            return Err("av_frame_alloc failed".into());
+        }
+        (*frame).width = 64;
+        (*frame).height = 64;
+        (*frame).format = ffmpeg::sys::AVPixelFormat::AV_PIX_FMT_YUV420P as c_int;
+        (*frame).pts = 0;
+
+        if ffmpeg::sys::av_frame_get_buffer(frame, 0) < 0 {
+            ffmpeg::sys::av_frame_free(&mut frame);
+            ffmpeg::sys::avcodec_free_context(&mut ctx);
+            return Err("av_frame_get_buffer failed".into());
+        }
+
+        // Fill U/V planes with 128 (neutral chroma) — Y=0 is black
+        for plane in 1..3 {
+            let linesize = (*frame).linesize[plane] as usize;
+            let height = 32usize; // chroma height for 64x64 YUV420P
+            let plane_ptr = (*frame).data[plane];
+            if !plane_ptr.is_null() && linesize > 0 {
+                for row in 0..height {
+                    ptr::write_bytes(plane_ptr.add(row * linesize), 128, linesize);
+                }
+            }
+        }
+
+        let mut pkt = ffmpeg::sys::av_packet_alloc();
+        if pkt.is_null() {
+            ffmpeg::sys::av_frame_free(&mut frame);
+            ffmpeg::sys::avcodec_free_context(&mut ctx);
+            return Err("av_packet_alloc failed".into());
+        }
+
+        let mut data = Vec::new();
+
+        // Encode the frame
+        ffmpeg::sys::avcodec_send_frame(ctx, frame);
+        while ffmpeg::sys::avcodec_receive_packet(ctx, pkt) >= 0 {
+            data.extend_from_slice(std::slice::from_raw_parts((*pkt).data, (*pkt).size as usize));
+            ffmpeg::sys::av_packet_unref(pkt);
+        }
+
+        // Flush encoder
+        ffmpeg::sys::avcodec_send_frame(ctx, ptr::null_mut());
+        while ffmpeg::sys::avcodec_receive_packet(ctx, pkt) >= 0 {
+            data.extend_from_slice(std::slice::from_raw_parts((*pkt).data, (*pkt).size as usize));
+            ffmpeg::sys::av_packet_unref(pkt);
+        }
+
+        ffmpeg::sys::av_packet_free(&mut pkt);
+        ffmpeg::sys::av_frame_free(&mut frame);
+        ffmpeg::sys::avcodec_free_context(&mut ctx);
+
+        if data.is_empty() {
+            Err("test encoder produced no data".into())
+        } else {
+            Ok(data)
+        }
     }
 }
