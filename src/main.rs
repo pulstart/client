@@ -157,6 +157,7 @@ struct StreamApp {
     applied_cursor_visible: Option<bool>,
     applied_cursor_grab: Option<egui::CursorGrab>,
     suppress_mouse_delta: bool,
+    suppress_pointer_pos_frames: u8,
     excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
     update_ui_state: UpdateUiState,
     update_tx: crossbeam_channel::Sender<UpdateWorkerEvent>,
@@ -447,6 +448,7 @@ impl StreamApp {
             applied_cursor_visible: None,
             applied_cursor_grab: None,
             suppress_mouse_delta: false,
+            suppress_pointer_pos_frames: 0,
             excluded_video_codecs: Arc::new(Mutex::new(st_protocol::VideoCodecSupport::empty())),
             update_ui_state,
             update_tx,
@@ -848,6 +850,7 @@ impl StreamApp {
         if self.applied_cursor_grab != Some(cursor_grab) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(cursor_grab));
             self.suppress_mouse_delta = true;
+            self.suppress_pointer_pos_frames = 2;
             self.applied_cursor_grab = Some(cursor_grab);
         }
         if self.applied_cursor_visible != Some(cursor_visible) {
@@ -1220,7 +1223,11 @@ impl StreamApp {
             && snapshot.controller_state == ControllerState::OwnedByYou
             && self.pointer_buttons != 0;
         let virtual_hover = self.uses_virtual_hover_cursor(&snapshot);
-        let actual_pointer_pos = ctx.input(|i| i.pointer.latest_pos());
+        let actual_pointer_pos = if self.suppress_pointer_pos_frames > 0 {
+            self.hover_cursor_pos.or_else(|| ctx.input(|i| i.pointer.latest_pos()))
+        } else {
+            ctx.input(|i| i.pointer.latest_pos())
+        };
         let mut pointer_pos = if virtual_hover && previous_capture_mode == LocalCaptureMode::HoverAbsolute
         {
             self.hover_cursor_pos.or(actual_pointer_pos)
@@ -1445,7 +1452,6 @@ impl StreamApp {
                     self.last_sent_absolute_cursor = None;
                 }
             }
-            self.hover_cursor_resync_pending = false;
         } else if !self.resume_hover_after_relative_drag {
             self.hover_cursor_pos = None;
             self.last_sent_absolute_cursor = None;
@@ -3940,6 +3946,7 @@ impl eframe::App for StreamApp {
         }
         self.keep_awake
             .set_active(matches!(state, ConnectionState::Connected));
+        self.suppress_pointer_pos_frames = self.suppress_pointer_pos_frames.saturating_sub(1);
         self.apply_pointer_capture_mode(ctx);
         self.sync_remote_cursor_texture(ctx);
         let recent_pointer_activity = self
@@ -4263,6 +4270,21 @@ impl eframe::App for StreamApp {
                 egui::Event::PointerMoved(pos) => {
                     if !virtual_hover {
                         last_pointer_pos = Some(pos);
+                    }
+                    if self.capture_mode == LocalCaptureMode::HoverAbsolute
+                        && self.hover_cursor_resync_pending
+                        && self.suppress_pointer_pos_frames == 0
+                    {
+                        if let Some(rect) = video_rect {
+                            self.hover_cursor_pos = Some(clamp_pos_to_video_rect(
+                                pos,
+                                rect,
+                                ctx.pixels_per_point(),
+                            ));
+                        } else {
+                            self.hover_cursor_pos = Some(pos);
+                        }
+                        self.hover_cursor_resync_pending = false;
                     }
                 }
                 egui::Event::MouseMoved(delta) => {
