@@ -359,34 +359,64 @@ impl VideoDecoder {
 
         for codec in [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1] {
             let test_bitstream = generate_test_bitstream(codec);
-            if let Ok(mut decoder) = Self::new_internal(codec, false) {
-                match &test_bitstream {
-                    Ok(data) => match decoder.try_test_decode(data) {
-                        Ok(()) => {
-                            eprintln!(
-                                "[probe] {} decoder '{}' validated (hw={})",
-                                codec_label(codec),
-                                decoder.decoder_name,
-                                decoder.hardware_accelerated,
-                            );
+            let mut found = false;
+
+            // Try each hardware probe step with actual decode validation.
+            for step in probe_steps(codec) {
+                if let Ok(mut decoder) = Self::try_probe_step(codec, step) {
+                    match &test_bitstream {
+                        Ok(data) => match decoder.try_test_decode(data) {
+                            Ok(()) => {
+                                eprintln!(
+                                    "[probe] {} decoder '{}' validated (hw={})",
+                                    codec_label(codec),
+                                    decoder.decoder_name,
+                                    decoder.hardware_accelerated,
+                                );
+                                supported.insert(codec);
+                                if decoder.is_hardware_accelerated() {
+                                    hardware.insert(codec);
+                                }
+                                found = true;
+                                break;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[probe] {} decoder '{}' failed decode test: {e}",
+                                    codec_label(codec),
+                                    decoder.decoder_name,
+                                );
+                            }
+                        },
+                        Err(_) => {
+                            // No test bitstream — trust the probe
                             supported.insert(codec);
                             if decoder.is_hardware_accelerated() {
                                 hardware.insert(codec);
                             }
+                            found = true;
+                            break;
                         }
-                        Err(e) => {
-                            eprintln!(
-                                "[probe] {} decoder '{}' failed decode test: {e}",
-                                codec_label(codec),
-                                decoder.decoder_name,
-                            );
+                    }
+                }
+            }
+
+            // Software fallback
+            if !found {
+                if let Ok(mut decoder) = Self::try_sw_decoder(codec) {
+                    match &test_bitstream {
+                        Ok(data) => {
+                            if decoder.try_test_decode(data).is_ok() {
+                                eprintln!(
+                                    "[probe] {} decoder '{}' validated (hw=false)",
+                                    codec_label(codec),
+                                    decoder.decoder_name,
+                                );
+                                supported.insert(codec);
+                            }
                         }
-                    },
-                    Err(_) => {
-                        // No test bitstream (encoder lib missing) — trust the probe
-                        supported.insert(codec);
-                        if decoder.is_hardware_accelerated() {
-                            hardware.insert(codec);
+                        Err(_) => {
+                            supported.insert(codec);
                         }
                     }
                 }
@@ -1720,13 +1750,25 @@ fn generate_test_bitstream_runtime(codec: VideoCodec) -> Result<Vec<u8>, String>
             return Err("avcodec_alloc_context3 failed".into());
         }
 
-        (*ctx).width = 64;
-        (*ctx).height = 64;
+        // 256x256: must exceed NVDEC minimum (128x128 for AV1/HEVC CUVID)
+        (*ctx).width = 256;
+        (*ctx).height = 256;
         (*ctx).pix_fmt = ffmpeg::sys::AVPixelFormat::AV_PIX_FMT_YUV420P;
         (*ctx).time_base = ffmpeg::sys::AVRational { num: 1, den: 30 };
-        (*ctx).gop_size = 1;
-        (*ctx).bit_rate = 200_000;
         (*ctx).max_b_frames = 0;
+
+        if codec == VideoCodec::Av1 {
+            // SVT-AV1 doesn't support forced keyframes in VBR mode.
+            // Use CQP with a single frame — first frame is always a keyframe.
+            (*ctx).bit_rate = 0;
+            (*ctx).gop_size = 0;
+            let qp = std::ffi::CString::new("qp").unwrap();
+            let val = std::ffi::CString::new("30").unwrap();
+            ffmpeg::sys::av_opt_set((*ctx).priv_data, qp.as_ptr(), val.as_ptr(), 0);
+        } else {
+            (*ctx).gop_size = 1;
+            (*ctx).bit_rate = 200_000;
+        }
 
         if ffmpeg::sys::avcodec_open2(ctx, enc, ptr::null_mut()) < 0 {
             ffmpeg::sys::avcodec_free_context(&mut ctx);
@@ -1738,8 +1780,8 @@ fn generate_test_bitstream_runtime(codec: VideoCodec) -> Result<Vec<u8>, String>
             ffmpeg::sys::avcodec_free_context(&mut ctx);
             return Err("av_frame_alloc failed".into());
         }
-        (*frame).width = 64;
-        (*frame).height = 64;
+        (*frame).width = 256;
+        (*frame).height = 256;
         (*frame).format = ffmpeg::sys::AVPixelFormat::AV_PIX_FMT_YUV420P as c_int;
         (*frame).pts = 0;
 
@@ -1752,7 +1794,7 @@ fn generate_test_bitstream_runtime(codec: VideoCodec) -> Result<Vec<u8>, String>
         // Fill U/V planes with 128 (neutral chroma) — Y=0 is black
         for plane in 1..3 {
             let linesize = (*frame).linesize[plane] as usize;
-            let height = 32usize; // chroma height for 64x64 YUV420P
+            let height = 128usize; // chroma height for 256x256 YUV420P
             let plane_ptr = (*frame).data[plane];
             if !plane_ptr.is_null() && linesize > 0 {
                 for row in 0..height {
@@ -1796,8 +1838,9 @@ fn generate_test_bitstream_runtime(codec: VideoCodec) -> Result<Vec<u8>, String>
     }
 }
 
-// Embedded pre-encoded 64x64 black-frame test bitstreams.
-// Generated with: ffmpeg -f lavfi -i color=c=black:s=64x64 -frames:v 1 -c:v <encoder> ...
+// Embedded pre-encoded 256x256 black-frame test bitstreams.
+// Generated with: ffmpeg -f lavfi -i color=black:s=256x256 -frames:v 1 -c:v <encoder> ...
+// 256x256 is required: NVDEC CUVID needs at least 128x128 for HEVC/AV1.
 // These are used as fallback when software encoder libraries are not available
 // (common on Windows where libx265/libsvtav1 may be missing from the FFmpeg build).
 const EMBEDDED_TEST_H264: &[u8] = &[

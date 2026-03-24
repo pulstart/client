@@ -3,6 +3,7 @@
 mod audio;
 mod debug_state;
 mod decode;
+mod graph_overlay;
 mod display;
 mod input;
 mod keep_awake;
@@ -133,6 +134,7 @@ struct StreamApp {
     latest_remote_cursor_serial: Option<u64>,
     seen_cursor_shape_version: u64,
     debug_overlay_tab: DebugOverlayTab,
+    graph_overlay: graph_overlay::GraphOverlay,
     menu_open: bool,
     menu_button_pos: egui::Pos2,
     menu_button_drag_origin: Option<egui::Pos2>,
@@ -326,6 +328,7 @@ impl StreamApp {
             latest_remote_cursor_serial: None,
             seen_cursor_shape_version: 0,
             debug_overlay_tab: DebugOverlayTab::General,
+            graph_overlay: graph_overlay::GraphOverlay::new(),
             menu_open: false,
             menu_button_pos,
             menu_button_drag_origin: None,
@@ -3062,18 +3065,6 @@ fn codec_support_report_summary(report: decode::VideoCodecSupportReport) -> Stri
     }
 }
 
-fn format_opt_ms(value: Option<f32>) -> String {
-    value
-        .map(|v| format!("{v:.1} ms"))
-        .unwrap_or_else(|| "-".to_string())
-}
-
-fn format_opt_kbps(value: Option<u32>) -> String {
-    value
-        .map(|v| format!("{v} kbps"))
-        .unwrap_or_else(|| "-".to_string())
-}
-
 fn format_pos(pos: egui::Pos2) -> String {
     format!("({:.1}, {:.1})", pos.x, pos.y)
 }
@@ -3499,15 +3490,6 @@ fn render_debug_overlay(
         })
         .unwrap_or_else(|| "-".to_string());
 
-    let packet_total = snapshot
-        .received_packets
-        .saturating_add(snapshot.lost_packets);
-    let loss_pct = if packet_total > 0 {
-        snapshot.lost_packets as f32 * 100.0 / packet_total as f32
-    } else {
-        0.0
-    };
-
     let general_lines = vec![
         format!("server: {}", snapshot.server_addr),
         format!("stream: {stream_line}"),
@@ -3577,46 +3559,7 @@ fn render_debug_overlay(
             }
         ),
         format!(
-            "bitrate: target={}  rx={:.0} kbps (video {:.0} / audio {:.0})",
-            format_opt_kbps(snapshot.target_bitrate_kbps),
-            snapshot.received_total_kbps,
-            snapshot.received_video_kbps,
-            snapshot.received_audio_kbps
-        ),
-        format!(
-            "fps: stream={}  rx={:.1}  decode={:.1}  present={:.1}",
-            input_snapshot
-                .stream_config
-                .as_ref()
-                .map(|cfg| cfg.framerate.to_string())
-                .unwrap_or_else(|| "-".to_string()),
-            snapshot.receive_fps,
-            snapshot.decode_fps,
-            snapshot.present_fps
-        ),
-        format!(
-            "udp: packets={} lost={} ({loss_pct:.1}%) late={} dropped_frames={} window={} ms",
-            snapshot.received_packets,
-            snapshot.lost_packets,
-            snapshot.late_packets,
-            snapshot.dropped_frames,
-            snapshot.transport_interval_ms
-        ),
-        format!(
-            "latency: total={}  capture->send={}  send->assemble={}",
-            format_opt_ms(snapshot.total_latency_ms),
-            format_opt_ms(snapshot.capture_to_send_ms),
-            format_opt_ms(snapshot.send_to_assemble_ms)
-        ),
-        format!(
-            "latency: assemble->decode={}  decode->present={}  clock_rtt={}  clock_offset={}",
-            format_opt_ms(snapshot.assemble_to_decode_ms),
-            format_opt_ms(snapshot.decode_to_present_ms),
-            format_opt_ms(snapshot.clock_rtt_ms),
-            format_opt_ms(snapshot.server_clock_ahead_ms)
-        ),
-        format!(
-            "frame: id={} format={} present_path={} decode_work={}",
+            "frame: id={} format={} present_path={}",
             snapshot
                 .last_frame_id
                 .map(|id| id.to_string())
@@ -3630,8 +3573,7 @@ fn render_debug_overlay(
                 "-"
             } else {
                 snapshot.last_present_path.as_str()
-            },
-            format_opt_ms(snapshot.decode_work_ms)
+            }
         ),
     ];
 
@@ -3832,8 +3774,10 @@ impl eframe::App for StreamApp {
         });
 
         if state == ConnectionState::Connected {
+            let snapshot = self.debug_state.snapshot();
             if self.debug_enabled {
-                let snapshot = self.debug_state.snapshot();
+                self.graph_overlay.push(&snapshot);
+                self.graph_overlay.render(ctx);
                 let input_snapshot = self.shared_input.snapshot();
                 let cursor_lines = self.cursor_debug_lines(ctx, &input_snapshot);
                 render_debug_overlay(
