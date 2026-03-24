@@ -1445,7 +1445,7 @@ impl StreamApp {
                     self.last_sent_absolute_cursor = None;
                 }
             }
-        } else {
+        } else if !self.resume_hover_after_relative_drag {
             self.hover_cursor_pos = None;
             self.last_sent_absolute_cursor = None;
         }

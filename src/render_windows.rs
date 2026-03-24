@@ -117,6 +117,8 @@ impl WindowsD3d11Importer {
             state.processor.as_ptr(),
             state.output_view.as_ptr(),
             input_view.as_ptr(),
+            frame.width,
+            frame.height,
         );
 
         let unlock_ok =
@@ -639,8 +641,31 @@ fn video_processor_blt(
     processor: *mut c_void,
     output_view: *mut c_void,
     input_view: *mut c_void,
+    width: u32,
+    height: u32,
 ) -> Result<(), String> {
     let video_context = video_context as *mut ID3D11VideoContext;
+    let rect = WinRect {
+        left: 0,
+        top: 0,
+        right: width as i32,
+        bottom: height as i32,
+    };
+    unsafe {
+        ((*(*video_context).vtable).video_processor_set_stream_source_rect)(
+            video_context,
+            processor,
+            0,
+            1,
+            &rect,
+        );
+        ((*(*video_context).vtable).video_processor_set_output_target_rect)(
+            video_context,
+            processor,
+            1,
+            &rect,
+        );
+    }
     let stream = D3d11VideoProcessorStream {
         enable: 1,
         output_index: 0,
@@ -876,6 +901,14 @@ struct ID3D11VideoContext {
 }
 
 #[repr(C)]
+struct WinRect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[repr(C)]
 struct ID3D11VideoContextVtbl {
     query_interface: usize,
     add_ref: usize,
@@ -890,7 +923,21 @@ struct ID3D11VideoContextVtbl {
     decoder_end_frame: usize,
     submit_decoder_buffers: usize,
     decoder_extension: usize,
-    video_processor_prefix: [usize; 40],
+    video_processor_set_output_target_rect: unsafe extern "system" fn(
+        *mut ID3D11VideoContext,
+        *mut c_void,
+        BOOL,
+        *const WinRect,
+    ),
+    _vp_prefix_1: [usize; 16],
+    video_processor_set_stream_source_rect: unsafe extern "system" fn(
+        *mut ID3D11VideoContext,
+        *mut c_void,
+        UINT,
+        BOOL,
+        *const WinRect,
+    ),
+    _vp_prefix_2: [usize; 22],
     video_processor_blt: unsafe extern "system" fn(
         *mut ID3D11VideoContext,
         *mut c_void,
