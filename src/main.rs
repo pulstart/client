@@ -25,8 +25,8 @@ use render_gl::NativeVideoTexture;
 use st_protocol::{
     ClientDisplayInfo, ClockSyncPing, ControlMessage, ControllerState, InputPacket, KeyboardKey,
     KeyboardStateInput, MouseAbsoluteInput, MouseButtonsInput, MouseRelativeInput, MouseWheelInput,
-    StreamConfig, TransportFeedback, MOUSE_BUTTON_EXTRA1, MOUSE_BUTTON_EXTRA2, MOUSE_BUTTON_MIDDLE,
-    MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY,
+    StreamConfig, TransportFeedback, VideoCodec, VideoCodecSupport, MOUSE_BUTTON_EXTRA1,
+    MOUSE_BUTTON_EXTRA2, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY,
 };
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -105,6 +105,7 @@ struct StreamApp {
     audio_enabled: bool,
     debug_enabled: bool,
     display_refresh_millihz: Option<u32>,
+    video_codec_support: decode::VideoCodecSupportReport,
     audio_enabled_flag: Arc<AtomicBool>,
     debug_enabled_flag: Arc<AtomicBool>,
     state: Arc<Mutex<ConnectionState>>,
@@ -274,6 +275,7 @@ impl StreamApp {
         let debug_enabled = load_debug_enabled();
         let menu_button_pos = load_menu_button_pos().unwrap_or_else(default_menu_button_pos);
         let display_refresh_millihz = display::detect_max_refresh_millihz();
+        let video_codec_support = decode::VideoDecoder::detect_supported_codecs();
         let (update_tx, update_rx) = crossbeam_channel::unbounded();
         let update_ui_state = match updater::supported_target_label() {
             Ok(_) => UpdateUiState::Idle,
@@ -294,6 +296,7 @@ impl StreamApp {
             audio_enabled: audio,
             debug_enabled,
             display_refresh_millihz,
+            video_codec_support,
             audio_enabled_flag: Arc::new(AtomicBool::new(audio)),
             debug_enabled_flag: Arc::new(AtomicBool::new(debug_enabled)),
             state: Arc::new(Mutex::new(ConnectionState::Disconnected)),
@@ -381,6 +384,7 @@ impl StreamApp {
         let debug_state = Arc::clone(&self.debug_state);
         let native_surfaces = Arc::clone(&self.native_surfaces);
         let display_refresh_millihz = self.display_refresh_millihz;
+        let video_codec_support = self.video_codec_support;
         let shared_input = Arc::clone(&self.shared_input);
         debug_state.reset_for_connect(&addr, display_refresh_millihz);
 
@@ -388,6 +392,7 @@ impl StreamApp {
             run_connection(
                 addr,
                 display_refresh_millihz,
+                video_codec_support,
                 state,
                 frame_buf,
                 debug_state,
@@ -1729,6 +1734,7 @@ impl StreamApp {
                         .color(egui::Color32::from_rgb(224, 230, 236)),
                 );
                 ui.add_space(8.0);
+                let codec_support = codec_support_report_summary(self.video_codec_support);
                 if ui.available_width() < 360.0 {
                     render_capability_item(ui, "Platform", platform_label());
                     render_capability_item(
@@ -1738,7 +1744,7 @@ impl StreamApp {
                     );
                     render_capability_item(ui, "Renderer", "Glow");
                     render_capability_item(ui, "Best Present", native_surface_summary(caps));
-                    render_capability_item(ui, "Codecs", "h264 / hevc / av1");
+                    render_capability_item(ui, "Codecs", &codec_support);
                     render_capability_item(ui, "Audio", "opus stereo / 48 kHz");
                 } else {
                     egui::Grid::new("client_capabilities_grid")
@@ -1767,7 +1773,7 @@ impl StreamApp {
                             ui.end_row();
 
                             ui.label(capability_key("Codecs"));
-                            ui.label(egui::RichText::new("h264 / hevc / av1").monospace());
+                            ui.label(egui::RichText::new(codec_support.as_str()).monospace());
                             ui.end_row();
 
                             ui.label(capability_key("Audio"));
@@ -2168,6 +2174,7 @@ fn stop_media_threads(media_threads: MediaThreads) {
 fn run_connection(
     addr: String,
     display_refresh_millihz: Option<u32>,
+    video_codec_support: decode::VideoCodecSupportReport,
     state: Arc<Mutex<ConnectionState>>,
     frame_buf: Arc<Mutex<VideoFrameBuffer>>,
     debug_state: Arc<ConnectionDebugState>,
@@ -2267,14 +2274,18 @@ fn run_connection(
         .unwrap_or(0);
     if trace_enabled() {
         eprintln!(
-            "[trace][client] sending ClientDisplayInfo: refresh_millihz={} udp_port={local_udp_port}",
-            display_refresh_millihz.unwrap_or(0)
+            "[trace][client] sending ClientDisplayInfo: refresh_millihz={} udp_port={local_udp_port} codecs={} hw_codecs={}",
+            display_refresh_millihz.unwrap_or(0),
+            codec_support_summary(video_codec_support.supported),
+            codec_support_summary(video_codec_support.hardware)
         );
     }
     let _ = tcp.write_all(
         &ControlMessage::ClientDisplayInfo(ClientDisplayInfo {
             max_refresh_millihz: display_refresh_millihz.unwrap_or(0),
             udp_port: local_udp_port,
+            supported_video_codecs: video_codec_support.supported,
+            hardware_video_codecs: video_codec_support.hardware,
         })
         .serialize(),
     );
@@ -2978,6 +2989,39 @@ fn format_refresh(refresh_millihz: Option<u32>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+fn codec_support_summary(support: VideoCodecSupport) -> String {
+    let mut entries = Vec::new();
+    for codec in [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1] {
+        if support.supports(codec) {
+            entries.push(codec_name(codec));
+        }
+    }
+    if entries.is_empty() {
+        "-".to_string()
+    } else {
+        entries.join(" / ")
+    }
+}
+
+fn codec_support_report_summary(report: decode::VideoCodecSupportReport) -> String {
+    let mut entries = Vec::new();
+    for codec in [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1] {
+        if report.supported.supports(codec) {
+            let suffix = if report.hardware.supports(codec) {
+                "hw"
+            } else {
+                "sw"
+            };
+            entries.push(format!("{}({suffix})", codec_name(codec)));
+        }
+    }
+    if entries.is_empty() {
+        "-".to_string()
+    } else {
+        entries.join(" / ")
+    }
+}
+
 fn format_opt_ms(value: Option<f32>) -> String {
     value
         .map(|v| format!("{v:.1} ms"))
@@ -3016,10 +3060,14 @@ fn format_rect_opt(rect: Option<egui::Rect>) -> String {
 }
 
 fn codec_label(stream_config: &StreamConfig) -> &'static str {
-    match stream_config.codec {
-        st_protocol::VideoCodec::H264 => "h264",
-        st_protocol::VideoCodec::Hevc => "hevc",
-        st_protocol::VideoCodec::Av1 => "av1",
+    codec_name(stream_config.codec)
+}
+
+fn codec_name(codec: VideoCodec) -> &'static str {
+    match codec {
+        VideoCodec::H264 => "h264",
+        VideoCodec::Hevc => "hevc",
+        VideoCodec::Av1 => "av1",
     }
 }
 

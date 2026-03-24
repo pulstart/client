@@ -16,7 +16,7 @@ use ffmpeg::format::Pixel;
 use ffmpeg::software::scaling;
 use ffmpeg::util::frame::Video as VideoFrame;
 use ffmpeg::Codec;
-use st_protocol::VideoCodec;
+use st_protocol::{VideoCodec, VideoCodecSupport};
 use std::ffi::CStr;
 #[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -143,6 +143,13 @@ pub struct VideoDecoder {
     consecutive_failures: u32,
     waiting_for_recovery: bool,
     decoder_name: String,
+    hardware_accelerated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VideoCodecSupportReport {
+    pub supported: VideoCodecSupport,
+    pub hardware: VideoCodecSupport,
 }
 
 /// A hardware decoder to probe.
@@ -297,35 +304,76 @@ impl VideoDecoder {
     /// 2. Platform-ordered hardware device / decoder strategies
     /// 3. Software fallback
     pub fn new(codec: VideoCodec) -> Result<Self, String> {
+        Self::new_internal(codec, true)
+    }
+
+    fn new_internal(codec: VideoCodec, verbose: bool) -> Result<Self, String> {
         ffmpeg::init().map_err(|e| format!("ffmpeg init: {e}"))?;
 
         // 1. User override
         if let Some(hint) = decoder_hint(codec) {
-            eprintln!("[decode] trying user hint: {hint}");
+            if verbose {
+                eprintln!("[decode] trying user hint: {hint}");
+            }
             match Self::try_hint(codec, &hint) {
                 Ok(d) => {
-                    eprintln!("[decode] using hinted decoder: {}", d.decoder_name);
+                    if verbose {
+                        eprintln!("[decode] using hinted decoder: {}", d.decoder_name);
+                    }
                     return Ok(d);
                 }
-                Err(e) => eprintln!("[decode] hint '{hint}' failed: {e}"),
+                Err(e) => {
+                    if verbose {
+                        eprintln!("[decode] hint '{hint}' failed: {e}");
+                    }
+                }
             }
         }
 
         // 2. Hardware decoders
         for step in probe_steps(codec) {
-            eprintln!("[decode] probing {}...", probe_step_name(step));
+            if verbose {
+                eprintln!("[decode] probing {}...", probe_step_name(step));
+            }
             match Self::try_probe_step(codec, step) {
                 Ok(d) => {
-                    eprintln!("[decode] using hardware decoder: {}", d.decoder_name);
+                    if verbose {
+                        eprintln!("[decode] using hardware decoder: {}", d.decoder_name);
+                    }
                     return Ok(d);
                 }
-                Err(e) => eprintln!("[decode] {} unavailable: {e}", probe_step_name(step)),
+                Err(e) => {
+                    if verbose {
+                        eprintln!("[decode] {} unavailable: {e}", probe_step_name(step));
+                    }
+                }
             }
         }
 
         // 3. Software fallback
-        eprintln!("[decode] using software {} decoder", codec_label(codec));
+        if verbose {
+            eprintln!("[decode] using software {} decoder", codec_label(codec));
+        }
         Self::try_sw_decoder(codec)
+    }
+
+    pub fn detect_supported_codecs() -> VideoCodecSupportReport {
+        let mut supported = VideoCodecSupport::empty();
+        let mut hardware = VideoCodecSupport::empty();
+
+        for codec in [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1] {
+            if let Ok(decoder) = Self::new_internal(codec, false) {
+                supported.insert(codec);
+                if decoder.is_hardware_accelerated() {
+                    hardware.insert(codec);
+                }
+            }
+        }
+
+        VideoCodecSupportReport {
+            supported,
+            hardware,
+        }
     }
 
     fn try_hint(codec: VideoCodec, hint: &str) -> Result<Self, String> {
@@ -468,6 +516,7 @@ impl VideoDecoder {
             consecutive_failures: 0,
             waiting_for_recovery: false,
             decoder_name: name.to_string(),
+            hardware_accelerated: true,
         })
     }
 
@@ -499,6 +548,7 @@ impl VideoDecoder {
             consecutive_failures: 0,
             waiting_for_recovery: false,
             decoder_name: name.to_string(),
+            hardware_accelerated: false,
         })
     }
 
@@ -934,6 +984,10 @@ impl VideoDecoder {
     /// Active decoder name (e.g. "h264_vaapi", "h264 (software)").
     pub fn name(&self) -> &str {
         &self.decoder_name
+    }
+
+    pub fn is_hardware_accelerated(&self) -> bool {
+        self.hardware_accelerated
     }
 
     pub fn waiting_for_recovery(&self) -> bool {
