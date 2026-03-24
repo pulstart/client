@@ -125,6 +125,7 @@ struct StreamApp {
     last_video_rect: Option<egui::Rect>,
     last_sent_absolute_cursor: Option<(u16, u16)>,
     hover_cursor_pos: Option<egui::Pos2>,
+    resume_hover_after_relative_drag: bool,
     remote_cursor_textures: BTreeMap<u64, RemoteCursorTexture>,
     latest_remote_cursor_serial: Option<u64>,
     seen_cursor_shape_version: u64,
@@ -311,6 +312,7 @@ impl StreamApp {
             last_video_rect: None,
             last_sent_absolute_cursor: None,
             hover_cursor_pos: None,
+            resume_hover_after_relative_drag: false,
             remote_cursor_textures: BTreeMap::new(),
             latest_remote_cursor_serial: None,
             seen_cursor_shape_version: 0,
@@ -346,6 +348,7 @@ impl StreamApp {
         self.last_video_rect = None;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
+        self.resume_hover_after_relative_drag = false;
         self.await_pointer_exit_after_auto_release = false;
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
@@ -413,6 +416,7 @@ impl StreamApp {
         self.last_video_rect = None;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
+        self.resume_hover_after_relative_drag = false;
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
         self.seen_cursor_shape_version = 0;
@@ -430,6 +434,7 @@ impl StreamApp {
         self.pending_capture_click = false;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
+        self.resume_hover_after_relative_drag = false;
         self.await_pointer_exit_after_auto_release = false;
     }
 
@@ -444,6 +449,7 @@ impl StreamApp {
         self.last_video_rect = None;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
+        self.resume_hover_after_relative_drag = false;
         self.menu_open = false;
         self.await_pointer_exit_after_auto_release = false;
         self.local_overlay_hit_rects.clear();
@@ -455,6 +461,7 @@ impl StreamApp {
         self.pointer_buttons = 0;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
+        self.resume_hover_after_relative_drag = false;
         self.await_pointer_exit_after_auto_release = false;
         self.clear_remote_keyboard();
         if let Some(client_id) = self.shared_input.snapshot().client_id {
@@ -2964,6 +2971,47 @@ fn pointer_button_mask(button: egui::PointerButton) -> u8 {
     }
 }
 
+fn drag_capture_button_mask(button: egui::PointerButton) -> u8 {
+    match button {
+        egui::PointerButton::Primary => MOUSE_BUTTON_PRIMARY,
+        egui::PointerButton::Secondary => MOUSE_BUTTON_SECONDARY,
+        _ => 0,
+    }
+}
+
+fn should_enter_relative_button_drag_capture(
+    capture_mode: LocalCaptureMode,
+    controller_state: ControllerState,
+    mouse_relative: bool,
+    button: egui::PointerButton,
+    pressed: bool,
+    over_video: bool,
+    over_local_overlay: bool,
+) -> bool {
+    capture_mode == LocalCaptureMode::HoverAbsolute
+        && controller_state == ControllerState::OwnedByYou
+        && mouse_relative
+        && drag_capture_button_mask(button) != 0
+        && pressed
+        && over_video
+        && !over_local_overlay
+}
+
+fn should_return_to_hover_after_relative_button_drag(
+    capture_mode: LocalCaptureMode,
+    resume_hover_after_relative_drag: bool,
+    button: egui::PointerButton,
+    pressed: bool,
+    pointer_buttons: u8,
+) -> bool {
+    let drag_buttons = MOUSE_BUTTON_PRIMARY | MOUSE_BUTTON_SECONDARY;
+    capture_mode == LocalCaptureMode::CapturedRelative
+        && resume_hover_after_relative_drag
+        && drag_capture_button_mask(button) != 0
+        && !pressed
+        && pointer_buttons & drag_buttons == 0
+}
+
 fn quantize_wheel(delta: egui::Vec2, unit: egui::MouseWheelUnit) -> (i16, i16) {
     let scale = match unit {
         egui::MouseWheelUnit::Point => 1.0 / 40.0,
@@ -3757,7 +3805,35 @@ impl eframe::App for StreamApp {
                     let over_local_overlay = route_pos
                         .map(|pos| self.pointer_over_local_overlay(pos))
                         .unwrap_or(false);
+                    let enter_relative_drag = should_enter_relative_button_drag_capture(
+                        self.capture_mode,
+                        snapshot.controller_state,
+                        snapshot.capabilities.mouse_relative,
+                        button,
+                        pressed,
+                        over_video,
+                        over_local_overlay,
+                    );
+                    let restore_hover_after_drag = should_return_to_hover_after_relative_button_drag(
+                        self.capture_mode,
+                        self.resume_hover_after_relative_drag,
+                        button,
+                        pressed,
+                        self.pointer_buttons,
+                    );
+                    let mut sent_button_state = false;
+                    if enter_relative_drag {
+                        if let (Some(route_pos), Some(rect)) = (route_pos, video_rect) {
+                            sent_button_state =
+                                self.send_absolute_cursor(client_id, route_pos, rect, true);
+                        }
+                        self.capture_mode = LocalCaptureMode::CapturedRelative;
+                        self.resume_hover_after_relative_drag = true;
+                        self.await_pointer_exit_after_auto_release = false;
+                        ctx.request_repaint();
+                    }
                     if snapshot.controller_state == ControllerState::OwnedByYou
+                        && !sent_button_state
                         && !over_local_overlay
                         && (self.capture_mode == LocalCaptureMode::CapturedRelative
                             || self.capture_mode == LocalCaptureMode::HoverAbsolute && over_video)
@@ -3780,6 +3856,21 @@ impl eframe::App for StreamApp {
                                 buttons: self.pointer_buttons,
                             }));
                         }
+                    }
+                    if restore_hover_after_drag {
+                        self.capture_mode = LocalCaptureMode::HoverAbsolute;
+                        self.resume_hover_after_relative_drag = false;
+                        self.last_sent_absolute_cursor = None;
+                        if let Some(route_pos) = route_pos.filter(|pos| {
+                            video_rect
+                                .map(|rect| {
+                                    rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
+                                })
+                                .unwrap_or(false)
+                        }) {
+                            self.hover_cursor_pos = Some(route_pos);
+                        }
+                        ctx.request_repaint();
                     }
                 }
                 egui::Event::MouseWheel { delta, unit, .. } => {
@@ -3943,6 +4034,62 @@ mod tests {
             heartbeat.due_packet(release_at + INPUT_STATE_REPAIR_WINDOW + Duration::from_millis(1)),
             None
         );
+    }
+
+    #[test]
+    fn hover_primary_or_secondary_press_enters_relative_drag_when_available() {
+        assert!(should_enter_relative_button_drag_capture(
+            LocalCaptureMode::HoverAbsolute,
+            ControllerState::OwnedByYou,
+            true,
+            egui::PointerButton::Primary,
+            true,
+            true,
+            false,
+        ));
+        assert!(should_enter_relative_button_drag_capture(
+            LocalCaptureMode::HoverAbsolute,
+            ControllerState::OwnedByYou,
+            true,
+            egui::PointerButton::Secondary,
+            true,
+            true,
+            false,
+        ));
+        assert!(!should_enter_relative_button_drag_capture(
+            LocalCaptureMode::HoverAbsolute,
+            ControllerState::OwnedByYou,
+            false,
+            egui::PointerButton::Primary,
+            true,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn temporary_relative_drag_returns_to_hover_after_drag_buttons_release() {
+        assert!(should_return_to_hover_after_relative_button_drag(
+            LocalCaptureMode::CapturedRelative,
+            true,
+            egui::PointerButton::Primary,
+            false,
+            0,
+        ));
+        assert!(!should_return_to_hover_after_relative_button_drag(
+            LocalCaptureMode::CapturedRelative,
+            true,
+            egui::PointerButton::Primary,
+            false,
+            MOUSE_BUTTON_PRIMARY,
+        ));
+        assert!(!should_return_to_hover_after_relative_button_drag(
+            LocalCaptureMode::CapturedRelative,
+            true,
+            egui::PointerButton::Secondary,
+            false,
+            MOUSE_BUTTON_SECONDARY,
+        ));
     }
 }
 
