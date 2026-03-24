@@ -191,6 +191,10 @@ fn parse_apply_update_command(args: Vec<OsString>) -> Result<ApplyUpdateCommand,
 
 fn run_apply_update_command(command: &ApplyUpdateCommand) -> Result<(), String> {
     wait_for_process_exit(command.parent_pid)?;
+    // On Windows, the OS may hold file handles briefly after process exit
+    // (antivirus, search indexer, loader cache). Give it a moment.
+    #[cfg(windows)]
+    thread::sleep(Duration::from_millis(500));
     #[cfg(unix)]
     {
         if let Err(direct_err) = sync_package_contents(&command.package_root, &command.install_root)
@@ -556,15 +560,13 @@ fn sync_path(source: &Path, destination: &Path) -> Result<(), String> {
                     )
                 })?;
             } else {
-                fs::remove_file(destination).map_err(|err| {
-                    format!(
-                        "Failed to remove existing file '{}': {err}",
-                        destination.display()
-                    )
-                })?;
+                remove_or_rename_old(destination)?;
             }
         }
-        fs::copy(source, destination).map_err(|err| {
+        retry_io(3, Duration::from_millis(200), || {
+            fs::copy(source, destination)
+        })
+        .map_err(|err| {
             format!(
                 "Failed to copy '{}' to '{}': {err}",
                 source.display(),
@@ -574,6 +576,81 @@ fn sync_path(source: &Path, destination: &Path) -> Result<(), String> {
         copy_permissions(source, destination)?;
     }
     Ok(())
+}
+
+/// Try to remove a file. If removal fails (common on Windows when the file is
+/// still locked by the OS, antivirus, or search indexer), rename it to
+/// `.st-update-old` so the new file can be written. Old files are cleaned up
+/// on next launch via `cleanup_old_update_files()`.
+fn remove_or_rename_old(path: &Path) -> Result<(), String> {
+    // Try direct removal first.
+    if retry_io(2, Duration::from_millis(150), || fs::remove_file(path)).is_ok() {
+        return Ok(());
+    }
+
+    // Rename the locked file out of the way.
+    let mut old_path = path.as_os_str().to_os_string();
+    old_path.push(".st-update-old");
+    let old_path = PathBuf::from(old_path);
+    // Remove a previous .old file if present.
+    let _ = fs::remove_file(&old_path);
+    fs::rename(path, &old_path).map_err(|err| {
+        format!(
+            "Failed to move locked file '{}' to '{}': {err}",
+            path.display(),
+            old_path.display()
+        )
+    })
+}
+
+/// Retry an I/O operation with short delays between attempts.
+fn retry_io<T>(
+    retries: usize,
+    delay: Duration,
+    mut op: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    let mut last_err = None;
+    for i in 0..=retries {
+        match op() {
+            Ok(val) => return Ok(val),
+            Err(err) => {
+                last_err = Some(err);
+                if i < retries {
+                    thread::sleep(delay);
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
+/// Remove leftover `.st-update-old` files from a previous update. Call this
+/// once at startup.
+pub fn cleanup_old_update_files() {
+    let Ok(current_exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(install_dir) = current_exe.parent() else {
+        return;
+    };
+    cleanup_old_files_in(install_dir);
+}
+
+fn cleanup_old_files_in(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            cleanup_old_files_in(&path);
+        } else if path
+            .to_string_lossy()
+            .ends_with(".st-update-old")
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 fn copy_permissions(source: &Path, destination: &Path) -> Result<(), String> {

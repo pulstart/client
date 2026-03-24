@@ -4412,6 +4412,7 @@ fn main() {
             std::process::exit(1);
         }
     }
+    updater::cleanup_old_update_files();
 
     #[cfg(target_os = "macos")]
     let viewport = egui::ViewportBuilder::default()
