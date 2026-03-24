@@ -1297,7 +1297,10 @@ impl StreamApp {
                     self.hover_cursor_pos = Some(pos);
                 }
 
-                if let (Some(client_id), Some(pos)) = (snapshot.client_id, self.hover_cursor_pos) {
+                if self.pointer_buttons != 0 && snapshot.capabilities.mouse_relative {
+                    // Relative deltas are sent per-event from raw_input_hook MouseMoved handler
+                    self.last_sent_absolute_cursor = None;
+                } else if let (Some(client_id), Some(pos)) = (snapshot.client_id, self.hover_cursor_pos) {
                     self.send_absolute_cursor_if_needed(client_id, pos, video_rect);
                 }
             } else {
@@ -1322,7 +1325,10 @@ impl StreamApp {
                     })
                 };
                 self.hover_cursor_pos = hover_pos;
-                if let (Some(client_id), Some(pos)) = (snapshot.client_id, hover_pos) {
+                if hover_drag_active && snapshot.capabilities.mouse_relative {
+                    // Relative deltas are sent per-event from raw_input_hook MouseMoved handler
+                    self.last_sent_absolute_cursor = None;
+                } else if let (Some(client_id), Some(pos)) = (snapshot.client_id, hover_pos) {
                     self.send_absolute_cursor_if_needed(client_id, pos, video_rect);
                 } else {
                     self.last_sent_absolute_cursor = None;
@@ -3963,6 +3969,8 @@ impl eframe::App for StreamApp {
                                 .unwrap_or_else(|| rect.center());
                             let unclamped =
                                 egui::pos2(base_pos.x + delta.x, base_pos.y + delta.y);
+                            let send_relative_for_drag = hover_drag_active
+                                && snapshot.capabilities.mouse_relative;
                             if self.pointer_over_local_overlay(unclamped) {
                                 if hover_drag_active {
                                     let next_pos = clamp_pos_to_video_rect(
@@ -3972,7 +3980,20 @@ impl eframe::App for StreamApp {
                                     );
                                     self.hover_cursor_pos = Some(next_pos);
                                     last_pointer_pos = Some(next_pos);
-                                    self.send_absolute_cursor_if_needed(client_id, next_pos, rect);
+                                    if send_relative_for_drag {
+                                        let dx = delta.x.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                                        let dy = delta.y.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                                        if dx != 0 || dy != 0 {
+                                            self.send_input_packet(InputPacket::MouseRelative(
+                                                MouseRelativeInput {
+                                                    client_id, dx, dy,
+                                                    buttons: self.pointer_buttons,
+                                                },
+                                            ));
+                                        }
+                                    } else {
+                                        self.send_absolute_cursor_if_needed(client_id, next_pos, rect);
+                                    }
                                     ctx.request_repaint();
                                     continue;
                                 }
@@ -3995,7 +4016,20 @@ impl eframe::App for StreamApp {
                                     );
                                     self.hover_cursor_pos = Some(next_pos);
                                     last_pointer_pos = Some(next_pos);
-                                    self.send_absolute_cursor_if_needed(client_id, next_pos, rect);
+                                    if send_relative_for_drag {
+                                        let dx = delta.x.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                                        let dy = delta.y.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                                        if dx != 0 || dy != 0 {
+                                            self.send_input_packet(InputPacket::MouseRelative(
+                                                MouseRelativeInput {
+                                                    client_id, dx, dy,
+                                                    buttons: self.pointer_buttons,
+                                                },
+                                            ));
+                                        }
+                                    } else {
+                                        self.send_absolute_cursor_if_needed(client_id, next_pos, rect);
+                                    }
                                     ctx.request_repaint();
                                     continue;
                                 }
@@ -4013,7 +4047,40 @@ impl eframe::App for StreamApp {
                             );
                             self.hover_cursor_pos = Some(next_pos);
                             last_pointer_pos = Some(next_pos);
-                            self.send_absolute_cursor_if_needed(client_id, next_pos, rect);
+                            if hover_drag_active && snapshot.capabilities.mouse_relative {
+                                let dx = delta.x.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                                let dy = delta.y.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                                if dx != 0 || dy != 0 {
+                                    self.send_input_packet(InputPacket::MouseRelative(
+                                        MouseRelativeInput {
+                                            client_id,
+                                            dx,
+                                            dy,
+                                            buttons: self.pointer_buttons,
+                                        },
+                                    ));
+                                }
+                            } else {
+                                self.send_absolute_cursor_if_needed(client_id, next_pos, rect);
+                            }
+                            ctx.request_repaint();
+                        }
+                    } else if self.capture_mode == LocalCaptureMode::HoverAbsolute
+                        && snapshot.controller_state == ControllerState::OwnedByYou
+                        && self.pointer_buttons != 0
+                        && snapshot.capabilities.mouse_relative
+                    {
+                        let dx = delta.x.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                        let dy = delta.y.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                        if dx != 0 || dy != 0 {
+                            self.send_input_packet(InputPacket::MouseRelative(
+                                MouseRelativeInput {
+                                    client_id,
+                                    dx,
+                                    dy,
+                                    buttons: self.pointer_buttons,
+                                },
+                            ));
                             ctx.request_repaint();
                         }
                     }
