@@ -1398,13 +1398,17 @@ impl StreamApp {
                 self.hover_cursor_pos =
                     Some(clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()));
             } else if self.hover_cursor_pos.is_none() {
-                self.hover_cursor_pos = Some(video_rect.center());
+                // Don't fall back to center — skip the transition until we
+                // have a real pointer position to anchor the drag.
+                self.hover_drag_edge_mismatch_frames = 0;
             }
-            self.capture_mode = LocalCaptureMode::CapturedRelative;
-            self.resume_hover_after_relative_drag = true;
-            self.hover_cursor_resync_pending = false;
-            self.hover_drag_edge_mismatch_frames = 0;
-            ctx.request_repaint();
+            if self.hover_cursor_pos.is_some() {
+                self.capture_mode = LocalCaptureMode::CapturedRelative;
+                self.resume_hover_after_relative_drag = true;
+                self.hover_cursor_resync_pending = false;
+                self.hover_drag_edge_mismatch_frames = 0;
+                ctx.request_repaint();
+            }
         }
 
         if previous_capture_mode != self.capture_mode && self.capture_mode == LocalCaptureMode::Idle
@@ -4316,10 +4320,9 @@ impl eframe::App for StreamApp {
                             ));
                             if self.resume_hover_after_relative_drag {
                                 if let Some(rect) = video_rect {
-                                    let base_pos = self
+                                    let Some(base_pos) = self
                                         .hover_cursor_pos
-                                        .or(last_pointer_pos)
-                                        .unwrap_or_else(|| rect.center());
+                                        .or(last_pointer_pos) else { continue };
                                     let next_pos = clamp_pos_to_video_rect(
                                         egui::pos2(base_pos.x + delta.x, base_pos.y + delta.y),
                                         rect,
