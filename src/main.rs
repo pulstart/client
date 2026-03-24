@@ -141,6 +141,7 @@ struct StreamApp {
     await_pointer_exit_after_auto_release: bool,
     applied_cursor_visible: Option<bool>,
     applied_cursor_grab: Option<egui::CursorGrab>,
+    suppress_mouse_delta: bool,
     update_ui_state: UpdateUiState,
     update_tx: crossbeam_channel::Sender<UpdateWorkerEvent>,
     update_rx: crossbeam_channel::Receiver<UpdateWorkerEvent>,
@@ -332,6 +333,7 @@ impl StreamApp {
             await_pointer_exit_after_auto_release: false,
             applied_cursor_visible: None,
             applied_cursor_grab: None,
+            suppress_mouse_delta: false,
             update_ui_state,
             update_tx,
             update_rx,
@@ -728,6 +730,7 @@ impl StreamApp {
 
         if self.applied_cursor_grab != Some(cursor_grab) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(cursor_grab));
+            self.suppress_mouse_delta = true;
             self.applied_cursor_grab = Some(cursor_grab);
         }
         if self.applied_cursor_visible != Some(cursor_visible) {
@@ -3914,6 +3917,9 @@ impl eframe::App for StreamApp {
                     }
                 }
                 egui::Event::MouseMoved(delta) => {
+                    if self.suppress_mouse_delta {
+                        continue;
+                    }
                     if self.capture_mode == LocalCaptureMode::CapturedRelative
                         && snapshot.controller_state == ControllerState::OwnedByYou
                     {
@@ -4165,6 +4171,8 @@ impl eframe::App for StreamApp {
                 _ => {}
             }
         }
+
+        self.suppress_mouse_delta = false;
 
         if keyboard_dirty {
             self.send_keyboard_snapshot(client_id);
