@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  FFMPEG_VERSION: "7.1"
+  FFMPEG_VERSION: "8.0"
   FFMPEG_BUILD_TAG: "latest"
 
 jobs:
