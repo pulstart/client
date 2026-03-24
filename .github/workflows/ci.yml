@@ -58,7 +58,7 @@ jobs:
         with:
           workspaces: |
             . -> target
-          prefix-key: v2
+          prefix-key: v3
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
