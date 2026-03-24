@@ -23,6 +23,7 @@ use eframe::egui;
 use input::{LocalCaptureMode, LocalKeyboardState, RemoteCursorTexture, SharedInputState};
 use keep_awake::KeepAwakeController;
 use render_gl::NativeVideoTexture;
+use serde::{Deserialize, Serialize};
 use st_protocol::{
     ClientDisplayInfo, ClockSyncPing, ControlMessage, ControllerState, InputPacket, KeyboardKey,
     KeyboardStateInput, MouseAbsoluteInput, MouseButtonsInput, MouseRelativeInput, MouseWheelInput,
@@ -39,7 +40,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use transport::AudioPacket;
-use video_frame::{NativeSurfaceCapabilities, NativeSurfaceControl, VideoFrameBuffer};
+use video_frame::{NativeSurfaceControl, VideoFrameBuffer};
 
 use crate::debug_state::{unix_time_micros, ConnectionDebugSnapshot, ConnectionDebugState};
 
@@ -59,6 +60,14 @@ enum ConnectionState {
     Connecting,
     Connected,
     Error(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HomeTab {
+    Servers,
+    Settings,
+    Update,
+    About,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +112,10 @@ struct CursorOverlayGeometry {
 
 struct StreamApp {
     server_addr: String,
+    server_list: Vec<ServerEntry>,
+    add_server_addr: String,
+    search_query: String,
+    home_tab: HomeTab,
     audio_enabled: bool,
     debug_enabled: bool,
     display_refresh_millihz: Option<u32>,
@@ -259,6 +272,92 @@ fn save_menu_button_pos(pos: egui::Pos2) {
     let _ = std::fs::write(dir.join("menu_button_pos"), format!("{:.1} {:.1}", pos.x, pos.y));
 }
 
+// ---------------------------------------------------------------------------
+// Server list persistence
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ServerEntry {
+    address: String,
+    #[serde(default)]
+    nickname: String,
+    /// Unix timestamp (seconds) of last successful connection, 0 if never.
+    #[serde(default)]
+    last_connected: u64,
+}
+
+fn load_server_list() -> Vec<ServerEntry> {
+    let path = state_dir().join("servers.json");
+    match std::fs::read_to_string(&path) {
+        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn save_server_list(list: &[ServerEntry]) {
+    let dir = state_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(data) = serde_json::to_string_pretty(list) {
+        let _ = std::fs::write(dir.join("servers.json"), data);
+    }
+}
+
+/// Ensure the last-connected server is in the list and migrate the legacy
+/// `last_server` file if the list is empty.
+fn ensure_server_in_list(list: &mut Vec<ServerEntry>, addr: &str) {
+    let normalized = normalize_server_addr(addr);
+    if normalized.is_empty() {
+        return;
+    }
+    if !list.iter().any(|s| s.address == normalized) {
+        list.push(ServerEntry {
+            address: normalized,
+            nickname: String::new(),
+            last_connected: 0,
+        });
+    }
+}
+
+fn touch_server_connected(list: &mut Vec<ServerEntry>, addr: &str) {
+    let normalized = normalize_server_addr(addr);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some(entry) = list.iter_mut().find(|s| s.address == normalized) {
+        entry.last_connected = now;
+    } else {
+        list.push(ServerEntry {
+            address: normalized,
+            nickname: String::new(),
+            last_connected: now,
+        });
+    }
+    save_server_list(list);
+}
+
+fn format_last_connected(ts: u64) -> String {
+    if ts == 0 {
+        return "Never connected".to_string();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let ago = now.saturating_sub(ts);
+    if ago < 60 {
+        "Just now".to_string()
+    } else if ago < 3600 {
+        format!("{} min ago", ago / 60)
+    } else if ago < 86400 {
+        format!("{} hours ago", ago / 3600)
+    } else if ago < 86400 * 30 {
+        format!("{} days ago", ago / 86400)
+    } else {
+        "Long ago".to_string()
+    }
+}
+
 fn clamp_menu_button_pos(pos: egui::Pos2, content_rect: egui::Rect) -> egui::Pos2 {
     let max_x = (content_rect.right() - FLOATING_MENU_BUTTON_SIZE).max(content_rect.left());
     let max_y = (content_rect.bottom() - FLOATING_MENU_BUTTON_SIZE).max(content_rect.top());
@@ -275,6 +374,12 @@ fn clamp_menu_button_pos(pos: egui::Pos2, content_rect: egui::Rect) -> egui::Pos
 impl StreamApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let saved = load_last_server().unwrap_or_else(default_server_addr);
+        let mut server_list = load_server_list();
+        // Migrate legacy last_server into the list
+        if server_list.is_empty() && !saved.trim().is_empty() {
+            ensure_server_in_list(&mut server_list, &saved);
+            save_server_list(&server_list);
+        }
         let audio = load_audio_enabled();
         let debug_enabled = load_debug_enabled();
         let menu_button_pos = load_menu_button_pos().unwrap_or_else(default_menu_button_pos);
@@ -297,6 +402,10 @@ impl StreamApp {
         ));
         Self {
             server_addr: saved,
+            server_list,
+            add_server_addr: String::new(),
+            search_query: String::new(),
+            home_tab: HomeTab::Servers,
             audio_enabled: audio,
             debug_enabled,
             display_refresh_millihz,
@@ -348,6 +457,7 @@ impl StreamApp {
     fn connect(&mut self, ctx: egui::Context) {
         let saved_addr = self.server_addr.trim().to_string();
         save_last_server(&saved_addr);
+        touch_server_connected(&mut self.server_list, &saved_addr);
 
         self.disconnect_flag.store(true, Ordering::SeqCst);
         let disconnect_flag = Arc::new(AtomicBool::new(false));
@@ -1411,387 +1521,542 @@ impl StreamApp {
     fn paint_connected_background(&self, _ui: &mut egui::Ui) {}
 
     fn render_home_screen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let rect = ui.max_rect();
-        let painter = ui.painter();
-        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(8, 11, 16));
-        painter.circle_filled(
-            egui::pos2(rect.right() - 90.0, rect.top() + 90.0),
-            170.0,
-            egui::Color32::from_rgba_unmultiplied(64, 174, 255, 26),
-        );
-        painter.circle_filled(
-            egui::pos2(rect.left() + 90.0, rect.bottom() - 70.0),
-            200.0,
-            egui::Color32::from_rgba_unmultiplied(50, 210, 154, 20),
-        );
+        let full_rect = ui.max_rect();
+        let painter = ui.painter().clone();
 
-        let available_width = ui.available_width();
-        let outer_padding = if available_width < 520.0 { 10.0 } else { 16.0 };
-        let content_width = (available_width - outer_padding * 2.0).clamp(0.0, 980.0);
-        let caps = self.native_surfaces.snapshot();
-        let compact_hero = content_width < 860.0;
-        let split_cards = content_width > 920.0;
+        // Parsec-style colors
+        const BG_MAIN: egui::Color32 = egui::Color32::from_rgb(26, 30, 38);
+        const BG_SIDEBAR: egui::Color32 = egui::Color32::from_rgb(21, 24, 31);
+        const TEXT_WHITE: egui::Color32 = egui::Color32::from_rgb(230, 233, 240);
+        const TEXT_GRAY: egui::Color32 = egui::Color32::from_rgb(138, 142, 150);
+        const ACCENT_BLUE: egui::Color32 = egui::Color32::from_rgb(90, 200, 250);
+        const BTN_DARK: egui::Color32 = egui::Color32::from_rgb(52, 56, 66);
+        const SIDEBAR_W: f32 = 48.0;
+
+        // Fill backgrounds
+        painter.rect_filled(full_rect, 0.0, BG_MAIN);
+        let sidebar_rect = egui::Rect::from_min_size(
+            full_rect.min,
+            egui::vec2(SIDEBAR_W, full_rect.height()),
+        );
+        painter.rect_filled(sidebar_rect, 0.0, BG_SIDEBAR);
+
+        // --- Sidebar icons ---
+        let sidebar_tabs = [
+            ("S", "Servers", HomeTab::Servers),
+            ("G", "Settings", HomeTab::Settings),
+            ("U", "Update", HomeTab::Update),
+            ("?", "About", HomeTab::About),
+        ];
+        for (i, (icon, tooltip, tab)) in sidebar_tabs.iter().enumerate() {
+            let selected = self.home_tab == *tab;
+            let icon_y = full_rect.top() + 16.0 + i as f32 * 48.0;
+            let icon_rect = egui::Rect::from_min_size(
+                egui::pos2(full_rect.left(), icon_y),
+                egui::vec2(SIDEBAR_W, 40.0),
+            );
+
+            if selected {
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(full_rect.left(), icon_y),
+                        egui::vec2(3.0, 40.0),
+                    ),
+                    0.0,
+                    ACCENT_BLUE,
+                );
+                painter.rect_filled(
+                    icon_rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(90, 200, 250, 20),
+                );
+            }
+
+            let icon_response = ui.allocate_rect(icon_rect, egui::Sense::click());
+            painter.text(
+                icon_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                icon,
+                egui::FontId::proportional(16.0),
+                if selected { ACCENT_BLUE } else { TEXT_GRAY },
+            );
+            if icon_response.hovered() && !selected {
+                painter.rect_filled(
+                    icon_rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 8),
+                );
+            }
+            if icon_response.clicked() {
+                self.home_tab = *tab;
+            }
+            icon_response.on_hover_text(*tooltip);
+        }
+
+        // --- Main content area ---
+        let content_left = full_rect.left() + SIDEBAR_W;
+
+        // Bottom bar (only on Servers tab)
+        let bottom_bar_h = if self.home_tab == HomeTab::Servers {
+            48.0
+        } else {
+            0.0
+        };
+        let main_bottom = full_rect.bottom() - bottom_bar_h;
+
+        if self.home_tab == HomeTab::Servers && bottom_bar_h > 0.0 {
+            let bottom_rect = egui::Rect::from_min_max(
+                egui::pos2(content_left, main_bottom),
+                full_rect.max,
+            );
+            painter.rect_filled(
+                bottom_rect,
+                0.0,
+                egui::Color32::from_rgb(30, 34, 42),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(content_left, bottom_rect.top()),
+                    egui::pos2(full_rect.right(), bottom_rect.top()),
+                ],
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 50, 58)),
+            );
+
+            let bottom_inner = bottom_rect.shrink2(egui::vec2(20.0, 8.0));
+            let mut bottom_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(bottom_inner)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            bottom_ui.label(
+                egui::RichText::new("Add server by address.")
+                    .size(12.0)
+                    .color(TEXT_GRAY),
+            );
+            bottom_ui.add_space(8.0);
+            let add_resp = bottom_ui.add(
+                egui::TextEdit::singleline(&mut self.add_server_addr)
+                    .hint_text("IP or host[:port]")
+                    .desired_width(200.0),
+            );
+            let can_add = !self.add_server_addr.trim().is_empty();
+            if add_resp.lost_focus()
+                && bottom_ui.input(|i| i.key_pressed(egui::Key::Enter))
+                && can_add
+            {
+                let addr = self.add_server_addr.trim().to_string();
+                ensure_server_in_list(&mut self.server_list, &addr);
+                save_server_list(&self.server_list);
+                self.add_server_addr.clear();
+            }
+            bottom_ui.add_space(4.0);
+            if bottom_ui
+                .add_enabled(
+                    can_add,
+                    egui::Button::new(
+                        egui::RichText::new("Add")
+                            .size(12.0)
+                            .color(TEXT_WHITE),
+                    )
+                    .fill(BTN_DARK)
+                    .corner_radius(4)
+                    .min_size(egui::vec2(50.0, 28.0)),
+                )
+                .clicked()
+            {
+                let addr = self.add_server_addr.trim().to_string();
+                ensure_server_in_list(&mut self.server_list, &addr);
+                save_server_list(&self.server_list);
+                self.add_server_addr.clear();
+            }
+        }
+
+        // Scrollable main content
+        let main_rect = egui::Rect::from_min_max(
+            egui::pos2(content_left, full_rect.top()),
+            egui::pos2(full_rect.right(), main_bottom),
+        );
+        let mut main_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(main_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.add_space(34.0);
-                ui.add_space(outer_padding);
-                ui.vertical_centered(|ui| {
-                    ui.set_max_width(content_width);
-                    ui.set_width(content_width);
-
-                    egui::Frame::popup(ui.style())
-                        .fill(egui::Color32::from_rgba_unmultiplied(15, 20, 28, 232))
-                        .show(ui, |ui| {
-                            if compact_hero {
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("st viewer")
-                                            .size(30.0)
-                                            .strong()
-                                            .color(egui::Color32::from_rgb(240, 244, 248)),
-                                    );
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "Low-latency streaming client with high-refresh negotiation and native presentation paths.",
-                                        )
-                                        .size(15.0)
-                                        .color(egui::Color32::from_rgb(166, 178, 191)),
-                                    );
-                                    ui.add_space(10.0);
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "The menu below exposes the current viewer controls directly: last server, audio/debug defaults, display refresh hint, codec support, and the best zero-copy path this platform can use.",
-                                        )
-                                        .size(13.0)
-                                        .color(egui::Color32::from_rgb(130, 143, 157)),
-                                    );
-                                    ui.add_space(12.0);
-                                    render_client_summary_panel(ui, caps, self.display_refresh_millihz);
-                                });
-                            } else {
-                                let row_width = ui.available_width();
-                                let summary_width = (row_width * 0.28).clamp(210.0, 250.0);
-                                let text_width = (row_width - summary_width - 14.0).max(280.0);
-                                ui.horizontal_top(|ui| {
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(text_width, 0.0),
-                                        egui::Layout::top_down(egui::Align::Min),
-                                        |ui| {
-                                            ui.label(
-                                                egui::RichText::new("st viewer")
-                                                    .size(30.0)
-                                                    .strong()
-                                                    .color(egui::Color32::from_rgb(240, 244, 248)),
-                                            );
-                                            ui.add_space(4.0);
-                                            ui.label(
-                                                egui::RichText::new(
-                                                    "Low-latency streaming client with high-refresh negotiation and native presentation paths.",
-                                                )
-                                                .size(15.0)
-                                                .color(egui::Color32::from_rgb(166, 178, 191)),
-                                            );
-                                            ui.add_space(10.0);
-                                            ui.label(
-                                                egui::RichText::new(
-                                                    "The menu below exposes the current viewer controls directly: last server, audio/debug defaults, display refresh hint, codec support, and the best zero-copy path this platform can use.",
-                                                )
-                                                .size(13.0)
-                                                .color(egui::Color32::from_rgb(130, 143, 157)),
-                                            );
-                                        },
-                                    );
-                                    ui.add_space(14.0);
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(summary_width, 0.0),
-                                        egui::Layout::top_down(egui::Align::Min),
-                                        |ui| {
-                                            render_client_summary_panel(
-                                                ui,
-                                                caps,
-                                                self.display_refresh_millihz,
-                                            );
-                                        },
-                                    );
-                                });
-                            }
-                        });
-
-                    ui.add_space(14.0);
-                    if split_cards {
-                        ui.columns(2, |columns| {
-                            self.render_connection_card(&mut columns[0], ctx);
-                            self.render_client_capabilities_card(&mut columns[1], ctx, caps);
-                        });
-                    } else {
-                        self.render_connection_card(ui, ctx);
-                        ui.add_space(12.0);
-                        self.render_client_capabilities_card(ui, ctx, caps);
-                    }
-
-                    ui.add_space(12.0);
-                    egui::Frame::popup(ui.style())
-                        .fill(egui::Color32::from_rgba_unmultiplied(14, 18, 24, 214))
-                        .show(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(
-                                    egui::RichText::new("Flow")
-                                        .strong()
-                                        .color(egui::Color32::from_rgb(228, 234, 240)),
-                                );
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Enter on the server field connects immediately. Audio and Debug act as session defaults. The detected display refresh is sent as the FPS ceiling hint when the stream starts.",
-                                    )
-                                    .color(egui::Color32::from_rgb(154, 166, 179)),
-                                );
-                            });
-                        });
-                });
-                ui.add_space(28.0);
-            });
-    }
-
-    fn render_connection_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        egui::Frame::popup(ui.style())
-            .fill(egui::Color32::from_rgba_unmultiplied(16, 21, 28, 230))
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new("Connection")
-                        .size(19.0)
-                        .strong()
-                        .color(egui::Color32::from_rgb(240, 244, 248)),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Pick the server control address and launch the current viewer pipeline.",
-                    )
-                    .size(13.0)
-                    .color(egui::Color32::from_rgb(156, 169, 181)),
-                );
-                ui.add_space(14.0);
-                egui::Frame::popup(ui.style())
-                    .fill(egui::Color32::from_rgba_unmultiplied(10, 31, 52, 206))
-                    .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                egui::RichText::new("Quick Start")
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(228, 241, 255)),
-                            );
-                            ui.label(
-                                egui::RichText::new(
-                                    "Set the server endpoint, then launch the viewer. Control stays on TCP, video and audio switch to UDP after setup.",
-                                )
-                                .size(12.0)
-                                .color(egui::Color32::from_rgb(180, 205, 232)),
-                            );
-                        });
-                    });
-                ui.add_space(12.0);
-                ui.label(
-                    egui::RichText::new("Server")
-                        .strong()
-                        .color(egui::Color32::from_rgb(224, 230, 236)),
-                );
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.server_addr)
-                        .hint_text("127.0.0.1 or host[:port]")
-                        .desired_width(f32::INFINITY),
-                );
-                let can_connect = !self.server_addr.trim().is_empty();
-                if response.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    && can_connect
-                {
-                    self.video_texture.clear_frame();
-                    self.connect(ctx.clone());
-                }
-
-                ui.add_space(10.0);
-                let connect_width = ui.available_width().max(0.0);
-                let narrow_button = connect_width < 260.0;
-                let connect_label = if can_connect {
-                    if narrow_button {
-                        "Connect"
-                    } else {
-                        "Connect To Stream"
-                    }
-                } else {
-                    if narrow_button {
-                        "Enter Server"
-                    } else {
-                        "Enter Server To Connect"
-                    }
+            .show(&mut main_ui, |ui| {
+                let margin = egui::Margin {
+                    left: 32,
+                    right: 32,
+                    top: 28,
+                    bottom: 28,
                 };
-                if ui
-                    .add_enabled(
-                        can_connect,
-                        egui::Button::new(
-                            egui::RichText::new(connect_label)
-                                .size(17.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(246, 250, 252)),
-                        )
-                        .min_size(egui::vec2(connect_width, 50.0))
-                        .fill(egui::Color32::from_rgb(18, 122, 235)),
-                    )
-                    .clicked()
-                {
-                    self.video_texture.clear_frame();
-                    self.connect(ctx.clone());
-                }
-
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new("Hint")
-                            .strong()
-                            .color(egui::Color32::from_rgb(219, 225, 233)),
-                    );
-                    ui.label(
-                        egui::RichText::new(
-                            "Press Enter from the address field for immediate connect.",
-                        )
-                        .size(12.0)
-                        .color(egui::Color32::from_rgb(144, 157, 170)),
-                    );
-                });
-                ui.add_space(10.0);
-                ui.label(egui::RichText::new(format!("last target: {}", self.server_addr)).monospace());
-                ui.label(
-                    egui::RichText::new(format!(
-                        "If the port is omitted, the client uses {DEFAULT_APP_PORT}. TCP and UDP share the same server port; client UDP stays auto."
-                    ))
-                    .monospace(),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "The client keeps the last server address, performs TCP control setup first, then switches video and audio to UDP media transport.",
-                    )
-                    .size(12.0)
-                    .color(egui::Color32::from_rgb(132, 145, 158)),
-                );
+                egui::Frame::NONE
+                    .inner_margin(margin)
+                    .show(ui, |ui| {
+                        match self.home_tab {
+                            HomeTab::Servers => self.render_servers_tab(ui, ctx, &painter),
+                            HomeTab::Settings => self.render_settings_tab(ui),
+                            HomeTab::Update => self.render_update_tab(ui, ctx),
+                            HomeTab::About => self.render_about_tab(ui),
+                        }
+                    });
             });
     }
 
-    fn render_client_capabilities_card(
+    fn render_servers_tab(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        caps: NativeSurfaceCapabilities,
+        painter: &egui::Painter,
     ) {
-        egui::Frame::popup(ui.style())
-            .fill(egui::Color32::from_rgba_unmultiplied(16, 21, 28, 230))
-            .show(ui, |ui| {
+        const TEXT_WHITE: egui::Color32 = egui::Color32::from_rgb(230, 233, 240);
+        const TEXT_GRAY: egui::Color32 = egui::Color32::from_rgb(138, 142, 150);
+        const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(90, 95, 108);
+        const ACCENT_BLUE: egui::Color32 = egui::Color32::from_rgb(90, 200, 250);
+        const BTN_DARK: egui::Color32 = egui::Color32::from_rgb(52, 56, 66);
+        const BG_CARD: egui::Color32 = egui::Color32::from_rgb(42, 46, 56);
+        const BG_CARD_HOVER: egui::Color32 = egui::Color32::from_rgb(50, 55, 66);
+        const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(58, 62, 72);
+        const CARD_W: f32 = 180.0;
+        const CARD_H: f32 = 210.0;
+
+        ui.label(
+            egui::RichText::new("Computers")
+                .size(32.0)
+                .color(TEXT_WHITE),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Connect to your computer in low latency desktop mode.")
+                .size(13.0)
+                .color(TEXT_GRAY),
+        );
+        ui.add_space(16.0);
+
+        // Search bar + Reload
+        let search_width = ui.available_width().min(500.0);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search_query)
+                    .hint_text("Search Hosts and Computers")
+                    .desired_width(search_width),
+            );
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Reload")
+                                    .size(13.0)
+                                    .color(ACCENT_BLUE),
+                            )
+                            .fill(egui::Color32::TRANSPARENT),
+                        )
+                        .clicked()
+                    {
+                        // Placeholder
+                    }
+                },
+            );
+        });
+        ui.add_space(20.0);
+
+        // Sort: most recently connected first
+        let mut indices: Vec<usize> = (0..self.server_list.len()).collect();
+        indices.sort_by(|&a, &b| {
+            self.server_list[b]
+                .last_connected
+                .cmp(&self.server_list[a].last_connected)
+        });
+
+        // Filter by search
+        let query = self.search_query.trim().to_lowercase();
+        if !query.is_empty() {
+            indices.retain(|&i| {
+                let e = &self.server_list[i];
+                e.address.to_lowercase().contains(&query)
+                    || e.nickname.to_lowercase().contains(&query)
+            });
+        }
+
+        let mut connect_idx: Option<usize> = None;
+        let mut delete_idx: Option<usize> = None;
+
+        if self.server_list.is_empty() {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
                 ui.label(
-                    egui::RichText::new("Client Defaults")
-                        .size(19.0)
-                        .strong()
-                        .color(egui::Color32::from_rgb(240, 244, 248)),
+                    egui::RichText::new("No computers")
+                        .size(15.0)
+                        .color(TEXT_DIM),
                 );
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new(
-                        "Tune the next session and verify which fast paths this client can use.",
-                    )
-                    .size(13.0)
-                    .color(egui::Color32::from_rgb(156, 169, 181)),
+                    egui::RichText::new("Add a server address using the bar below.")
+                        .size(12.0)
+                        .color(TEXT_DIM),
                 );
+            });
+        } else if indices.is_empty() {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("No matches")
+                        .size(15.0)
+                        .color(TEXT_DIM),
+                );
+            });
+        } else {
+            let avail_w = ui.available_width();
+            let cols = ((avail_w + 12.0) / (CARD_W + 12.0)).floor().max(1.0) as usize;
+
+            let mut card_i = 0;
+            while card_i < indices.len() {
+                ui.horizontal(|ui| {
+                    for _ in 0..cols {
+                        if card_i >= indices.len() {
+                            break;
+                        }
+                        let idx = indices[card_i];
+                        card_i += 1;
+                        let entry = &self.server_list[idx];
+
+                        let (card_id, card_rect) =
+                            ui.allocate_space(egui::vec2(CARD_W, CARD_H));
+                        let hover = ui
+                            .interact(card_rect, card_id, egui::Sense::hover())
+                            .hovered();
+                        let fill = if hover { BG_CARD_HOVER } else { BG_CARD };
+
+                        painter.rect(
+                            card_rect,
+                            8.0,
+                            fill,
+                            egui::Stroke::new(1.0, CARD_BORDER),
+                            egui::StrokeKind::Outside,
+                        );
+
+                        // Monitor icon
+                        let icon_cx = card_rect.center().x;
+                        let icon_top = card_rect.top() + 20.0;
+                        paint_monitor_icon(
+                            painter,
+                            egui::pos2(icon_cx, icon_top),
+                            entry.last_connected > 0,
+                        );
+
+                        // Server name
+                        let display_name = if entry.nickname.is_empty() {
+                            &entry.address
+                        } else {
+                            &entry.nickname
+                        };
+                        let name_y = icon_top + 76.0;
+                        painter.text(
+                            egui::pos2(icon_cx, name_y),
+                            egui::Align2::CENTER_CENTER,
+                            truncate_str(display_name, 20),
+                            egui::FontId::proportional(12.0),
+                            TEXT_WHITE,
+                        );
+
+                        // Subtitle
+                        let sub_y = name_y + 16.0;
+                        let subtitle = if !entry.nickname.is_empty() {
+                            truncate_str(&entry.address, 24).to_string()
+                        } else {
+                            format_last_connected(entry.last_connected)
+                        };
+                        painter.text(
+                            egui::pos2(icon_cx, sub_y),
+                            egui::Align2::CENTER_CENTER,
+                            &subtitle,
+                            egui::FontId::proportional(10.0),
+                            TEXT_DIM,
+                        );
+
+                        // Connect button
+                        let btn_w = CARD_W - 24.0;
+                        let btn_h = 28.0;
+                        let btn_rect = egui::Rect::from_min_size(
+                            egui::pos2(
+                                card_rect.left() + 12.0,
+                                card_rect.bottom() - 12.0 - btn_h,
+                            ),
+                            egui::vec2(btn_w, btn_h),
+                        );
+                        let btn_resp =
+                            ui.allocate_rect(btn_rect, egui::Sense::click());
+                        let btn_fill = if btn_resp.hovered() {
+                            egui::Color32::from_rgb(62, 66, 76)
+                        } else {
+                            BTN_DARK
+                        };
+                        painter.rect(
+                            btn_rect,
+                            4.0,
+                            btn_fill,
+                            egui::Stroke::NONE,
+                            egui::StrokeKind::Outside,
+                        );
+                        painter.text(
+                            btn_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "Connect",
+                            egui::FontId::proportional(12.0),
+                            TEXT_WHITE,
+                        );
+                        if btn_resp.clicked() {
+                            connect_idx = Some(idx);
+                        }
+
+                        // Delete X in top-right corner
+                        let x_rect = egui::Rect::from_min_size(
+                            egui::pos2(card_rect.right() - 22.0, card_rect.top() + 4.0),
+                            egui::vec2(18.0, 18.0),
+                        );
+                        let x_resp =
+                            ui.allocate_rect(x_rect, egui::Sense::click());
+                        if hover {
+                            let x_color = if x_resp.hovered() {
+                                egui::Color32::from_rgb(220, 100, 100)
+                            } else {
+                                egui::Color32::from_rgb(140, 90, 90)
+                            };
+                            painter.text(
+                                x_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "x",
+                                egui::FontId::proportional(12.0),
+                                x_color,
+                            );
+                        }
+                        if x_resp.clicked() {
+                            delete_idx = Some(idx);
+                        }
+
+                        ui.add_space(12.0);
+                    }
+                });
                 ui.add_space(12.0);
+            }
+        }
 
-                let audio_changed = render_setting_row(
-                    ui,
-                    "Audio",
-                    "Start stereo playback when the stream format matches the current client pipeline.",
-                    self.audio_enabled,
+        if let Some(idx) = connect_idx {
+            self.server_addr = self.server_list[idx].address.clone();
+            self.video_texture.clear_frame();
+            self.connect(ctx.clone());
+        }
+        if let Some(idx) = delete_idx {
+            self.server_list.remove(idx);
+            save_server_list(&self.server_list);
+        }
+    }
+
+    fn render_settings_tab(&mut self, ui: &mut egui::Ui) {
+        const TEXT_WHITE: egui::Color32 = egui::Color32::from_rgb(230, 233, 240);
+        const TEXT_GRAY: egui::Color32 = egui::Color32::from_rgb(138, 142, 150);
+        const BG_ROW: egui::Color32 = egui::Color32::from_rgb(34, 38, 48);
+
+        ui.label(
+            egui::RichText::new("Settings")
+                .size(32.0)
+                .color(TEXT_WHITE),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Session defaults for the next connection.")
+                .size(13.0)
+                .color(TEXT_GRAY),
+        );
+        ui.add_space(24.0);
+
+        // Audio toggle
+        let audio_clicked = render_parsec_toggle(ui, "Audio", "Start stereo playback on connect.", self.audio_enabled, BG_ROW);
+        if audio_clicked {
+            self.audio_enabled = !self.audio_enabled;
+            save_audio_enabled(self.audio_enabled);
+            self.audio_enabled_flag.store(self.audio_enabled, Ordering::SeqCst);
+        }
+        ui.add_space(8.0);
+
+        // Debug overlay toggle
+        let debug_clicked = render_parsec_toggle(ui, "Debug Overlay", "Show transport, decoder, and latency telemetry.", self.debug_enabled, BG_ROW);
+        if debug_clicked {
+            self.debug_enabled = !self.debug_enabled;
+            save_debug_enabled(self.debug_enabled);
+            self.debug_enabled_flag.store(self.debug_enabled, Ordering::SeqCst);
+        }
+    }
+
+    fn render_update_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        const TEXT_WHITE: egui::Color32 = egui::Color32::from_rgb(230, 233, 240);
+        const TEXT_GRAY: egui::Color32 = egui::Color32::from_rgb(138, 142, 150);
+
+        ui.label(
+            egui::RichText::new("Update")
+                .size(32.0)
+                .color(TEXT_WHITE),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Check for new client releases and update in place.")
+                .size(13.0)
+                .color(TEXT_GRAY),
+        );
+        ui.add_space(24.0);
+        self.render_update_panel(ui, ctx, false);
+    }
+
+    fn render_about_tab(&self, ui: &mut egui::Ui) {
+        const TEXT_WHITE: egui::Color32 = egui::Color32::from_rgb(230, 233, 240);
+        const TEXT_GRAY: egui::Color32 = egui::Color32::from_rgb(138, 142, 150);
+        const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(90, 95, 108);
+
+        ui.label(
+            egui::RichText::new("About")
+                .size(32.0)
+                .color(TEXT_WHITE),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Client capabilities and platform information.")
+                .size(13.0)
+                .color(TEXT_GRAY),
+        );
+        ui.add_space(24.0);
+
+        let caps = self.native_surfaces.snapshot();
+        let codec_support = self.video_codec_support;
+
+        let rows: &[(&str, String)] = &[
+            ("Version", format!("v{}", updater::current_version())),
+            ("Platform", about_platform_label().to_string()),
+            ("Display", about_format_refresh(self.display_refresh_millihz)),
+            ("Present", about_native_surface(caps).to_string()),
+            ("Codecs", about_codec_summary(codec_support)),
+            ("Audio", "opus stereo / 48 kHz".to_string()),
+        ];
+
+        for (label, value) in rows {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(*label)
+                        .size(13.0)
+                        .color(TEXT_DIM),
                 );
-                if audio_changed {
-                    self.audio_enabled = !self.audio_enabled;
-                    save_audio_enabled(self.audio_enabled);
-                    self.audio_enabled_flag
-                        .store(self.audio_enabled, Ordering::SeqCst);
-                }
-                ui.add_space(8.0);
-                let debug_changed = render_setting_row(
-                    ui,
-                    "Debug Overlay",
-                    "Expose transport, decoder, bitrate, FPS, and latency telemetry while connected.",
-                    self.debug_enabled,
-                );
-                if debug_changed {
-                    self.debug_enabled = !self.debug_enabled;
-                    save_debug_enabled(self.debug_enabled);
-                    self.debug_enabled_flag
-                        .store(self.debug_enabled, Ordering::SeqCst);
-                }
-
-                ui.add_space(14.0);
-                ui.separator();
-                ui.add_space(12.0);
-                self.render_update_panel(ui, ctx, false);
-
-                ui.add_space(14.0);
-                ui.separator();
                 ui.add_space(12.0);
                 ui.label(
-                    egui::RichText::new("Capabilities")
-                        .strong()
-                        .color(egui::Color32::from_rgb(224, 230, 236)),
+                    egui::RichText::new(value.as_str())
+                        .size(13.0)
+                        .monospace()
+                        .color(TEXT_WHITE),
                 );
-                ui.add_space(8.0);
-                let codec_support = codec_support_report_summary(self.video_codec_support);
-                if ui.available_width() < 360.0 {
-                    render_capability_item(ui, "Platform", platform_label());
-                    render_capability_item(
-                        ui,
-                        "Display",
-                        &format_refresh(self.display_refresh_millihz),
-                    );
-                    render_capability_item(ui, "Renderer", "Glow");
-                    render_capability_item(ui, "Best Present", native_surface_summary(caps));
-                    render_capability_item(ui, "Codecs", &codec_support);
-                    render_capability_item(ui, "Audio", "opus stereo / 48 kHz");
-                } else {
-                    egui::Grid::new("client_capabilities_grid")
-                        .num_columns(2)
-                        .spacing([14.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label(capability_key("Platform"));
-                            ui.label(egui::RichText::new(platform_label()).monospace());
-                            ui.end_row();
-
-                            ui.label(capability_key("Display"));
-                            ui.label(
-                                egui::RichText::new(format_refresh(self.display_refresh_millihz))
-                                    .monospace(),
-                            );
-                            ui.end_row();
-
-                            ui.label(capability_key("Renderer"));
-                            ui.label(egui::RichText::new("Glow").monospace());
-                            ui.end_row();
-
-                            ui.label(capability_key("Best Present"));
-                            ui.label(
-                                egui::RichText::new(native_surface_summary(caps)).monospace(),
-                            );
-                            ui.end_row();
-
-                            ui.label(capability_key("Codecs"));
-                            ui.label(egui::RichText::new(codec_support.as_str()).monospace());
-                            ui.end_row();
-
-                            ui.label(capability_key("Audio"));
-                            ui.label(egui::RichText::new("opus stereo / 48 kHz").monospace());
-                            ui.end_row();
-                        });
-                }
             });
+            ui.add_space(6.0);
+        }
     }
 
     fn render_update_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, compact: bool) {
@@ -3046,25 +3311,6 @@ fn codec_support_summary(support: VideoCodecSupport) -> String {
     }
 }
 
-fn codec_support_report_summary(report: decode::VideoCodecSupportReport) -> String {
-    let mut entries = Vec::new();
-    for codec in [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1] {
-        if report.supported.supports(codec) {
-            let suffix = if report.hardware.supports(codec) {
-                "hw"
-            } else {
-                "sw"
-            };
-            entries.push(format!("{}({suffix})", codec_name(codec)));
-        }
-    }
-    if entries.is_empty() {
-        "-".to_string()
-    } else {
-        entries.join(" / ")
-    }
-}
-
 fn format_pos(pos: egui::Pos2) -> String {
     format!("({:.1}, {:.1})", pos.x, pos.y)
 }
@@ -3323,121 +3569,152 @@ fn egui_key_to_remote_key(key: egui::Key) -> Option<KeyboardKey> {
     })
 }
 
-fn render_setting_row(ui: &mut egui::Ui, title: &str, description: &str, enabled: bool) -> bool {
-    let mut clicked = false;
-    if ui.available_width() < 360.0 {
-        ui.vertical(|ui| {
-            ui.label(
-                egui::RichText::new(title)
-                    .strong()
-                    .color(egui::Color32::from_rgb(235, 239, 244)),
-            );
-            ui.label(
-                egui::RichText::new(description)
-                    .size(12.0)
-                    .color(egui::Color32::from_rgb(134, 147, 160)),
-            );
-            ui.add_space(6.0);
-            if render_setting_toggle(ui, enabled) {
-                clicked = true;
-            }
-        });
+/// Draw a simple monitor icon with signal waves. `center_top` is the top-center of the icon area.
+fn paint_monitor_icon(painter: &egui::Painter, center_top: egui::Pos2, connected: bool) {
+    let cx = center_top.x;
+    let top = center_top.y;
+
+    // Monitor body (rounded rect)
+    let mon_w = 56.0;
+    let mon_h = 40.0;
+    let mon_rect = egui::Rect::from_min_size(
+        egui::pos2(cx - mon_w / 2.0, top + 14.0),
+        egui::vec2(mon_w, mon_h),
+    );
+    painter.rect(
+        mon_rect,
+        4.0,
+        egui::Color32::from_rgb(60, 64, 74),
+        egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 94, 104)),
+        egui::StrokeKind::Outside,
+    );
+
+    // Screen inner area
+    let screen = mon_rect.shrink(4.0);
+    let screen_color = if connected {
+        egui::Color32::from_rgb(40, 50, 70)
     } else {
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new(title)
-                        .strong()
-                        .color(egui::Color32::from_rgb(235, 239, 244)),
-                );
-                ui.label(
-                    egui::RichText::new(description)
-                        .size(12.0)
-                        .color(egui::Color32::from_rgb(134, 147, 160)),
-                );
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if render_setting_toggle(ui, enabled) {
-                    clicked = true;
-                }
+        egui::Color32::from_rgb(30, 33, 40)
+    };
+    painter.rect_filled(screen, 2.0, screen_color);
+
+    // Stand
+    let stand_w = 16.0;
+    let stand_h = 6.0;
+    painter.rect_filled(
+        egui::Rect::from_min_size(
+            egui::pos2(cx - stand_w / 2.0, mon_rect.bottom()),
+            egui::vec2(stand_w, stand_h),
+        ),
+        0.0,
+        egui::Color32::from_rgb(70, 74, 84),
+    );
+    // Base
+    let base_w = 28.0;
+    painter.rect_filled(
+        egui::Rect::from_min_size(
+            egui::pos2(cx - base_w / 2.0, mon_rect.bottom() + stand_h),
+            egui::vec2(base_w, 3.0),
+        ),
+        1.0,
+        egui::Color32::from_rgb(70, 74, 84),
+    );
+
+    // Signal waves above monitor (if connected)
+    if connected {
+        let wave_color = egui::Color32::from_rgb(120, 200, 255);
+        let wave_cx = cx;
+        let wave_top = top;
+        for i in 0..3 {
+            let r = 6.0 + i as f32 * 5.0;
+            let stroke = egui::Stroke::new(1.2, wave_color.gamma_multiply(1.0 - i as f32 * 0.25));
+            // Draw arc segments (approximated with small line segments)
+            let segments = 8;
+            let start_angle = -std::f32::consts::FRAC_PI_4;
+            let end_angle = std::f32::consts::FRAC_PI_4;
+            let mut points = Vec::with_capacity(segments + 1);
+            for s in 0..=segments {
+                let t = s as f32 / segments as f32;
+                let angle = start_angle + t * (end_angle - start_angle) - std::f32::consts::FRAC_PI_2;
+                points.push(egui::pos2(
+                    wave_cx + r * angle.cos(),
+                    wave_top + 8.0 + r * angle.sin(),
+                ));
+            }
+            painter.add(egui::Shape::line(points, stroke));
+        }
+    }
+}
+
+fn truncate_str(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len {
+        s
+    } else {
+        let end = s
+            .char_indices()
+            .nth(max_len.saturating_sub(1))
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        &s[..end]
+    }
+}
+
+fn render_parsec_toggle(
+    ui: &mut egui::Ui,
+    title: &str,
+    description: &str,
+    enabled: bool,
+    bg: egui::Color32,
+) -> bool {
+    let mut clicked = false;
+    egui::Frame::NONE
+        .fill(bg)
+        .corner_radius(6)
+        .inner_margin(egui::Margin::same(14))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(title)
+                            .size(14.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(230, 233, 240)),
+                    );
+                    ui.label(
+                        egui::RichText::new(description)
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(138, 142, 150)),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (label, fill) = if enabled {
+                        ("ON", egui::Color32::from_rgb(38, 146, 108))
+                    } else {
+                        ("OFF", egui::Color32::from_rgb(60, 64, 74))
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(label)
+                                    .size(12.0)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(230, 233, 240)),
+                            )
+                            .fill(fill)
+                            .corner_radius(4)
+                            .min_size(egui::vec2(54.0, 28.0)),
+                        )
+                        .clicked()
+                    {
+                        clicked = true;
+                    }
+                });
             });
         });
-    }
     clicked
 }
 
-fn render_setting_toggle(ui: &mut egui::Ui, enabled: bool) -> bool {
-    let (label, fill) = if enabled {
-        (
-            "Enabled",
-            egui::Color32::from_rgba_unmultiplied(38, 146, 108, 220),
-        )
-    } else {
-        (
-            "Disabled",
-            egui::Color32::from_rgba_unmultiplied(69, 81, 94, 220),
-        )
-    };
-    ui.add_sized(
-        [94.0, 28.0],
-        egui::Button::new(
-            egui::RichText::new(label)
-                .strong()
-                .color(egui::Color32::from_rgb(243, 247, 250)),
-        )
-        .fill(fill),
-    )
-    .clicked()
-}
-
-fn render_capability_item(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.label(capability_key(label));
-    ui.label(
-        egui::RichText::new(value)
-            .monospace()
-            .color(egui::Color32::from_rgb(228, 234, 240)),
-    );
-    ui.add_space(6.0);
-}
-
-fn capability_key(label: &str) -> egui::RichText {
-    egui::RichText::new(label).color(egui::Color32::from_rgb(150, 163, 176))
-}
-
-fn render_client_summary_panel(
-    ui: &mut egui::Ui,
-    caps: NativeSurfaceCapabilities,
-    display_refresh_millihz: Option<u32>,
-) {
-    egui::Frame::popup(ui.style())
-        .fill(egui::Color32::from_rgba_unmultiplied(11, 15, 20, 220))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new("Client")
-                    .strong()
-                    .color(egui::Color32::from_rgb(226, 232, 240)),
-            );
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new(format!("version: v{}", updater::current_version()))
-                    .monospace(),
-            );
-            ui.label(egui::RichText::new(format!("platform: {}", platform_label())).monospace());
-            ui.label(
-                egui::RichText::new(format!(
-                    "display: {}",
-                    format_refresh(display_refresh_millihz)
-                ))
-                .monospace(),
-            );
-            ui.label(
-                egui::RichText::new(format!("present: {}", native_surface_summary(caps)))
-                    .monospace(),
-            );
-        });
-}
-
-fn platform_label() -> &'static str {
+fn about_platform_label() -> &'static str {
     if cfg!(target_os = "linux") {
         "Linux"
     } else if cfg!(target_os = "macos") {
@@ -3449,7 +3726,14 @@ fn platform_label() -> &'static str {
     }
 }
 
-fn native_surface_summary(caps: NativeSurfaceCapabilities) -> &'static str {
+fn about_format_refresh(refresh_millihz: Option<u32>) -> String {
+    match refresh_millihz {
+        Some(mhz) => format!("{:.1} Hz", mhz as f64 / 1000.0),
+        None => "not detected".to_string(),
+    }
+}
+
+fn about_native_surface(caps: video_frame::NativeSurfaceCapabilities) -> &'static str {
     if caps.linux_dmabuf {
         "dmabuf / egl"
     } else if caps.macos_videotoolbox {
@@ -3458,6 +3742,30 @@ fn native_surface_summary(caps: NativeSurfaceCapabilities) -> &'static str {
         "d3d11 interop"
     } else {
         "cpu upload fallback"
+    }
+}
+
+fn about_codec_summary(report: decode::VideoCodecSupportReport) -> String {
+    use st_protocol::VideoCodec;
+    let mut entries = Vec::new();
+    for (codec, name) in [
+        (VideoCodec::H264, "h264"),
+        (VideoCodec::Hevc, "hevc"),
+        (VideoCodec::Av1, "av1"),
+    ] {
+        if report.supported.supports(codec) {
+            let suffix = if report.hardware.supports(codec) {
+                "hw"
+            } else {
+                "sw"
+            };
+            entries.push(format!("{name}({suffix})"));
+        }
+    }
+    if entries.is_empty() {
+        "-".to_string()
+    } else {
+        entries.join(" / ")
     }
 }
 
@@ -3713,12 +4021,39 @@ impl eframe::App for StreamApp {
                 self.render_home_screen(ui, ctx);
             }
             ConnectionState::Connecting => {
+                let rect = ui.max_rect();
+                ui.painter()
+                    .rect_filled(rect, 0.0, egui::Color32::from_rgb(26, 30, 38));
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() / 3.0);
                     ui.spinner();
-                    ui.label("Connecting...");
-                    ui.add_space(10.0);
-                    if ui.button("Cancel").clicked() {
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new("Connecting...")
+                            .size(16.0)
+                            .color(egui::Color32::from_rgb(230, 233, 240)),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(&self.server_addr)
+                            .size(12.0)
+                            .monospace()
+                            .color(egui::Color32::from_rgb(138, 142, 150)),
+                    );
+                    ui.add_space(20.0);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Cancel")
+                                    .size(13.0)
+                                    .color(egui::Color32::from_rgb(230, 233, 240)),
+                            )
+                            .fill(egui::Color32::from_rgb(52, 56, 66))
+                            .corner_radius(4)
+                            .min_size(egui::vec2(100.0, 34.0)),
+                        )
+                        .clicked()
+                    {
                         self.disconnect();
                     }
                 });
@@ -3756,16 +4091,47 @@ impl eframe::App for StreamApp {
                     ui.vertical_centered(|ui| {
                         ui.add_space(ui.available_height() / 3.0);
                         ui.spinner();
-                        ui.label("Waiting for video...");
+                        ui.add_space(12.0);
+                        ui.label(
+                            egui::RichText::new("Waiting for video...")
+                                .size(14.0)
+                                .color(egui::Color32::from_rgb(138, 142, 150)),
+                        );
                     });
                 }
             }
             ConnectionState::Error(msg) => {
+                let rect = ui.max_rect();
+                ui.painter()
+                    .rect_filled(rect, 0.0, egui::Color32::from_rgb(26, 30, 38));
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() / 3.0);
-                    ui.colored_label(egui::Color32::RED, msg);
-                    ui.add_space(10.0);
-                    if ui.button("Retry").clicked() {
+                    ui.label(
+                        egui::RichText::new("Connection Failed")
+                            .size(20.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(230, 233, 240)),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(msg)
+                            .size(13.0)
+                            .color(egui::Color32::from_rgb(220, 100, 100)),
+                    );
+                    ui.add_space(20.0);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Back")
+                                    .size(13.0)
+                                    .color(egui::Color32::from_rgb(230, 233, 240)),
+                            )
+                            .fill(egui::Color32::from_rgb(52, 56, 66))
+                            .corner_radius(4)
+                            .min_size(egui::vec2(100.0, 34.0)),
+                        )
+                        .clicked()
+                    {
                         self.video_texture.clear_frame();
                         *self.state.lock().unwrap() = ConnectionState::Disconnected;
                     }
