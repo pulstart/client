@@ -3512,7 +3512,7 @@ fn render_debug_overlay(
         format!("server: {}", snapshot.server_addr),
         format!("stream: {stream_line}"),
         format!(
-            "display: {}  audio={}  decoder={}  encoder={}  capture={}  input={}",
+            "display: {}  audio={}  decoder={}  encoder={}  capture={}  input={}  quality={}",
             format_refresh(snapshot.display_refresh_millihz),
             if audio_enabled { "on" } else { "off" },
             if snapshot.decoder_name.is_empty() {
@@ -3534,6 +3534,11 @@ fn render_debug_overlay(
                 "-"
             } else {
                 snapshot.input_backend.as_str()
+            },
+            if snapshot.quality_preset.is_empty() {
+                "-"
+            } else {
+                snapshot.quality_preset.as_str()
             }
         ),
         format!(

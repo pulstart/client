@@ -12,6 +12,7 @@ pub struct ConnectionDebugSnapshot {
     pub encoder_name: String,
     pub capture_backend: String,
     pub input_backend: String,
+    pub quality_preset: String,
     pub target_bitrate_kbps: Option<u32>,
     pub received_total_kbps: f32,
     pub received_video_kbps: f32,
@@ -125,6 +126,7 @@ impl ConnectionDebugState {
         inner.snapshot.encoder_name = info.encoder_name;
         inner.snapshot.capture_backend = info.capture_backend;
         inner.snapshot.input_backend = info.input_backend;
+        inner.snapshot.quality_preset = info.quality_preset;
         inner.snapshot.target_bitrate_kbps = Some(info.target_bitrate_kbps);
     }
 
