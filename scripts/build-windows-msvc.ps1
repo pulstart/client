@@ -49,8 +49,6 @@ $profile = if ($Configuration -eq "release") { "release" } else { "debug" }
 Push-Location $clientRoot
 try {
     $env:VCPKG_ROOT = $VcpkgRoot
-    $env:VCPKGRS_DYNAMIC = "1"
-    $env:VCPKGRS_TRIPLET = $Triplet
     $env:VCPKG_DEFAULT_TRIPLET = $Triplet
     if ($Configuration -eq "release") {
         $env:VCPKG_BUILD_TYPE = "release"
@@ -62,12 +60,19 @@ try {
         # Pre-built FFmpeg provided — only install opus via vcpkg (classic mode
         # to bypass the manifest which also lists ffmpeg).
         Write-Host "Using pre-built FFmpeg from $FfmpegDir"
+        # Don't set VCPKGRS_DYNAMIC — we don't want ffmpeg-sys-next to look for
+        # FFmpeg via vcpkg. It will find it via FFMPEG_DIR instead.
+        Remove-Item Env:VCPKGRS_DYNAMIC -ErrorAction SilentlyContinue
+        Remove-Item Env:VCPKGRS_TRIPLET -ErrorAction SilentlyContinue
         & $vcpkgExe install "opus:$Triplet" --x-install-root=$installRoot --classic
         if ($LASTEXITCODE -ne 0) {
             throw "vcpkg install opus failed."
         }
         $env:FFMPEG_DIR = $FfmpegDir
     } else {
+        # Full vcpkg install — set VCPKGRS vars so ffmpeg-sys-next uses vcpkg.
+        $env:VCPKGRS_DYNAMIC = "1"
+        $env:VCPKGRS_TRIPLET = $Triplet
         # Full vcpkg install (FFmpeg + opus from manifest). Slow path.
         Write-Host "Building FFmpeg via vcpkg (no pre-built FFmpeg provided)"
         & $vcpkgExe install --triplet $Triplet --x-manifest-root=$clientRoot --x-install-root=$installRoot

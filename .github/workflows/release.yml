@@ -70,6 +70,7 @@ jobs:
         with:
           workspaces: |
             . -> target
+          prefix-key: v2
 
       - name: Stamp Cargo.toml version
         shell: bash
