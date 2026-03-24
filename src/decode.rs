@@ -273,10 +273,6 @@ fn probe_steps(codec: VideoCodec) -> Vec<ProbeStep> {
             device_type: AV_HWDEVICE_TYPE_QSV,
         },
         ProbeStep::HwDevice {
-            label: "amf",
-            device_type: AV_HWDEVICE_TYPE_AMF,
-        },
-        ProbeStep::HwDevice {
             label: "cuda",
             device_type: AV_HWDEVICE_TYPE_CUDA,
         },
