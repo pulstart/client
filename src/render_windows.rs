@@ -117,8 +117,6 @@ impl WindowsD3d11Importer {
             state.processor.as_ptr(),
             state.output_view.as_ptr(),
             input_view.as_ptr(),
-            frame.width,
-            frame.height,
         );
 
         let unlock_ok =
@@ -250,6 +248,33 @@ impl InteropState {
             shared_texture.as_ptr(),
             processor_enum.as_ptr(),
         )?;
+
+        // Set explicit source and output rects so the video processor only
+        // reads the actual content area.  Without these, decoder textures
+        // that are larger than the coded frame (GPU alignment padding) can
+        // produce a green line at the bottom.
+        let content_rect = WinRect {
+            left: 0,
+            top: 0,
+            right: frame.width as i32,
+            bottom: frame.height as i32,
+        };
+        let video_context_ptr = video_context.as_ptr() as *mut ID3D11VideoContext;
+        unsafe {
+            ((*(*video_context_ptr).vtable).video_processor_set_stream_source_rect)(
+                video_context_ptr,
+                processor.as_ptr(),
+                0,
+                1,
+                &content_rect,
+            );
+            ((*(*video_context_ptr).vtable).video_processor_set_output_target_rect)(
+                video_context_ptr,
+                processor.as_ptr(),
+                1,
+                &content_rect,
+            );
+        }
 
         let registered_object = unsafe {
             (interop.register_object)(
@@ -641,31 +666,8 @@ fn video_processor_blt(
     processor: *mut c_void,
     output_view: *mut c_void,
     input_view: *mut c_void,
-    width: u32,
-    height: u32,
 ) -> Result<(), String> {
     let video_context = video_context as *mut ID3D11VideoContext;
-    let rect = WinRect {
-        left: 0,
-        top: 0,
-        right: width as i32,
-        bottom: height as i32,
-    };
-    unsafe {
-        ((*(*video_context).vtable).video_processor_set_stream_source_rect)(
-            video_context,
-            processor,
-            0,
-            1,
-            &rect,
-        );
-        ((*(*video_context).vtable).video_processor_set_output_target_rect)(
-            video_context,
-            processor,
-            1,
-            &rect,
-        );
-    }
     let stream = D3d11VideoProcessorStream {
         enable: 1,
         output_index: 0,

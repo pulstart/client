@@ -847,15 +847,24 @@ impl StreamApp {
                 (true, egui::CursorGrab::None)
             };
 
+        // Hide the cursor before changing the grab mode so that
+        // CursorGrab::Locked (which centres the OS cursor on Windows) does
+        // not flash the pointer at the centre of the window.  When making
+        // the cursor visible again, do it after the grab change so the
+        // cursor appears at the released position, not the locked one.
+        if !cursor_visible && self.applied_cursor_visible != Some(false) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+            self.applied_cursor_visible = Some(false);
+        }
         if self.applied_cursor_grab != Some(cursor_grab) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(cursor_grab));
             self.suppress_mouse_delta = true;
             self.suppress_pointer_pos_frames = 2;
             self.applied_cursor_grab = Some(cursor_grab);
         }
-        if self.applied_cursor_visible != Some(cursor_visible) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(cursor_visible));
-            self.applied_cursor_visible = Some(cursor_visible);
+        if cursor_visible && self.applied_cursor_visible != Some(true) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+            self.applied_cursor_visible = Some(true);
         }
     }
 
