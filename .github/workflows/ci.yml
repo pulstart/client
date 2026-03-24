@@ -13,6 +13,10 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  FFMPEG_VERSION: "7.1"
+  FFMPEG_BUILD_TAG: "latest"
+
 jobs:
   build:
     name: ${{ matrix.name }}
@@ -83,6 +87,33 @@ jobs:
           brew install ffmpeg opus pkg-config
           echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg)/lib/pkgconfig:$(brew --prefix opus)/lib/pkgconfig:${PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
 
+      # --- Windows: pre-built FFmpeg + vcpkg for opus only ---
+
+      - name: Cache pre-built FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-prebuilt
+          key: ${{ runner.os }}-ffmpeg-${{ env.FFMPEG_VERSION }}-${{ env.FFMPEG_BUILD_TAG }}
+
+      - name: Download pre-built FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ffmpegZip = "ffmpeg-n${{ env.FFMPEG_VERSION }}-${{ env.FFMPEG_BUILD_TAG }}-win64-lgpl-shared-${{ env.FFMPEG_VERSION }}.zip"
+          $ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/${{ env.FFMPEG_BUILD_TAG }}/$ffmpegZip"
+          $downloadDir = "${{ github.workspace }}\ffmpeg-prebuilt"
+          New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
+          $zipPath = "$downloadDir\$ffmpegZip"
+          if (-not (Test-Path $zipPath)) {
+            Write-Host "Downloading $ffmpegUrl ..."
+            Invoke-WebRequest -Uri $ffmpegUrl -OutFile $zipPath -UseBasicParsing
+          }
+          Expand-Archive -Path $zipPath -DestinationPath $downloadDir -Force
+          $extractedDir = Get-ChildItem -Path $downloadDir -Directory | Where-Object { $_.Name -like "ffmpeg-*" } | Select-Object -First 1
+          echo "FFMPEG_DIR=$($extractedDir.FullName)" >> $env:GITHUB_ENV
+          Write-Host "FFmpeg extracted to $($extractedDir.FullName)"
+
       - name: Checkout vcpkg
         if: runner.os == 'Windows'
         uses: actions/checkout@v4
@@ -96,12 +127,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            vcpkg/downloads
             vcpkg_installed
             ~\AppData\Local\vcpkg\archives
-          key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json') }}
+          key: ${{ runner.os }}-vcpkg-opus-v1
           restore-keys: |
-            ${{ runner.os }}-vcpkg-
+            ${{ runner.os }}-vcpkg-opus-
 
       - name: Build Unix release
         if: matrix.build_kind == 'unix'
@@ -114,7 +144,7 @@ jobs:
       - name: Build Windows release
         if: matrix.build_kind == 'windows'
         shell: pwsh
-        run: .\scripts\build-windows-msvc.ps1 -Configuration release -VcpkgRoot "${{ github.workspace }}\vcpkg" -BootstrapVcpkg
+        run: .\scripts\build-windows-msvc.ps1 -Configuration release -VcpkgRoot "${{ github.workspace }}\vcpkg" -FfmpegDir "${{ env.FFMPEG_DIR }}" -BootstrapVcpkg
 
       - name: Package Windows artifact
         if: matrix.build_kind == 'windows'

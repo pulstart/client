@@ -4,6 +4,7 @@ param(
     [string]$Triplet = "x64-windows",
     [string]$Target = "x86_64-pc-windows-msvc",
     [string]$VcpkgRoot = $env:VCPKG_ROOT,
+    [string]$FfmpegDir = $env:FFMPEG_DIR,
     [switch]$BootstrapVcpkg
 )
 
@@ -57,9 +58,22 @@ try {
         Remove-Item Env:VCPKG_BUILD_TYPE -ErrorAction SilentlyContinue
     }
 
-    & $vcpkgExe install --triplet $Triplet --x-manifest-root=$clientRoot --x-install-root=$installRoot
-    if ($LASTEXITCODE -ne 0) {
-        throw "vcpkg install failed."
+    if ($FfmpegDir -and (Test-Path $FfmpegDir)) {
+        # Pre-built FFmpeg provided — only install opus via vcpkg.
+        Write-Host "Using pre-built FFmpeg from $FfmpegDir"
+        & $vcpkgExe install "opus:$Triplet" --x-install-root=$installRoot
+        if ($LASTEXITCODE -ne 0) {
+            throw "vcpkg install opus failed."
+        }
+        $env:FFMPEG_DIR = $FfmpegDir
+    } else {
+        # Full vcpkg install (FFmpeg + opus from manifest). Slow path.
+        Write-Host "Building FFmpeg via vcpkg (no pre-built FFmpeg provided)"
+        & $vcpkgExe install --triplet $Triplet --x-manifest-root=$clientRoot --x-install-root=$installRoot
+        if ($LASTEXITCODE -ne 0) {
+            throw "vcpkg install failed."
+        }
+        $env:FFMPEG_DIR = $installedRoot
     }
 
     $pkgConfExe = Join-Path $installedRoot "tools\pkgconf\pkgconf.exe"
@@ -76,6 +90,13 @@ try {
     }
     $pkgConfigPaths += Join-Path $installedRoot "lib\pkgconfig"
     $pkgConfigPaths += Join-Path $installedRoot "share\pkgconfig"
+    # Include pre-built FFmpeg pkgconfig if available
+    if ($FfmpegDir -and (Test-Path $FfmpegDir)) {
+        $ffmpegPkgConfig = Join-Path $FfmpegDir "lib\pkgconfig"
+        if (Test-Path $ffmpegPkgConfig) {
+            $pkgConfigPaths += $ffmpegPkgConfig
+        }
+    }
     $existingPkgConfigPaths = $pkgConfigPaths | Where-Object { Test-Path $_ }
     if ($existingPkgConfigPaths.Count -gt 0) {
         $env:PKG_CONFIG_PATH = $existingPkgConfigPaths -join ";"
@@ -83,7 +104,6 @@ try {
         Remove-Item Env:PKG_CONFIG_PATH -ErrorAction SilentlyContinue
     }
 
-    $env:FFMPEG_DIR = $installedRoot
     $env:LIBOPUS_LIB_DIR = $opusRoot
 
     & rustup target add $Target
@@ -107,6 +127,13 @@ try {
     Copy-Item (Join-Path $clientRoot "target\$Target\$profile\st-client.exe") $stageDir -Force
     if (Test-Path $dllDir) {
         Get-ChildItem (Join-Path $dllDir "*.dll") | Copy-Item -Destination $stageDir -Force
+    }
+    # Copy FFmpeg DLLs from pre-built dir if using pre-built
+    if ($FfmpegDir -and (Test-Path $FfmpegDir)) {
+        $ffmpegBinDir = Join-Path $FfmpegDir "bin"
+        if (Test-Path $ffmpegBinDir) {
+            Get-ChildItem (Join-Path $ffmpegBinDir "*.dll") | Copy-Item -Destination $stageDir -Force
+        }
     }
 
     Write-Host "Staged Windows build at $stageDir"
