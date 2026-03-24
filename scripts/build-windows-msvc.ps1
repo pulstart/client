@@ -59,9 +59,10 @@ try {
     }
 
     if ($FfmpegDir -and (Test-Path $FfmpegDir)) {
-        # Pre-built FFmpeg provided — only install opus via vcpkg.
+        # Pre-built FFmpeg provided — only install opus via vcpkg (classic mode
+        # to bypass the manifest which also lists ffmpeg).
         Write-Host "Using pre-built FFmpeg from $FfmpegDir"
-        & $vcpkgExe install "opus:$Triplet" --x-install-root=$installRoot
+        & $vcpkgExe install "opus:$Triplet" --x-install-root=$installRoot --classic
         if ($LASTEXITCODE -ne 0) {
             throw "vcpkg install opus failed."
         }
