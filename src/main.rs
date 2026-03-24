@@ -142,6 +142,7 @@ struct StreamApp {
     applied_cursor_visible: Option<bool>,
     applied_cursor_grab: Option<egui::CursorGrab>,
     suppress_mouse_delta: bool,
+    excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
     update_ui_state: UpdateUiState,
     update_tx: crossbeam_channel::Sender<UpdateWorkerEvent>,
     update_rx: crossbeam_channel::Receiver<UpdateWorkerEvent>,
@@ -334,6 +335,7 @@ impl StreamApp {
             applied_cursor_visible: None,
             applied_cursor_grab: None,
             suppress_mouse_delta: false,
+            excluded_video_codecs: Arc::new(Mutex::new(st_protocol::VideoCodecSupport::empty())),
             update_ui_state,
             update_tx,
             update_rx,
@@ -387,6 +389,7 @@ impl StreamApp {
         let native_surfaces = Arc::clone(&self.native_surfaces);
         let display_refresh_millihz = self.display_refresh_millihz;
         let video_codec_support = self.video_codec_support;
+        let excluded_video_codecs = Arc::clone(&self.excluded_video_codecs);
         let shared_input = Arc::clone(&self.shared_input);
         debug_state.reset_for_connect(&addr, display_refresh_millihz);
 
@@ -395,6 +398,7 @@ impl StreamApp {
                 addr,
                 display_refresh_millihz,
                 video_codec_support,
+                excluded_video_codecs,
                 state,
                 frame_buf,
                 debug_state,
@@ -2174,10 +2178,13 @@ fn stop_media_threads(media_threads: MediaThreads) {
     let _ = media_threads.input_thread.join();
 }
 
+const STARTUP_DECODE_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn run_connection(
     addr: String,
     display_refresh_millihz: Option<u32>,
     video_codec_support: decode::VideoCodecSupportReport,
+    excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
     state: Arc<Mutex<ConnectionState>>,
     frame_buf: Arc<Mutex<VideoFrameBuffer>>,
     debug_state: Arc<ConnectionDebugState>,
@@ -2283,12 +2290,23 @@ fn run_connection(
             codec_support_summary(video_codec_support.hardware)
         );
     }
+    let excluded = *excluded_video_codecs.lock().unwrap();
+    let effective_supported = video_codec_support.supported.subtract(excluded);
+    let effective_hardware = video_codec_support.hardware.subtract(excluded);
+    if !excluded.is_empty() {
+        eprintln!(
+            "[codec] excluding previously failed codecs: {} (effective: supported={} hw={})",
+            codec_support_summary(excluded),
+            codec_support_summary(effective_supported),
+            codec_support_summary(effective_hardware),
+        );
+    }
     let _ = tcp.write_all(
         &ControlMessage::ClientDisplayInfo(ClientDisplayInfo {
             max_refresh_millihz: display_refresh_millihz.unwrap_or(0),
             udp_port: local_udp_port,
-            supported_video_codecs: video_codec_support.supported,
-            hardware_video_codecs: video_codec_support.hardware,
+            supported_video_codecs: effective_supported,
+            hardware_video_codecs: effective_hardware,
         })
         .serialize(),
     );
@@ -2554,6 +2572,8 @@ fn run_connection(
     let mut last_audio_state = initial_audio;
     let mut last_debug_enabled = debug_enabled.load(Ordering::SeqCst);
     let mut next_clock_ping = Instant::now();
+    let mut startup_decode_ok = false;
+    let startup_deadline = Instant::now() + STARTUP_DECODE_TIMEOUT;
     loop {
         if session_cancelled(
             disconnect.as_ref(),
@@ -2581,12 +2601,29 @@ fn run_connection(
             let _ = tcp.write_all(&msg.serialize());
         }
         while let Ok(feedback) = feedback_rx.try_recv() {
+            if !startup_decode_ok && feedback.completed_frames > 0 {
+                startup_decode_ok = true;
+            }
             if tcp
                 .write_all(&ControlMessage::TransportFeedback(feedback).serialize())
                 .is_err()
             {
                 break;
             }
+        }
+        if !startup_decode_ok && Instant::now() >= startup_deadline {
+            let codec = stream_config.codec;
+            eprintln!(
+                "[codec] no frames decoded within {}s — excluding {:?} and reconnecting",
+                STARTUP_DECODE_TIMEOUT.as_secs(),
+                codec,
+            );
+            excluded_video_codecs.lock().unwrap().insert(codec);
+            // Trigger reconnect by disconnecting cleanly
+            *state.lock().unwrap() = ConnectionState::Disconnected;
+            ctx.request_repaint();
+            stop_media_threads(media_threads);
+            return;
         }
         if current_debug_enabled && Instant::now() >= next_clock_ping {
             let ping = ControlMessage::ClockSyncPing(ClockSyncPing {
@@ -3634,6 +3671,15 @@ impl eframe::App for StreamApp {
         ) {
             self.clear_local_session_interaction();
             self.video_texture.clear_frame();
+        }
+        // Auto-reconnect after codec fallback: the connection thread set state to
+        // Disconnected and added the failed codec to the exclusion list.
+        if state == ConnectionState::Disconnected
+            && !self.excluded_video_codecs.lock().unwrap().is_empty()
+            && !self.server_addr.trim().is_empty()
+        {
+            self.connect(ctx.clone());
+            return;
         }
         self.keep_awake
             .set_active(matches!(state, ConnectionState::Connected));
