@@ -1477,6 +1477,7 @@ impl StreamApp {
             || snapshot.controller_state != ControllerState::OwnedByYou
             || !snapshot.capabilities.hover_capture
             || !video_rect.contains(pos)
+            || !snapshot.cursor_state.visible
         {
             return;
         }
