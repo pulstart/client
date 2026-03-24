@@ -126,6 +126,7 @@ struct StreamApp {
     last_sent_absolute_cursor: Option<(u16, u16)>,
     hover_cursor_pos: Option<egui::Pos2>,
     resume_hover_after_relative_drag: bool,
+    hover_cursor_resync_pending: bool,
     remote_cursor_textures: BTreeMap<u64, RemoteCursorTexture>,
     latest_remote_cursor_serial: Option<u64>,
     seen_cursor_shape_version: u64,
@@ -313,6 +314,7 @@ impl StreamApp {
             last_sent_absolute_cursor: None,
             hover_cursor_pos: None,
             resume_hover_after_relative_drag: false,
+            hover_cursor_resync_pending: false,
             remote_cursor_textures: BTreeMap::new(),
             latest_remote_cursor_serial: None,
             seen_cursor_shape_version: 0,
@@ -349,6 +351,7 @@ impl StreamApp {
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
         self.resume_hover_after_relative_drag = false;
+        self.hover_cursor_resync_pending = false;
         self.await_pointer_exit_after_auto_release = false;
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
@@ -417,6 +420,7 @@ impl StreamApp {
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
         self.resume_hover_after_relative_drag = false;
+        self.hover_cursor_resync_pending = false;
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
         self.seen_cursor_shape_version = 0;
@@ -435,6 +439,7 @@ impl StreamApp {
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
         self.resume_hover_after_relative_drag = false;
+        self.hover_cursor_resync_pending = false;
         self.await_pointer_exit_after_auto_release = false;
     }
 
@@ -450,6 +455,7 @@ impl StreamApp {
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
         self.resume_hover_after_relative_drag = false;
+        self.hover_cursor_resync_pending = false;
         self.menu_open = false;
         self.await_pointer_exit_after_auto_release = false;
         self.local_overlay_hit_rects.clear();
@@ -462,6 +468,7 @@ impl StreamApp {
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
         self.resume_hover_after_relative_drag = false;
+        self.hover_cursor_resync_pending = false;
         self.await_pointer_exit_after_auto_release = false;
         self.clear_remote_keyboard();
         if let Some(client_id) = self.shared_input.snapshot().client_id {
@@ -887,7 +894,9 @@ impl StreamApp {
         );
 
         let (top_left, cursor_pos, using_pointer_pos) =
-            if self.capture_mode == LocalCaptureMode::HoverAbsolute {
+            if self.capture_mode == LocalCaptureMode::HoverAbsolute
+                || self.resume_hover_after_relative_drag
+            {
                 let pointer_pos = self
                     .hover_cursor_pos
                     .filter(|pos| video_rect.contains(*pos))?;
@@ -1184,9 +1193,21 @@ impl StreamApp {
                     self.send_absolute_cursor_if_needed(client_id, pos, video_rect);
                 }
             } else {
-                let hover_pos = actual_pointer_pos
-                    .or(pointer_pos)
-                    .filter(|pos| video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos));
+                let hover_pos = if self.hover_cursor_resync_pending {
+                    self.hover_cursor_pos
+                        .filter(|pos| {
+                            video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
+                        })
+                        .or_else(|| {
+                            actual_pointer_pos.or(pointer_pos).filter(|pos| {
+                                video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
+                            })
+                        })
+                } else {
+                    actual_pointer_pos.or(pointer_pos).filter(|pos| {
+                        video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
+                    })
+                };
                 self.hover_cursor_pos = hover_pos;
                 if let (Some(client_id), Some(pos)) = (snapshot.client_id, hover_pos) {
                     self.send_absolute_cursor_if_needed(client_id, pos, video_rect);
@@ -3716,6 +3737,20 @@ impl eframe::App for StreamApp {
                     if !virtual_hover {
                         last_pointer_pos = Some(pos);
                     }
+                    if self.capture_mode == LocalCaptureMode::HoverAbsolute
+                        && self.hover_cursor_resync_pending
+                    {
+                        if let Some(rect) = video_rect {
+                            self.hover_cursor_pos = Some(clamp_pos_to_video_rect(
+                                pos,
+                                rect,
+                                ctx.pixels_per_point(),
+                            ));
+                        } else {
+                            self.hover_cursor_pos = Some(pos);
+                        }
+                        self.hover_cursor_resync_pending = false;
+                    }
                 }
                 egui::Event::MouseMoved(delta) => {
                     if self.capture_mode == LocalCaptureMode::CapturedRelative
@@ -3732,6 +3767,21 @@ impl eframe::App for StreamApp {
                                     buttons: self.pointer_buttons,
                                 },
                             ));
+                            if self.resume_hover_after_relative_drag {
+                                if let Some(rect) = video_rect {
+                                    let base_pos = self
+                                        .hover_cursor_pos
+                                        .or(last_pointer_pos)
+                                        .unwrap_or_else(|| rect.center());
+                                    let next_pos = clamp_pos_to_video_rect(
+                                        egui::pos2(base_pos.x + delta.x, base_pos.y + delta.y),
+                                        rect,
+                                        ctx.pixels_per_point(),
+                                    );
+                                    self.hover_cursor_pos = Some(next_pos);
+                                    last_pointer_pos = Some(next_pos);
+                                }
+                            }
                             ctx.request_repaint();
                         }
                     } else if virtual_hover
@@ -3824,11 +3874,17 @@ impl eframe::App for StreamApp {
                     let mut sent_button_state = false;
                     if enter_relative_drag {
                         if let (Some(route_pos), Some(rect)) = (route_pos, video_rect) {
+                            self.hover_cursor_pos = Some(clamp_pos_to_video_rect(
+                                route_pos,
+                                rect,
+                                ctx.pixels_per_point(),
+                            ));
                             sent_button_state =
                                 self.send_absolute_cursor(client_id, route_pos, rect, true);
                         }
                         self.capture_mode = LocalCaptureMode::CapturedRelative;
                         self.resume_hover_after_relative_drag = true;
+                        self.hover_cursor_resync_pending = false;
                         self.await_pointer_exit_after_auto_release = false;
                         ctx.request_repaint();
                     }
@@ -3860,15 +3916,19 @@ impl eframe::App for StreamApp {
                     if restore_hover_after_drag {
                         self.capture_mode = LocalCaptureMode::HoverAbsolute;
                         self.resume_hover_after_relative_drag = false;
+                        if self.hover_cursor_pos.is_none() {
+                            self.hover_cursor_pos = route_pos.filter(|pos| {
+                                video_rect
+                                    .map(|rect| {
+                                        rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
+                                    })
+                                    .unwrap_or(false)
+                            });
+                        }
+                        self.hover_cursor_resync_pending = self.hover_cursor_pos.is_some();
                         self.last_sent_absolute_cursor = None;
-                        if let Some(route_pos) = route_pos.filter(|pos| {
-                            video_rect
-                                .map(|rect| {
-                                    rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
-                                })
-                                .unwrap_or(false)
-                        }) {
-                            self.hover_cursor_pos = Some(route_pos);
+                        if let Some(pos) = self.hover_cursor_pos {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(pos));
                         }
                         ctx.request_repaint();
                     }
