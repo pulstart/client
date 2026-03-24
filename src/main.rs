@@ -1166,6 +1166,29 @@ impl StreamApp {
             }
         }
 
+        let drag_buttons = MOUSE_BUTTON_PRIMARY | MOUSE_BUTTON_SECONDARY;
+        let hidden_cursor_relative_drag = snapshot.capabilities.separate_cursor
+            && snapshot.capabilities.mouse_relative
+            && !snapshot.cursor_state.visible;
+        if self.capture_mode == LocalCaptureMode::HoverAbsolute
+            && snapshot.controller_state == ControllerState::OwnedByYou
+            && self.pointer_buttons & drag_buttons != 0
+            && hidden_cursor_relative_drag
+        {
+            if let Some(pos) = pointer_pos.filter(|pos| {
+                video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
+            }) {
+                self.hover_cursor_pos =
+                    Some(clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()));
+            } else if self.hover_cursor_pos.is_none() {
+                self.hover_cursor_pos = Some(video_rect.center());
+            }
+            self.capture_mode = LocalCaptureMode::CapturedRelative;
+            self.resume_hover_after_relative_drag = true;
+            self.hover_cursor_resync_pending = false;
+            ctx.request_repaint();
+        }
+
         if previous_capture_mode != self.capture_mode && self.capture_mode == LocalCaptureMode::Idle
         {
             self.clear_remote_keyboard();
@@ -3003,7 +3026,7 @@ fn drag_capture_button_mask(button: egui::PointerButton) -> u8 {
 fn should_enter_relative_button_drag_capture(
     capture_mode: LocalCaptureMode,
     controller_state: ControllerState,
-    mouse_relative: bool,
+    hidden_cursor_relative_drag: bool,
     button: egui::PointerButton,
     pressed: bool,
     over_video: bool,
@@ -3011,7 +3034,7 @@ fn should_enter_relative_button_drag_capture(
 ) -> bool {
     capture_mode == LocalCaptureMode::HoverAbsolute
         && controller_state == ControllerState::OwnedByYou
-        && mouse_relative
+        && hidden_cursor_relative_drag
         && drag_capture_button_mask(button) != 0
         && pressed
         && over_video
@@ -3855,10 +3878,13 @@ impl eframe::App for StreamApp {
                     let over_local_overlay = route_pos
                         .map(|pos| self.pointer_over_local_overlay(pos))
                         .unwrap_or(false);
+                    let hidden_cursor_relative_drag = snapshot.capabilities.separate_cursor
+                        && snapshot.capabilities.mouse_relative
+                        && !snapshot.cursor_state.visible;
                     let enter_relative_drag = should_enter_relative_button_drag_capture(
                         self.capture_mode,
                         snapshot.controller_state,
-                        snapshot.capabilities.mouse_relative,
+                        hidden_cursor_relative_drag,
                         button,
                         pressed,
                         over_video,
@@ -4097,7 +4123,7 @@ mod tests {
     }
 
     #[test]
-    fn hover_primary_or_secondary_press_enters_relative_drag_when_available() {
+    fn hidden_cursor_drag_buttons_enter_relative_drag() {
         assert!(should_enter_relative_button_drag_capture(
             LocalCaptureMode::HoverAbsolute,
             ControllerState::OwnedByYou,
