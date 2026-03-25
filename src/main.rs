@@ -4753,7 +4753,8 @@ fn main() {
         Ok(false) => {}
         Err(err) => {
             eprintln!("[updater] {err}");
-            std::process::exit(1);
+            // Exit cleanly to avoid triggering Windows Error Reporting dialogs.
+            std::process::exit(0);
         }
     }
     updater::cleanup_old_update_files();

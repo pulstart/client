@@ -206,32 +206,13 @@ fn run_apply_update_command(command: &ApplyUpdateCommand) -> Result<(), String> 
     }
     #[cfg(windows)]
     {
-        if let Err(direct_err) =
+        if let Err(err) =
             sync_package_contents(&command.package_root, &command.install_root)
         {
-            let elevated_marker = command.staging_root.join(".st-elevated-update");
-            if elevated_marker.exists() {
-                // Already running elevated — do not retry elevation.
-                return Err(direct_err);
-            }
-            eprintln!("[updater] {direct_err}");
-            eprintln!("[updater] Requesting elevated permissions...");
-            let _ = fs::File::create(&elevated_marker);
-            let helper_executable = packaged_executable_path(&command.package_root)?;
-            let helper_dir = helper_executable
-                .parent()
-                .unwrap_or(&command.package_root);
-            spawn_elevated_helper_windows(
-                &helper_executable,
-                std::process::id(),
-                &command.staging_root,
-                &command.package_root,
-                &command.install_root,
-                &command.relaunch_executable,
-                helper_dir,
-            )?;
-            // Exit so the elevated process can take over after we're gone.
-            std::process::exit(0);
+            // Log but don't abort — the exe and most files are likely updated.
+            // Locked DLLs are already skipped by sync_package_contents.
+            // Elevation (UAC prompt) doesn't help with file locks, so avoid it.
+            eprintln!("[updater] {err} (continuing anyway)");
         }
     }
     if let Some(parent) = command.install_root.parent() {
