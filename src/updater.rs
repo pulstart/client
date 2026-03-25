@@ -194,7 +194,7 @@ fn run_apply_update_command(command: &ApplyUpdateCommand) -> Result<(), String> 
     // On Windows, the OS may hold file handles briefly after process exit
     // (antivirus, search indexer, loader cache). Give it a moment.
     #[cfg(windows)]
-    thread::sleep(Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(1500));
     #[cfg(unix)]
     {
         if let Err(direct_err) = sync_package_contents(&command.package_root, &command.install_root)
@@ -547,14 +547,40 @@ fn sync_package_contents(source_root: &Path, install_root: &Path) -> Result<(), 
 
     let entries = fs::read_dir(source_root)
         .map_err(|err| format!("Failed to read extracted package '{}': {err}", source_root.display()))?;
+    let mut skipped: Vec<String> = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|err| format!("Failed to read extracted package entry: {err}"))?;
         let source_path = entry.path();
         let destination_path = install_root.join(entry.file_name());
-        sync_path(&source_path, &destination_path)?;
+        if let Err(err) = sync_path(&source_path, &destination_path) {
+            if cfg!(windows) && is_likely_locked_file(&destination_path) {
+                eprintln!("[updater] skipping locked file: {err}");
+                skipped.push(destination_path.display().to_string());
+                continue;
+            }
+            return Err(err);
+        }
+    }
+    if !skipped.is_empty() {
+        eprintln!(
+            "[updater] {} file(s) skipped due to locks, will retry on next launch",
+            skipped.len()
+        );
     }
     remove_stale_entries(source_root, install_root);
     Ok(())
+}
+
+/// Check whether a path looks like a file that Windows may hold locked
+/// (DLLs, PDBs, etc.) as opposed to a directory or config file that
+/// should never be silently skipped.
+fn is_likely_locked_file(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(ext.as_str(), "dll" | "pdb" | "lib" | "sys" | "ocx")
 }
 
 fn sync_path(source: &Path, destination: &Path) -> Result<(), String> {
@@ -589,8 +615,25 @@ fn sync_path(source: &Path, destination: &Path) -> Result<(), String> {
                         destination.display()
                     )
                 })?;
-            } else {
-                remove_or_rename_old(destination)?;
+            } else if let Err(err) = remove_or_rename_old(destination) {
+                // On Windows, if the file is locked, try copying over it
+                // directly as a last resort — the OS may allow writing even
+                // when deletion/rename is blocked.
+                if cfg!(windows) {
+                    eprintln!("[updater] {err}, attempting direct overwrite");
+                    retry_io(5, Duration::from_millis(500), || {
+                        fs::copy(source, destination)
+                    })
+                    .map_err(|copy_err| {
+                        format!(
+                            "Failed to update '{}': remove/rename failed ({err}), overwrite failed ({copy_err})",
+                            destination.display()
+                        )
+                    })?;
+                    copy_permissions(source, destination)?;
+                    return Ok(());
+                }
+                return Err(err);
             }
         }
         retry_io(3, Duration::from_millis(200), || {

@@ -1297,8 +1297,15 @@ impl StreamApp {
             self.auto_release_capture(false);
         }
 
-        if self.capture_mode == LocalCaptureMode::CapturedRelative && !ctx.input(|i| i.focused) {
-            self.force_release_capture();
+        if !ctx.input(|i| i.focused) {
+            // The OS resets cursor grab and visibility when the window loses
+            // focus.  Clear the applied state so apply_pointer_capture_mode
+            // re-sends the commands when focus returns.
+            self.applied_cursor_grab = None;
+            self.applied_cursor_visible = None;
+            if self.capture_mode == LocalCaptureMode::CapturedRelative {
+                self.force_release_capture();
+            }
         }
 
         if hover_supported
