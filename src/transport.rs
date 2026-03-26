@@ -1,7 +1,9 @@
 use st_protocol::packet::{PacketHeader, PayloadType, HEADER_SIZE};
+use st_protocol::tunnel::{CryptoContext, CRYPTO_OVERHEAD};
 use st_protocol::{CompletedFrame, FrameAssembler, TransportFeedback};
 use std::io::ErrorKind;
 use std::net::UdpSocket;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const FEEDBACK_INTERVAL: Duration = Duration::from_millis(500);
@@ -25,8 +27,10 @@ pub struct UdpReceiver {
     socket: UdpSocket,
     assembler: FrameAssembler,
     buf: Vec<u8>,
+    decrypt_buf: Vec<u8>,
     feedback: FeedbackWindow,
     trace_packets_logged: usize,
+    crypto: Option<Arc<CryptoContext>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -60,16 +64,18 @@ impl TransportWindowStats {
 }
 
 impl UdpReceiver {
-    pub fn from_socket(socket: UdpSocket) -> Result<Self, String> {
+    pub fn from_socket(socket: UdpSocket, crypto: Option<Arc<CryptoContext>>) -> Result<Self, String> {
         socket
             .set_nonblocking(true)
             .map_err(|e| format!("set_nonblocking: {e}"))?;
         Ok(Self {
             socket,
             assembler: FrameAssembler::new(),
-            buf: vec![0u8; 1500],
+            buf: vec![0u8; 1500 + CRYPTO_OVERHEAD],
+            decrypt_buf: Vec::with_capacity(1500),
             feedback: FeedbackWindow::default(),
             trace_packets_logged: 0,
+            crypto,
         })
     }
 
@@ -79,14 +85,26 @@ impl UdpReceiver {
         loop {
             match self.socket.recv_from(&mut self.buf) {
                 Ok((n, addr)) => {
-                    let raw = &self.buf[..n];
+                    // Decrypt if crypto is active.
+                    let raw: &[u8] = if let Some(ref crypto) = self.crypto {
+                        match crypto.decrypt(&self.buf[..n]) {
+                            Some(pt) => {
+                                self.decrypt_buf = pt;
+                                &self.decrypt_buf
+                            }
+                            None => continue, // auth failure — skip packet
+                        }
+                    } else {
+                        &self.buf[..n]
+                    };
+                    let raw_len = raw.len();
 
                     // Demux by payload type
                     if let Some(header) = PacketHeader::deserialize(raw) {
                         if std::env::var_os("ST_TRACE").is_some() && self.trace_packets_logged < 24
                         {
                             eprintln!(
-                                "[trace][client] udp packet #{} from {addr}: type={:?} frame_id={} seq={} bytes={n}",
+                                "[trace][client] udp packet #{} from {addr}: type={:?} frame_id={} seq={} bytes={raw_len}",
                                 self.trace_packets_logged,
                                 header.payload_type,
                                 header.frame_id,
@@ -95,11 +113,11 @@ impl UdpReceiver {
                             self.trace_packets_logged += 1;
                         }
                         if header.payload_type == PayloadType::Audio {
-                            if n > HEADER_SIZE {
+                            if raw_len > HEADER_SIZE {
                                 self.feedback.received_bytes =
-                                    self.feedback.received_bytes.saturating_add(n as u64);
+                                    self.feedback.received_bytes.saturating_add(raw_len as u64);
                                 self.feedback.received_audio_bytes =
-                                    self.feedback.received_audio_bytes.saturating_add(n as u64);
+                                    self.feedback.received_audio_bytes.saturating_add(raw_len as u64);
                                 return Some(ReceivedData::Audio(AudioPacket {
                                     seq: header.seq,
                                     data: raw[HEADER_SIZE..].to_vec(),
@@ -113,9 +131,9 @@ impl UdpReceiver {
                     self.feedback.received_packets =
                         self.feedback.received_packets.saturating_add(1);
                     self.feedback.received_bytes =
-                        self.feedback.received_bytes.saturating_add(n as u64);
+                        self.feedback.received_bytes.saturating_add(raw_len as u64);
                     self.feedback.received_video_bytes =
-                        self.feedback.received_video_bytes.saturating_add(n as u64);
+                        self.feedback.received_video_bytes.saturating_add(raw_len as u64);
                     let outcome = self.assembler.ingest_with_feedback(raw);
                     self.feedback.lost_packets = self
                         .feedback
@@ -210,7 +228,6 @@ impl FeedbackWindow {
         self.received_bytes = 0;
         self.received_video_bytes = 0;
         self.received_audio_bytes = 0;
-
         Some(stats)
     }
 }

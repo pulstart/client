@@ -69,8 +69,9 @@ pub fn run_receive_pipeline(
     present_refresh_millihz: Option<u32>,
     stream_config: StreamConfig,
     udp_socket: UdpSocket,
+    crypto: Option<std::sync::Arc<st_protocol::tunnel::CryptoContext>>,
 ) {
-    let mut receiver = match UdpReceiver::from_socket(udp_socket) {
+    let mut receiver = match UdpReceiver::from_socket(udp_socket, crypto) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Failed to create UDP receiver: {e}");

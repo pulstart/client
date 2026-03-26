@@ -1,5 +1,6 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
+mod api_client;
 mod audio;
 mod debug_state;
 mod decode;
@@ -126,6 +127,7 @@ struct StreamApp {
     add_server_addr: String,
     search_query: String,
     token: String,
+    api_discovery: Arc<api_client::ApiDiscoveryShared>,
     discovered_servers: Arc<Mutex<Vec<DiscoveredServer>>>,
     home_tab: HomeTab,
     audio_enabled: bool,
@@ -278,6 +280,16 @@ fn save_token(token: &str) {
     let dir = state_dir();
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join("token"), token);
+}
+
+/// Hardcoded API server URL. Override at build time or via ST_API_URL env var.
+const API_SERVER_URL: &str = "https://st-api.kubemaxx.io";
+
+fn resolve_api_url() -> String {
+    std::env::var("ST_API_URL")
+        .unwrap_or_else(|_| API_SERVER_URL.to_string())
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn load_menu_button_pos() -> Option<egui::Pos2> {
@@ -502,12 +514,18 @@ impl StreamApp {
         ));
         let discovered_servers = Arc::new(Mutex::new(Vec::<DiscoveredServer>::new()));
         start_discovery_listener(Arc::clone(&discovered_servers), cc.egui_ctx.clone());
+        let api_discovery = Arc::new(api_client::ApiDiscoveryShared::new(
+            resolve_api_url(),
+            token.clone(),
+        ));
+        api_client::start_api_discovery(Arc::clone(&api_discovery), cc.egui_ctx.clone());
         Self {
             server_addr: saved,
             server_list,
             add_server_addr: String::new(),
             search_query: String::new(),
             token,
+            api_discovery,
             discovered_servers,
             home_tab: HomeTab::Servers,
             audio_enabled: audio,
@@ -610,6 +628,7 @@ impl StreamApp {
         let excluded_video_codecs = Arc::clone(&self.excluded_video_codecs);
         let shared_input = Arc::clone(&self.shared_input);
         let token = self.token.clone();
+        let api_disc = Arc::clone(&self.api_discovery);
         debug_state.reset_for_connect(&addr, display_refresh_millihz);
 
         std::thread::spawn(move || {
@@ -632,6 +651,7 @@ impl StreamApp {
                 control_rx,
                 input_rx,
                 ctx,
+                api_disc,
             );
         });
     }
@@ -1860,11 +1880,27 @@ impl StreamApp {
                 .color(TEXT_WHITE),
         );
         ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new("Connect to your computer in low latency desktop mode.")
-                .size(13.0)
-                .color(TEXT_GRAY),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Connect to your computer in low latency desktop mode.")
+                    .size(13.0)
+                    .color(TEXT_GRAY),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let api_url = self.api_discovery.api_url.lock().unwrap().clone();
+                if !api_url.is_empty() {
+                    let connected = self.api_discovery.is_connected();
+                    let (dot, label) = if connected {
+                        (egui::Color32::from_rgb(80, 200, 120), "Online")
+                    } else {
+                        (egui::Color32::from_rgb(180, 80, 80), "Offline")
+                    };
+                    ui.label(egui::RichText::new(label).size(11.0).color(dot));
+                    let dot_rect = ui.allocate_space(egui::vec2(8.0, 8.0)).1;
+                    ui.painter().circle_filled(dot_rect.center(), 4.0, dot);
+                }
+            });
+        });
         ui.add_space(16.0);
 
         // Search bar + Reload
@@ -1899,48 +1935,123 @@ impl StreamApp {
         });
         ui.add_space(20.0);
 
-        // Sort: most recently connected first
+        // ---- Build unified server list from all sources ----
+        const ACCENT_GREEN: egui::Color32 = egui::Color32::from_rgb(80, 200, 120);
+
+        // Collect LAN-discovered servers (token-matched, non-expired).
+        let discovered = self.discovered_servers.lock().unwrap().clone();
+        let lan_servers: Vec<&DiscoveredServer> = discovered
+            .iter()
+            .filter(|d| d.token == self.token && !self.token.is_empty())
+            .filter(|d| d.last_seen.elapsed() < DISCOVERY_EXPIRY)
+            .collect();
+        let lan_addrs: Vec<String> = lan_servers.iter().map(|d| d.address.clone()).collect();
+
+        // Collect API-discovered host candidates.
+        let api_host = self.api_discovery.host.lock().unwrap().clone();
+        let api_candidates: Vec<String> = api_host
+            .as_ref()
+            .filter(|h| !h.candidates.is_empty() && h.last_seen.elapsed() < Duration::from_secs(15))
+            .map(|h| h.candidates.clone())
+            .unwrap_or_default();
+
+        // Merged entry for rendering.
+        struct MergedServer {
+            address: String,
+            display_name: String,
+            subtitle: String,
+            is_lan: bool,
+            saved_idx: Option<usize>,
+            icon_active: bool,
+        }
+
+        let mut merged: Vec<MergedServer> = Vec::new();
+        let mut seen_addrs: Vec<String> = Vec::new();
+
+        // 1) Saved servers (preserve order: most recently connected first).
         let mut indices: Vec<usize> = (0..self.server_list.len()).collect();
         indices.sort_by(|&a, &b| {
             self.server_list[b]
                 .last_connected
                 .cmp(&self.server_list[a].last_connected)
         });
-
-        // Filter by search
-        let query = self.search_query.trim().to_lowercase();
-        if !query.is_empty() {
-            indices.retain(|&i| {
-                let e = &self.server_list[i];
-                e.address.to_lowercase().contains(&query)
-                    || e.nickname.to_lowercase().contains(&query)
+        for idx in &indices {
+            let entry = &self.server_list[*idx];
+            let is_lan = lan_addrs.contains(&entry.address);
+            let display_name = if entry.nickname.is_empty() {
+                entry.address.clone()
+            } else {
+                entry.nickname.clone()
+            };
+            let subtitle = if !entry.nickname.is_empty() {
+                truncate_str(&entry.address, 24).to_string()
+            } else {
+                format_last_connected(entry.last_connected)
+            };
+            seen_addrs.push(entry.address.clone());
+            merged.push(MergedServer {
+                address: entry.address.clone(),
+                display_name,
+                subtitle,
+                is_lan,
+                saved_idx: Some(*idx),
+                icon_active: entry.last_connected > 0 || is_lan,
             });
         }
 
-        let mut connect_idx: Option<usize> = None;
+        // 2) LAN-discovered servers not already in the saved list.
+        for srv in &lan_servers {
+            if !seen_addrs.contains(&srv.address) {
+                seen_addrs.push(srv.address.clone());
+                merged.push(MergedServer {
+                    address: srv.address.clone(),
+                    display_name: srv.hostname.clone(),
+                    subtitle: truncate_str(&srv.address, 24).to_string(),
+                    is_lan: true,
+                    saved_idx: None,
+                    icon_active: true,
+                });
+            }
+        }
+
+        // 3) API-discovered candidates not already shown.
+        for addr in &api_candidates {
+            if !seen_addrs.contains(addr) {
+                seen_addrs.push(addr.clone());
+                merged.push(MergedServer {
+                    address: addr.clone(),
+                    display_name: addr.clone(),
+                    subtitle: String::new(),
+                    is_lan: false,
+                    saved_idx: None,
+                    icon_active: true,
+                });
+            }
+        }
+
+        // Filter by search query.
+        let query = self.search_query.trim().to_lowercase();
+        if !query.is_empty() {
+            merged.retain(|m| {
+                m.address.to_lowercase().contains(&query)
+                    || m.display_name.to_lowercase().contains(&query)
+            });
+        }
+
+        let mut connect_addr: Option<String> = None;
         let mut delete_idx: Option<usize> = None;
 
-        if self.server_list.is_empty() {
+        if merged.is_empty() {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
+                let msg = if self.server_list.is_empty() && lan_servers.is_empty() && api_candidates.is_empty() {
+                    "No computers\nAdd a server address using the bar below."
+                } else {
+                    "No matches"
+                };
                 ui.label(
-                    egui::RichText::new("No computers")
-                        .size(15.0)
-                        .color(TEXT_DIM),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("Add a server address using the bar below.")
-                        .size(12.0)
-                        .color(TEXT_DIM),
-                );
-            });
-        } else if indices.is_empty() {
-            ui.add_space(40.0);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new("No matches")
-                        .size(15.0)
+                    egui::RichText::new(msg)
+                        .size(14.0)
                         .color(TEXT_DIM),
                 );
             });
@@ -1949,15 +2060,14 @@ impl StreamApp {
             let cols = ((avail_w + 12.0) / (CARD_W + 12.0)).floor().max(1.0) as usize;
 
             let mut card_i = 0;
-            while card_i < indices.len() {
+            while card_i < merged.len() {
                 ui.horizontal(|ui| {
                     for _ in 0..cols {
-                        if card_i >= indices.len() {
+                        if card_i >= merged.len() {
                             break;
                         }
-                        let idx = indices[card_i];
+                        let srv = &merged[card_i];
                         card_i += 1;
-                        let entry = &self.server_list[idx];
 
                         let (card_id, card_rect) =
                             ui.allocate_space(egui::vec2(CARD_W, CARD_H));
@@ -1980,191 +2090,42 @@ impl StreamApp {
                         paint_monitor_icon(
                             painter,
                             egui::pos2(icon_cx, icon_top),
-                            entry.last_connected > 0,
+                            srv.icon_active,
                         );
 
                         // Server name
-                        let display_name = if entry.nickname.is_empty() {
-                            &entry.address
-                        } else {
-                            &entry.nickname
-                        };
                         let name_y = icon_top + 76.0;
                         painter.text(
                             egui::pos2(icon_cx, name_y),
                             egui::Align2::CENTER_CENTER,
-                            truncate_str(display_name, 20),
+                            truncate_str(&srv.display_name, 20),
                             egui::FontId::proportional(12.0),
                             TEXT_WHITE,
                         );
 
                         // Subtitle
                         let sub_y = name_y + 16.0;
-                        let subtitle = if !entry.nickname.is_empty() {
-                            truncate_str(&entry.address, 24).to_string()
-                        } else {
-                            format_last_connected(entry.last_connected)
-                        };
-                        painter.text(
-                            egui::pos2(icon_cx, sub_y),
-                            egui::Align2::CENTER_CENTER,
-                            &subtitle,
-                            egui::FontId::proportional(10.0),
-                            TEXT_DIM,
-                        );
-
-                        // Connect button
-                        let btn_w = CARD_W - 24.0;
-                        let btn_h = 28.0;
-                        let btn_rect = egui::Rect::from_min_size(
-                            egui::pos2(
-                                card_rect.left() + 12.0,
-                                card_rect.bottom() - 12.0 - btn_h,
-                            ),
-                            egui::vec2(btn_w, btn_h),
-                        );
-                        let btn_resp =
-                            ui.allocate_rect(btn_rect, egui::Sense::click());
-                        let btn_fill = if btn_resp.hovered() {
-                            egui::Color32::from_rgb(62, 66, 76)
-                        } else {
-                            BTN_DARK
-                        };
-                        painter.rect(
-                            btn_rect,
-                            4.0,
-                            btn_fill,
-                            egui::Stroke::NONE,
-                            egui::StrokeKind::Outside,
-                        );
-                        painter.text(
-                            btn_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "Connect",
-                            egui::FontId::proportional(12.0),
-                            TEXT_WHITE,
-                        );
-                        if btn_resp.clicked() {
-                            connect_idx = Some(idx);
-                        }
-
-                        // Delete X in top-right corner
-                        let x_rect = egui::Rect::from_min_size(
-                            egui::pos2(card_rect.right() - 22.0, card_rect.top() + 4.0),
-                            egui::vec2(18.0, 18.0),
-                        );
-                        let x_resp =
-                            ui.allocate_rect(x_rect, egui::Sense::click());
-                        if hover {
-                            let x_color = if x_resp.hovered() {
-                                egui::Color32::from_rgb(220, 100, 100)
-                            } else {
-                                egui::Color32::from_rgb(140, 90, 90)
-                            };
+                        if !srv.subtitle.is_empty() {
                             painter.text(
-                                x_rect.center(),
+                                egui::pos2(icon_cx, sub_y),
                                 egui::Align2::CENTER_CENTER,
-                                "x",
-                                egui::FontId::proportional(12.0),
-                                x_color,
+                                &srv.subtitle,
+                                egui::FontId::proportional(10.0),
+                                TEXT_DIM,
                             );
                         }
-                        if x_resp.clicked() {
-                            delete_idx = Some(idx);
+
+                        // LAN badge
+                        if srv.is_lan {
+                            let badge_y = if srv.subtitle.is_empty() { sub_y } else { sub_y + 14.0 };
+                            painter.text(
+                                egui::pos2(icon_cx, badge_y),
+                                egui::Align2::CENTER_CENTER,
+                                "LAN",
+                                egui::FontId::proportional(9.0),
+                                ACCENT_GREEN,
+                            );
                         }
-
-                        ui.add_space(12.0);
-                    }
-                });
-                ui.add_space(12.0);
-            }
-        }
-
-        // --- Discovered servers (via LAN broadcast) ---
-        let discovered = self.discovered_servers.lock().unwrap().clone();
-        let known_addrs: Vec<String> = self.server_list.iter().map(|s| s.address.clone()).collect();
-        let matched: Vec<&DiscoveredServer> = discovered
-            .iter()
-            .filter(|d| d.token == self.token && !self.token.is_empty())
-            .filter(|d| !known_addrs.contains(&d.address))
-            .filter(|d| d.last_seen.elapsed() < DISCOVERY_EXPIRY)
-            .collect();
-
-        let mut connect_discovered: Option<String> = None;
-        if !matched.is_empty() {
-            ui.add_space(12.0);
-            ui.label(
-                egui::RichText::new("Discovered on Network")
-                    .size(14.0)
-                    .color(TEXT_GRAY),
-            );
-            ui.add_space(8.0);
-
-            let avail_w = ui.available_width();
-            let cols = ((avail_w + 12.0) / (CARD_W + 12.0)).floor().max(1.0) as usize;
-            let mut disc_i = 0;
-            const ACCENT_GREEN: egui::Color32 = egui::Color32::from_rgb(80, 200, 120);
-            const BG_DISC_CARD: egui::Color32 = egui::Color32::from_rgb(36, 46, 42);
-            const BG_DISC_HOVER: egui::Color32 = egui::Color32::from_rgb(44, 56, 50);
-            const DISC_BORDER: egui::Color32 = egui::Color32::from_rgb(50, 72, 58);
-
-            while disc_i < matched.len() {
-                ui.horizontal(|ui| {
-                    for _ in 0..cols {
-                        if disc_i >= matched.len() {
-                            break;
-                        }
-                        let srv = matched[disc_i];
-                        disc_i += 1;
-
-                        let (card_id, card_rect) =
-                            ui.allocate_space(egui::vec2(CARD_W, CARD_H));
-                        let hover = ui
-                            .interact(card_rect, card_id, egui::Sense::hover())
-                            .hovered();
-                        let fill = if hover { BG_DISC_HOVER } else { BG_DISC_CARD };
-
-                        painter.rect(
-                            card_rect,
-                            8.0,
-                            fill,
-                            egui::Stroke::new(1.0, DISC_BORDER),
-                            egui::StrokeKind::Outside,
-                        );
-
-                        // Monitor icon
-                        let icon_cx = card_rect.center().x;
-                        let icon_top = card_rect.top() + 20.0;
-                        paint_monitor_icon(painter, egui::pos2(icon_cx, icon_top), true);
-
-                        // Hostname
-                        let name_y = icon_top + 76.0;
-                        painter.text(
-                            egui::pos2(icon_cx, name_y),
-                            egui::Align2::CENTER_CENTER,
-                            truncate_str(&srv.hostname, 20),
-                            egui::FontId::proportional(12.0),
-                            TEXT_WHITE,
-                        );
-
-                        // Address subtitle
-                        let sub_y = name_y + 16.0;
-                        painter.text(
-                            egui::pos2(icon_cx, sub_y),
-                            egui::Align2::CENTER_CENTER,
-                            truncate_str(&srv.address, 24),
-                            egui::FontId::proportional(10.0),
-                            TEXT_DIM,
-                        );
-
-                        // "Discovered" label
-                        painter.text(
-                            egui::pos2(icon_cx, sub_y + 14.0),
-                            egui::Align2::CENTER_CENTER,
-                            "LAN",
-                            egui::FontId::proportional(9.0),
-                            ACCENT_GREEN,
-                        );
 
                         // Connect button
                         let btn_w = CARD_W - 24.0;
@@ -2197,15 +2158,44 @@ impl StreamApp {
                             TEXT_WHITE,
                         );
                         if btn_resp.clicked() {
-                            connect_discovered = Some(srv.address.clone());
-                            // Also add to saved list
+                            connect_addr = Some(srv.address.clone());
+                            // Ensure it gets into saved list.
                             ensure_server_in_list(&mut self.server_list, &srv.address);
-                            if let Some(entry) = self.server_list.iter_mut().find(|e| e.address == srv.address) {
-                                if entry.nickname.is_empty() {
-                                    entry.nickname = srv.hostname.clone();
+                            // Copy hostname as nickname for LAN-discovered entries.
+                            if srv.saved_idx.is_none() {
+                                if let Some(entry) = self.server_list.iter_mut().find(|e| e.address == srv.address) {
+                                    if entry.nickname.is_empty() && srv.display_name != srv.address {
+                                        entry.nickname = srv.display_name.clone();
+                                    }
                                 }
                             }
                             save_server_list(&self.server_list);
+                        }
+
+                        // Delete X in top-right corner (only for saved servers)
+                        if let Some(saved) = srv.saved_idx {
+                            let x_rect = egui::Rect::from_min_size(
+                                egui::pos2(card_rect.right() - 22.0, card_rect.top() + 4.0),
+                                egui::vec2(18.0, 18.0),
+                            );
+                            let x_resp = ui.allocate_rect(x_rect, egui::Sense::click());
+                            if hover {
+                                let x_color = if x_resp.hovered() {
+                                    egui::Color32::from_rgb(220, 100, 100)
+                                } else {
+                                    egui::Color32::from_rgb(140, 90, 90)
+                                };
+                                painter.text(
+                                    x_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "x",
+                                    egui::FontId::proportional(12.0),
+                                    x_color,
+                                );
+                            }
+                            if x_resp.clicked() {
+                                delete_idx = Some(saved);
+                            }
                         }
 
                         ui.add_space(12.0);
@@ -2215,12 +2205,7 @@ impl StreamApp {
             }
         }
 
-        if let Some(idx) = connect_idx {
-            self.server_addr = self.server_list[idx].address.clone();
-            self.video_texture.clear_frame();
-            self.connect(ctx.clone());
-        }
-        if let Some(addr) = connect_discovered {
+        if let Some(addr) = connect_addr {
             self.server_addr = addr;
             self.video_texture.clear_frame();
             self.connect(ctx.clone());
@@ -2289,6 +2274,7 @@ impl StreamApp {
             );
             if resp.changed() {
                 save_token(&self.token);
+                *self.api_discovery.token.lock().unwrap() = self.token.clone();
             }
         });
     }
@@ -2683,14 +2669,16 @@ fn start_media_threads(
     input_rx: crossbeam_channel::Receiver<InputPacket>,
     stream_config: StreamConfig,
     udp_socket: UdpSocket,
+    crypto: Option<Arc<st_protocol::tunnel::CryptoContext>>,
 ) -> Result<MediaThreads, String> {
     let input_socket = udp_socket
         .try_clone()
         .map_err(|err| format!("Failed to clone UDP socket: {err}"))?;
     let input_target = std::net::SocketAddr::new(socket_addr.ip(), socket_addr.port());
     let (input_stop_tx, input_stop_rx) = crossbeam_channel::bounded::<()>(1);
+    let input_crypto = crypto.clone();
     let input_thread = std::thread::spawn(move || {
-        run_input_sender(input_socket, input_target, input_rx, input_stop_rx);
+        run_input_sender(input_socket, input_target, input_rx, input_stop_rx, input_crypto);
     });
 
     let (audio_data_tx, audio_data_rx) = crossbeam_channel::bounded::<AudioPacket>(60);
@@ -2718,6 +2706,7 @@ fn start_media_threads(
             present_refresh_millihz,
             stream_config,
             udp_socket,
+            crypto,
         );
     });
 
@@ -2769,7 +2758,10 @@ fn run_connection(
     control_rx: crossbeam_channel::Receiver<ControlMessage>,
     input_rx: crossbeam_channel::Receiver<InputPacket>,
     ctx: egui::Context,
+    api_discovery: Arc<api_client::ApiDiscoveryShared>,
 ) {
+    let tunnel_crypto = api_discovery.crypto_context();
+
     if session_cancelled(
         disconnect.as_ref(),
         connection_epoch.as_ref(),
@@ -3031,6 +3023,7 @@ fn run_connection(
                                     input_rx.take().expect("input receiver already taken"),
                                     cfg,
                                     udp_socket.take().expect("udp socket already taken"),
+                                    tunnel_crypto.clone(),
                                 ) {
                                     Ok(media) => media,
                                     Err(err) => {
@@ -3606,10 +3599,16 @@ fn send_input_packet_raw(
     target: std::net::SocketAddr,
     packet: InputPacket,
     seq: &mut u16,
+    crypto: Option<&st_protocol::tunnel::CryptoContext>,
 ) {
     let raw = packet.serialize(*seq);
     *seq = seq.wrapping_add(1);
-    let _ = socket.send_to(&raw, target);
+    if let Some(crypto) = crypto {
+        let encrypted = crypto.encrypt(&raw);
+        let _ = socket.send_to(&encrypted, target);
+    } else {
+        let _ = socket.send_to(&raw, target);
+    }
 }
 
 fn run_input_sender(
@@ -3617,11 +3616,13 @@ fn run_input_sender(
     target: std::net::SocketAddr,
     input_rx: crossbeam_channel::Receiver<InputPacket>,
     shutdown_rx: crossbeam_channel::Receiver<()>,
+    crypto: Option<Arc<st_protocol::tunnel::CryptoContext>>,
 ) {
     let mut seq = 0u16;
     let mut mouse_heartbeat = MouseInputHeartbeat::default();
     let mut keyboard_heartbeat = KeyboardInputHeartbeat::default();
     let _ = socket.set_write_timeout(Some(INPUT_STATE_HEARTBEAT_INTERVAL));
+    let cref = crypto.as_deref();
     loop {
         if shutdown_rx.try_recv().is_ok() {
             break;
@@ -3632,17 +3633,17 @@ fn run_input_sender(
                 let now = Instant::now();
                 mouse_heartbeat.observe(packet, now);
                 keyboard_heartbeat.observe(packet, now);
-                send_input_packet_raw(&socket, target, packet, &mut seq);
+                send_input_packet_raw(&socket, target, packet, &mut seq, cref);
                 mouse_heartbeat.mark_sent(packet, now);
                 keyboard_heartbeat.mark_sent(packet, now);
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 let now = Instant::now();
                 if let Some(packet) = mouse_heartbeat.due_packet(now) {
-                    send_input_packet_raw(&socket, target, packet, &mut seq);
+                    send_input_packet_raw(&socket, target, packet, &mut seq, cref);
                 }
                 if let Some(packet) = keyboard_heartbeat.due_packet(now) {
-                    send_input_packet_raw(&socket, target, packet, &mut seq);
+                    send_input_packet_raw(&socket, target, packet, &mut seq, cref);
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
