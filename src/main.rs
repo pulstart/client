@@ -45,6 +45,8 @@ use video_frame::{NativeSurfaceControl, VideoFrameBuffer};
 use crate::debug_state::{unix_time_micros, ConnectionDebugSnapshot, ConnectionDebugState};
 
 const DEFAULT_APP_PORT: u16 = 28_480;
+const DISCOVERY_PORT: u16 = 28_481;
+const DISCOVERY_EXPIRY: Duration = Duration::from_secs(10);
 const MAX_REMOTE_CURSOR_TEXTURES: usize = 8;
 const INPUT_SENDER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const INPUT_STATE_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
@@ -74,6 +76,14 @@ enum HomeTab {
 enum DebugOverlayTab {
     General,
     Cursor,
+}
+
+#[derive(Clone, Debug)]
+struct DiscoveredServer {
+    hostname: String,
+    address: String,
+    token: String,
+    last_seen: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -115,6 +125,8 @@ struct StreamApp {
     server_list: Vec<ServerEntry>,
     add_server_addr: String,
     search_query: String,
+    token: String,
+    discovered_servers: Arc<Mutex<Vec<DiscoveredServer>>>,
     home_tab: HomeTab,
     audio_enabled: bool,
     debug_enabled: bool,
@@ -255,6 +267,19 @@ fn save_debug_enabled(enabled: bool) {
     let _ = std::fs::write(dir.join("debug_enabled"), if enabled { "1" } else { "0" });
 }
 
+fn load_token() -> String {
+    std::fs::read_to_string(state_dir().join("token"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn save_token(token: &str) {
+    let dir = state_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("token"), token);
+}
+
 fn load_menu_button_pos() -> Option<egui::Pos2> {
     let text = std::fs::read_to_string(state_dir().join("menu_button_pos")).ok()?;
     let mut parts = text.split_whitespace();
@@ -369,6 +394,79 @@ fn clamp_menu_button_pos(pos: egui::Pos2, content_rect: egui::Rect) -> egui::Pos
 }
 
 // ---------------------------------------------------------------------------
+// Discovery listener
+// ---------------------------------------------------------------------------
+
+fn start_discovery_listener(
+    discovered: Arc<Mutex<Vec<DiscoveredServer>>>,
+    ctx: egui::Context,
+) {
+    std::thread::spawn(move || {
+        let sock = match std::net::UdpSocket::bind(format!("0.0.0.0:{DISCOVERY_PORT}")) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("[discovery] Failed to bind listener on port {DISCOVERY_PORT}: {err}");
+                return;
+            }
+        };
+        // Short timeout so we can prune expired servers promptly
+        let _ = sock.set_read_timeout(Some(Duration::from_secs(3)));
+
+        let mut buf = [0u8; 512];
+        loop {
+            let changed;
+            match sock.recv_from(&mut buf) {
+                Ok((n, src_addr)) => {
+                    let data = String::from_utf8_lossy(&buf[..n]);
+                    let lines: Vec<&str> = data.lines().collect();
+                    if lines.len() >= 4 && lines[0] == "ST_DISCOVER" {
+                        let hostname = lines[1].to_string();
+                        let port: u16 = lines[2].parse().unwrap_or(DEFAULT_APP_PORT);
+                        let token = lines[3].to_string();
+                        let address = format!("{}:{port}", src_addr.ip());
+
+                        let mut servers = discovered.lock().unwrap();
+                        let before = servers.len();
+                        servers.retain(|s| s.last_seen.elapsed() < DISCOVERY_EXPIRY);
+                        if let Some(existing) = servers.iter_mut().find(|s| s.address == address) {
+                            existing.hostname = hostname;
+                            existing.token = token;
+                            existing.last_seen = Instant::now();
+                            changed = servers.len() != before;
+                        } else {
+                            servers.push(DiscoveredServer {
+                                hostname,
+                                address,
+                                token,
+                                last_seen: Instant::now(),
+                            });
+                            changed = true;
+                        }
+                    } else {
+                        changed = false;
+                    }
+                }
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    let mut servers = discovered.lock().unwrap();
+                    let before = servers.len();
+                    servers.retain(|s| s.last_seen.elapsed() < DISCOVERY_EXPIRY);
+                    changed = servers.len() != before;
+                }
+                Err(_) => {
+                    changed = false;
+                }
+            }
+            if changed {
+                ctx.request_repaint();
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // StreamApp
 // ---------------------------------------------------------------------------
 
@@ -381,6 +479,7 @@ impl StreamApp {
             ensure_server_in_list(&mut server_list, &saved);
             save_server_list(&server_list);
         }
+        let token = load_token();
         let audio = load_audio_enabled();
         let debug_enabled = load_debug_enabled();
         let menu_button_pos = load_menu_button_pos().unwrap_or_else(default_menu_button_pos);
@@ -401,11 +500,15 @@ impl StreamApp {
         let native_surfaces = Arc::new(NativeSurfaceControl::new(
             video_texture.native_surface_capabilities(),
         ));
+        let discovered_servers = Arc::new(Mutex::new(Vec::<DiscoveredServer>::new()));
+        start_discovery_listener(Arc::clone(&discovered_servers), cc.egui_ctx.clone());
         Self {
             server_addr: saved,
             server_list,
             add_server_addr: String::new(),
             search_query: String::new(),
+            token,
+            discovered_servers,
             home_tab: HomeTab::Servers,
             audio_enabled: audio,
             debug_enabled,
@@ -506,11 +609,13 @@ impl StreamApp {
         let video_codec_support = self.video_codec_support;
         let excluded_video_codecs = Arc::clone(&self.excluded_video_codecs);
         let shared_input = Arc::clone(&self.shared_input);
+        let token = self.token.clone();
         debug_state.reset_for_connect(&addr, display_refresh_millihz);
 
         std::thread::spawn(move || {
             run_connection(
                 addr,
+                token,
                 display_refresh_millihz,
                 video_codec_support,
                 excluded_video_codecs,
@@ -1784,7 +1889,10 @@ impl StreamApp {
                         )
                         .clicked()
                     {
-                        // Placeholder
+                        self.server_list = load_server_list();
+                        // Prune stale discovered servers so the list is fresh
+                        self.discovered_servers.lock().unwrap()
+                            .retain(|s| s.last_seen.elapsed() < DISCOVERY_EXPIRY);
                     }
                 },
             );
@@ -1972,8 +2080,148 @@ impl StreamApp {
             }
         }
 
+        // --- Discovered servers (via LAN broadcast) ---
+        let discovered = self.discovered_servers.lock().unwrap().clone();
+        let known_addrs: Vec<String> = self.server_list.iter().map(|s| s.address.clone()).collect();
+        let matched: Vec<&DiscoveredServer> = discovered
+            .iter()
+            .filter(|d| d.token == self.token && !self.token.is_empty())
+            .filter(|d| !known_addrs.contains(&d.address))
+            .filter(|d| d.last_seen.elapsed() < DISCOVERY_EXPIRY)
+            .collect();
+
+        let mut connect_discovered: Option<String> = None;
+        if !matched.is_empty() {
+            ui.add_space(12.0);
+            ui.label(
+                egui::RichText::new("Discovered on Network")
+                    .size(14.0)
+                    .color(TEXT_GRAY),
+            );
+            ui.add_space(8.0);
+
+            let avail_w = ui.available_width();
+            let cols = ((avail_w + 12.0) / (CARD_W + 12.0)).floor().max(1.0) as usize;
+            let mut disc_i = 0;
+            const ACCENT_GREEN: egui::Color32 = egui::Color32::from_rgb(80, 200, 120);
+            const BG_DISC_CARD: egui::Color32 = egui::Color32::from_rgb(36, 46, 42);
+            const BG_DISC_HOVER: egui::Color32 = egui::Color32::from_rgb(44, 56, 50);
+            const DISC_BORDER: egui::Color32 = egui::Color32::from_rgb(50, 72, 58);
+
+            while disc_i < matched.len() {
+                ui.horizontal(|ui| {
+                    for _ in 0..cols {
+                        if disc_i >= matched.len() {
+                            break;
+                        }
+                        let srv = matched[disc_i];
+                        disc_i += 1;
+
+                        let (card_id, card_rect) =
+                            ui.allocate_space(egui::vec2(CARD_W, CARD_H));
+                        let hover = ui
+                            .interact(card_rect, card_id, egui::Sense::hover())
+                            .hovered();
+                        let fill = if hover { BG_DISC_HOVER } else { BG_DISC_CARD };
+
+                        painter.rect(
+                            card_rect,
+                            8.0,
+                            fill,
+                            egui::Stroke::new(1.0, DISC_BORDER),
+                            egui::StrokeKind::Outside,
+                        );
+
+                        // Monitor icon
+                        let icon_cx = card_rect.center().x;
+                        let icon_top = card_rect.top() + 20.0;
+                        paint_monitor_icon(painter, egui::pos2(icon_cx, icon_top), true);
+
+                        // Hostname
+                        let name_y = icon_top + 76.0;
+                        painter.text(
+                            egui::pos2(icon_cx, name_y),
+                            egui::Align2::CENTER_CENTER,
+                            truncate_str(&srv.hostname, 20),
+                            egui::FontId::proportional(12.0),
+                            TEXT_WHITE,
+                        );
+
+                        // Address subtitle
+                        let sub_y = name_y + 16.0;
+                        painter.text(
+                            egui::pos2(icon_cx, sub_y),
+                            egui::Align2::CENTER_CENTER,
+                            truncate_str(&srv.address, 24),
+                            egui::FontId::proportional(10.0),
+                            TEXT_DIM,
+                        );
+
+                        // "Discovered" label
+                        painter.text(
+                            egui::pos2(icon_cx, sub_y + 14.0),
+                            egui::Align2::CENTER_CENTER,
+                            "LAN",
+                            egui::FontId::proportional(9.0),
+                            ACCENT_GREEN,
+                        );
+
+                        // Connect button
+                        let btn_w = CARD_W - 24.0;
+                        let btn_h = 28.0;
+                        let btn_rect = egui::Rect::from_min_size(
+                            egui::pos2(
+                                card_rect.left() + 12.0,
+                                card_rect.bottom() - 12.0 - btn_h,
+                            ),
+                            egui::vec2(btn_w, btn_h),
+                        );
+                        let btn_resp = ui.allocate_rect(btn_rect, egui::Sense::click());
+                        let btn_fill = if btn_resp.hovered() {
+                            egui::Color32::from_rgb(62, 66, 76)
+                        } else {
+                            BTN_DARK
+                        };
+                        painter.rect(
+                            btn_rect,
+                            4.0,
+                            btn_fill,
+                            egui::Stroke::NONE,
+                            egui::StrokeKind::Outside,
+                        );
+                        painter.text(
+                            btn_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "Connect",
+                            egui::FontId::proportional(12.0),
+                            TEXT_WHITE,
+                        );
+                        if btn_resp.clicked() {
+                            connect_discovered = Some(srv.address.clone());
+                            // Also add to saved list
+                            ensure_server_in_list(&mut self.server_list, &srv.address);
+                            if let Some(entry) = self.server_list.iter_mut().find(|e| e.address == srv.address) {
+                                if entry.nickname.is_empty() {
+                                    entry.nickname = srv.hostname.clone();
+                                }
+                            }
+                            save_server_list(&self.server_list);
+                        }
+
+                        ui.add_space(12.0);
+                    }
+                });
+                ui.add_space(12.0);
+            }
+        }
+
         if let Some(idx) = connect_idx {
             self.server_addr = self.server_list[idx].address.clone();
+            self.video_texture.clear_frame();
+            self.connect(ctx.clone());
+        }
+        if let Some(addr) = connect_discovered {
+            self.server_addr = addr;
             self.video_texture.clear_frame();
             self.connect(ctx.clone());
         }
@@ -2017,6 +2265,32 @@ impl StreamApp {
             save_debug_enabled(self.debug_enabled);
             self.debug_enabled_flag.store(self.debug_enabled, Ordering::SeqCst);
         }
+
+        ui.add_space(16.0);
+        ui.label(
+            egui::RichText::new("Authentication")
+                .size(16.0)
+                .color(TEXT_WHITE),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Token to authenticate with servers. Must match the server's token.")
+                .size(12.0)
+                .color(TEXT_GRAY),
+        );
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Token").size(13.0).color(TEXT_WHITE));
+            ui.add_space(8.0);
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.token)
+                    .desired_width(300.0)
+                    .hint_text("Paste server token here"),
+            );
+            if resp.changed() {
+                save_token(&self.token);
+            }
+        });
     }
 
     fn render_update_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -2478,6 +2752,7 @@ const STARTUP_DECODE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn run_connection(
     addr: String,
+    token: String,
     display_refresh_millihz: Option<u32>,
     video_codec_support: decode::VideoCodecSupportReport,
     excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
@@ -2543,6 +2818,86 @@ fn run_connection(
         }
     };
     let _ = tcp.set_nodelay(true);
+
+    // --- Authentication handshake ---
+    let _ = tcp.write_all(&ControlMessage::Authenticate(token).serialize());
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    {
+        let mut auth_buf = vec![0u8; 64];
+        let mut pending = Vec::new();
+        let auth_deadline = Instant::now() + Duration::from_secs(5);
+        let mut authenticated = false;
+        'auth: while Instant::now() < auth_deadline {
+            match tcp.read(&mut auth_buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    pending.extend_from_slice(&auth_buf[..n]);
+                    let mut consumed = 0;
+                    while let Some((msg, used)) =
+                        ControlMessage::deserialize(&pending[consumed..])
+                    {
+                        consumed += used;
+                        match msg {
+                            ControlMessage::AuthResult(ok) => {
+                                if !ok {
+                                    set_error(
+                                        &state,
+                                        &ctx,
+                                        &disconnect,
+                                        &connection_epoch,
+                                        session_epoch,
+                                        "Authentication failed. Check your token.".into(),
+                                    );
+                                    return;
+                                }
+                                authenticated = true;
+                                break 'auth;
+                            }
+                            ControlMessage::Error(msg) => {
+                                set_error(
+                                    &state,
+                                    &ctx,
+                                    &disconnect,
+                                    &connection_epoch,
+                                    session_epoch,
+                                    format!("Server error: {msg}"),
+                                );
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if consumed > 0 {
+                        pending.drain(..consumed);
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => continue,
+                Err(e) => {
+                    set_error(
+                        &state,
+                        &ctx,
+                        &disconnect,
+                        &connection_epoch,
+                        session_epoch,
+                        format!("Auth read error: {e}"),
+                    );
+                    return;
+                }
+            }
+        }
+        if !authenticated {
+            set_error(
+                &state,
+                &ctx,
+                &disconnect,
+                &connection_epoch,
+                session_epoch,
+                "Authentication timed out.".into(),
+            );
+            return;
+        }
+    }
 
     if session_cancelled(
         disconnect.as_ref(),
@@ -2811,7 +3166,9 @@ fn run_connection(
                         | ControlMessage::TransportFeedback(_)
                         | ControlMessage::AcquireControl
                         | ControlMessage::ReleaseControl
-                        | ControlMessage::RequestKeyframe => {}
+                        | ControlMessage::RequestKeyframe
+                        | ControlMessage::Authenticate(_)
+                        | ControlMessage::AuthResult(_) => {}
                     }
                 }
                 if stream_started && media_threads.is_some() {
@@ -3010,7 +3367,9 @@ fn run_connection(
                         | ControlMessage::TransportFeedback(_)
                         | ControlMessage::AcquireControl
                         | ControlMessage::ReleaseControl
-                        | ControlMessage::RequestKeyframe => {}
+                        | ControlMessage::RequestKeyframe
+                        | ControlMessage::Authenticate(_)
+                        | ControlMessage::AuthResult(_) => {}
                         ControlMessage::StreamStarted => {}
                     }
                 }
