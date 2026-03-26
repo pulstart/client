@@ -1,5 +1,5 @@
 use st_protocol::tunnel::{CryptoContext, TunnelKeys};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -56,6 +56,10 @@ pub struct ApiDiscoveryShared {
     pub shared_key: Mutex<Option<[u8; 32]>>,
     /// Partner (host) NAT candidates parsed as SocketAddr.
     pub partner_candidates: Mutex<Vec<SocketAddr>>,
+    /// Pre-bound UDP socket for hole punching (taken once by the connection flow).
+    pub punch_socket: Mutex<Option<UdpSocket>>,
+    /// Local candidates advertised to the API server (ip:port strings).
+    pub punch_candidates: Mutex<Vec<String>>,
     /// Whether the last API request succeeded.
     pub connected: AtomicBool,
 }
@@ -69,6 +73,8 @@ impl ApiDiscoveryShared {
             host: Mutex::new(None),
             shared_key: Mutex::new(None),
             partner_candidates: Mutex::new(Vec::new()),
+            punch_socket: Mutex::new(None),
+            punch_candidates: Mutex::new(Vec::new()),
             connected: AtomicBool::new(false),
         }
     }
@@ -79,6 +85,11 @@ impl ApiDiscoveryShared {
             .lock()
             .unwrap()
             .map(|key| Arc::new(CryptoContext::new(key, false)))
+    }
+
+    /// Take the pre-bound punch socket for use in hole punching (one-shot).
+    pub fn take_punch_socket(&self) -> Option<UdpSocket> {
+        self.punch_socket.lock().unwrap().take()
     }
 
     pub fn is_connected(&self) -> bool {
@@ -161,6 +172,31 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
         let peer_id = shared.peer_id.lock().unwrap().clone();
         let mut failures: u32 = 0;
 
+        // Bind a UDP socket for hole punching and gather local candidates.
+        let punch_port = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(sock) => {
+                let port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+                *shared.punch_socket.lock().unwrap() = Some(sock);
+                port
+            }
+            Err(e) => {
+                eprintln!("[api] Failed to bind punch socket: {e}");
+                0
+            }
+        };
+        // Gather local candidates + discover public IP via STUN on the punch socket.
+        let local_candidates = if punch_port > 0 {
+            let sock_guard = shared.punch_socket.lock().unwrap();
+            st_protocol::tunnel::gather_candidates_with_stun(
+                punch_port,
+                sock_guard.as_ref(),
+            )
+        } else {
+            Vec::new()
+        };
+        *shared.punch_candidates.lock().unwrap() = local_candidates.clone();
+        let cands_json = serde_json::to_string(&local_candidates).unwrap_or_else(|_| "[]".into());
+
         loop {
             let url = shared.api_url.lock().unwrap().clone();
             let token = shared.token.lock().unwrap().clone();
@@ -178,7 +214,7 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
 
             // 1. Register as client — this is the connectivity check.
             let reg_body =
-                format!(r#"{{"token":"{token}","role":"client","peer_id":"{peer_id}","candidates":[]}}"#);
+                format!(r#"{{"token":"{token}","role":"client","peer_id":"{peer_id}","candidates":{cands_json}}}"#);
             let ok = ureq::post(&format!("{url}/api/register"))
                 .set("Content-Type", "application/json")
                 .send_string(&reg_body)
@@ -236,7 +272,7 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
 
             // 3. Fetch candidates
             let cand_body =
-                format!(r#"{{"token":"{token}","role":"client","candidates":[]}}"#);
+                format!(r#"{{"token":"{token}","role":"client","candidates":{cands_json}}}"#);
             if let Ok(resp) = ureq::post(&format!("{url}/api/candidates"))
                 .set("Content-Type", "application/json")
                 .send_string(&cand_body)
@@ -257,7 +293,11 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
             }
 
             // 4. Poll session status for UI
-            let changed = match ureq::get(&format!("{url}/api/session/{token}")).call() {
+            let session_body = format!(r#"{{"token":"{token}"}}"#);
+            let changed = match ureq::post(&format!("{url}/api/session"))
+                .set("Content-Type", "application/json")
+                .send_string(&session_body)
+            {
                 Ok(resp) => {
                     if let Ok(text) = resp.into_string() {
                         parse_session_status(&shared, &text)

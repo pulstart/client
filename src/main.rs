@@ -2813,17 +2813,52 @@ fn run_connection(
         return;
     }
 
-    // Connect TCP with timeout
-    let mut tcp = match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(5)) {
+    // Try direct TCP first. If it fails and we have tunnel state, fall back to hole punch.
+    let tcp_timeout = if tunnel_crypto.is_some() { 3 } else { 5 };
+    let tcp_result = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(tcp_timeout));
+
+    let mut tcp = match tcp_result {
         Ok(s) => s,
-        Err(e) => {
+        Err(tcp_err) => {
+            // Check if we can fall back to hole punching.
+            let partner_cands: Vec<std::net::SocketAddr> =
+                api_discovery.partner_candidates.lock().unwrap().clone();
+            if tunnel_crypto.is_some() && !partner_cands.is_empty() {
+                eprintln!(
+                    "[connect] Direct TCP to {socket_addr} failed ({tcp_err}), attempting hole punch..."
+                );
+                // Delegate to the punched session path.
+                run_punched_session(
+                    partner_cands,
+                    tunnel_crypto.unwrap(),
+                    token,
+                    display_refresh_millihz,
+                    video_codec_support,
+                    excluded_video_codecs,
+                    state,
+                    frame_buf,
+                    debug_state,
+                    disconnect,
+                    connection_epoch,
+                    session_epoch,
+                    audio_enabled,
+                    debug_enabled,
+                    native_surfaces,
+                    shared_input,
+                    control_rx,
+                    input_rx,
+                    ctx,
+                    api_discovery,
+                );
+                return;
+            }
             set_error(
                 &state,
                 &ctx,
                 &disconnect,
                 &connection_epoch,
                 session_epoch,
-                format!("Connection failed: {e}"),
+                format!("Connection failed: {tcp_err}"),
             );
             return;
         }
@@ -3413,6 +3448,342 @@ fn run_connection(
             *s,
             ConnectionState::Error(_) | ConnectionState::Disconnected
         ) {
+            *s = ConnectionState::Disconnected;
+        }
+    }
+    ctx.request_repaint();
+}
+
+/// Run a full streaming session over a hole-punched UDP socket.
+/// Called when direct TCP connection fails but tunnel crypto + partner candidates are available.
+///
+/// Uses a loopback UDP bridge: a background thread reads from the PunchedSocket and
+/// forwards media packets into a local UDP socket that the existing `run_receive_pipeline`
+/// reads from. This avoids duplicating the decode/render pipeline.
+#[allow(clippy::too_many_arguments)]
+fn run_punched_session(
+    partner_candidates: Vec<std::net::SocketAddr>,
+    crypto: Arc<st_protocol::tunnel::CryptoContext>,
+    token: String,
+    display_refresh_millihz: Option<u32>,
+    video_codec_support: decode::VideoCodecSupportReport,
+    excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
+    state: Arc<Mutex<ConnectionState>>,
+    frame_buf: Arc<Mutex<VideoFrameBuffer>>,
+    debug_state: Arc<ConnectionDebugState>,
+    disconnect: Arc<AtomicBool>,
+    connection_epoch: Arc<AtomicU64>,
+    session_epoch: u64,
+    audio_enabled: Arc<AtomicBool>,
+    debug_enabled: Arc<AtomicBool>,
+    native_surfaces: Arc<NativeSurfaceControl>,
+    shared_input: Arc<SharedInputState>,
+    control_rx: crossbeam_channel::Receiver<ControlMessage>,
+    input_rx: crossbeam_channel::Receiver<InputPacket>,
+    ctx: egui::Context,
+    api_discovery: Arc<api_client::ApiDiscoveryShared>,
+) {
+    use st_protocol::reliable_udp::{PunchedMessage, PunchedSocket};
+
+    // Take the pre-bound punch socket from API discovery.
+    let socket = match api_discovery.take_punch_socket() {
+        Some(s) => s,
+        None => match std::net::UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(e) => {
+                set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch,
+                    format!("Failed to bind punch socket: {e}"));
+                return;
+            }
+        },
+    };
+
+    {
+        let mut s = state.lock().unwrap();
+        *s = ConnectionState::Connecting;
+    }
+    ctx.request_repaint();
+
+    eprintln!("[punch] Attempting hole punch to {} candidates...", partner_candidates.len());
+    let peer = match st_protocol::tunnel::hole_punch(
+        &socket,
+        &partner_candidates,
+        &crypto,
+        Duration::from_secs(10),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch,
+                format!("Hole punch failed: {e}"));
+            return;
+        }
+    };
+    eprintln!("[punch] Success! Server confirmed at {peer}");
+
+    let punched = Arc::new(PunchedSocket::new(socket, peer, crypto));
+    let _ = punched.set_read_timeout(Some(Duration::from_millis(100)));
+
+    // --- Authentication ---
+    let auth_data = ControlMessage::Authenticate(token).serialize();
+    if let Err(e) = punched.send_control(&auth_data) {
+        set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch,
+            format!("Failed to send auth: {e}"));
+        return;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut authenticated = false;
+    while Instant::now() < deadline {
+        punched.tick();
+        if let Some(PunchedMessage::Control(data)) = punched.try_recv() {
+            if let Some((ControlMessage::AuthResult(ok), _)) = ControlMessage::deserialize(&data) {
+                if ok {
+                    authenticated = true;
+                } else {
+                    set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch,
+                        "Authentication failed. Check your token.".into());
+                    return;
+                }
+                break;
+            }
+        }
+    }
+    if !authenticated {
+        set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch,
+            "Authentication timeout over punched connection".into());
+        return;
+    }
+    eprintln!("[punch] Authenticated");
+
+    // --- Send ClientDisplayInfo ---
+    let excluded = *excluded_video_codecs.lock().unwrap();
+    let effective_supported = video_codec_support.supported.subtract(excluded);
+    let effective_hardware = video_codec_support.hardware.subtract(excluded);
+    let display_info = st_protocol::ClientDisplayInfo {
+        max_refresh_millihz: display_refresh_millihz.unwrap_or(0),
+        udp_port: 0, // Not used for punched connections.
+        supported_video_codecs: effective_supported,
+        hardware_video_codecs: effective_hardware,
+    };
+    let _ = punched.send_control(&ControlMessage::ClientDisplayInfo(display_info).serialize());
+
+    // --- Wait for StreamConfig and startup bundle ---
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stream_config: Option<st_protocol::StreamConfig> = None;
+    while Instant::now() < deadline {
+        punched.tick();
+        if let Some(PunchedMessage::Control(data)) = punched.try_recv() {
+            let mut offset = 0;
+            while let Some((msg, used)) = ControlMessage::deserialize(&data[offset..]) {
+                offset += used;
+                match msg {
+                    ControlMessage::StreamConfig(cfg) => {
+                        shared_input.set_stream_config(cfg);
+                        stream_config = Some(cfg);
+                    }
+                    ControlMessage::SessionDebugInfo(info) => {
+                        debug_state.set_session_info(info);
+                    }
+                    ControlMessage::InputSession(session) => {
+                        shared_input.set_client_id(session.client_id);
+                    }
+                    ControlMessage::InputCapabilities(caps) => {
+                        shared_input.set_capabilities(caps);
+                    }
+                    ControlMessage::ControllerState(cs) => {
+                        shared_input.set_controller_state(cs);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if stream_config.is_some() {
+            break;
+        }
+    }
+    let stream_config = match stream_config {
+        Some(cfg) => cfg,
+        None => {
+            set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch,
+                "Timeout waiting for StreamConfig from server".into());
+            return;
+        }
+    };
+
+    // --- Send ClientReadyForMedia ---
+    let _ = punched.send_control(&ControlMessage::ClientReadyForMedia.serialize());
+
+    // Wait for StreamStarted.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        punched.tick();
+        if let Some(PunchedMessage::Control(data)) = punched.try_recv() {
+            if let Some((ControlMessage::StreamStarted, _)) = ControlMessage::deserialize(&data) {
+                break;
+            }
+        }
+    }
+
+    eprintln!("[punch] Stream started, setting up media bridge");
+
+    // --- Loopback UDP bridge ---
+    // Create a local UDP socket pair. The bridge thread reads media packets from the
+    // PunchedSocket and sends them to the loopback socket. The existing pipeline reads
+    // from the loopback socket as if it were a normal UDP receiver.
+    let loopback_recv = match std::net::UdpSocket::bind("127.0.0.1:0") {
+        Ok(s) => s,
+        Err(e) => {
+            set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch,
+                format!("Failed to bind loopback socket: {e}"));
+            return;
+        }
+    };
+    let loopback_addr = loopback_recv.local_addr().unwrap();
+    let loopback_send = match std::net::UdpSocket::bind("127.0.0.1:0") {
+        Ok(s) => s,
+        Err(e) => {
+            set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch,
+                format!("Failed to bind loopback sender: {e}"));
+            return;
+        }
+    };
+
+    // Bridge thread: PunchedSocket → loopback, plus control message handling.
+    let bridge_running = Arc::new(AtomicBool::new(true));
+    let bridge_running_clone = Arc::clone(&bridge_running);
+    let punched_bridge = Arc::clone(&punched);
+    let shared_input_bridge = Arc::clone(&shared_input);
+    let ctx_bridge = ctx.clone();
+    let bridge_thread = std::thread::spawn(move || {
+        let _ = punched_bridge.set_nonblocking(false);
+        let _ = punched_bridge.set_read_timeout(Some(Duration::from_millis(10)));
+        while bridge_running_clone.load(Ordering::Relaxed) {
+            punched_bridge.tick();
+            match punched_bridge.try_recv() {
+                Some(PunchedMessage::Media(data)) => {
+                    let _ = loopback_send.send_to(&data, loopback_addr);
+                }
+                Some(PunchedMessage::Control(data)) => {
+                    let mut offset = 0;
+                    while let Some((msg, used)) = ControlMessage::deserialize(&data[offset..]) {
+                        offset += used;
+                        match msg {
+                            ControlMessage::CursorShape(shape) => {
+                                shared_input_bridge.set_cursor_shape(shape);
+                                ctx_bridge.request_repaint();
+                            }
+                            ControlMessage::CursorState(cs) => {
+                                shared_input_bridge.set_cursor_state(cs);
+                                ctx_bridge.request_repaint();
+                            }
+                            ControlMessage::ControllerState(cs) => {
+                                shared_input_bridge.set_controller_state(cs);
+                                ctx_bridge.request_repaint();
+                            }
+                            ControlMessage::InputCapabilities(caps) => {
+                                shared_input_bridge.set_capabilities(caps);
+                            }
+                            ControlMessage::Shutdown | ControlMessage::Error(_) => {
+                                bridge_running_clone.store(false, Ordering::Relaxed);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+    });
+
+    // --- Set Connected state ---
+    {
+        let mut s = state.lock().unwrap();
+        *s = ConnectionState::Connected;
+    }
+    ctx.request_repaint();
+
+    // --- Start media threads using the loopback socket ---
+    // The loopback socket receives unencrypted media packets from the bridge,
+    // so no crypto is needed on the pipeline side.
+    // Use a dummy input_rx for media threads — input goes through the punched socket instead.
+    let (pipeline_control_tx, pipeline_control_rx) = crossbeam_channel::bounded::<ControlMessage>(8);
+    let (_dummy_input_tx, dummy_input_rx) = crossbeam_channel::bounded::<InputPacket>(1);
+    set_udp_recv_buffer(&loopback_recv, 4 * 1024 * 1024);
+    let media = match start_media_threads(
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 1),
+        Arc::clone(&frame_buf),
+        Arc::clone(&debug_state),
+        Arc::clone(&debug_enabled),
+        ctx.clone(),
+        display_refresh_millihz,
+        Arc::clone(&audio_enabled),
+        Arc::clone(&native_surfaces),
+        pipeline_control_tx,
+        dummy_input_rx, // Dummy — input goes through punched socket
+        stream_config,
+        loopback_recv,
+        None, // No crypto — loopback is plaintext
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            bridge_running.store(false, Ordering::Relaxed);
+            let _ = bridge_thread.join();
+            set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch, e);
+            return;
+        }
+    };
+
+    // --- Control + input forwarding loop ---
+    // The input sender thread from start_media_threads sends to `peer` which won't work
+    // for punched connections. Override: forward input from control_rx to punched socket.
+    // The media thread's input sender will fail silently (sends to peer directly, which is fine
+    // as the packets arrive at the punched socket bridge). Actually, the input sender sends to
+    // `peer` address using the cloned loopback socket — those packets go nowhere useful.
+    // We need to separately forward input to the punched socket.
+    // For simplicity: drain control_rx and forward, and periodically send feedback.
+
+    let mut input_seq: u16 = 0;
+    loop {
+        if session_cancelled(disconnect.as_ref(), connection_epoch.as_ref(), session_epoch) {
+            break;
+        }
+        if !bridge_running.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Forward input from UI thread to server via punched socket media channel.
+        while let Ok(input_pkt) = input_rx.try_recv() {
+            let serialized = input_pkt.serialize(input_seq);
+            input_seq = input_seq.wrapping_add(1);
+            let _ = punched.send_media(&serialized);
+        }
+
+        // Forward outgoing control messages to punched socket.
+        while let Ok(ctrl) = control_rx.try_recv() {
+            let _ = punched.send_control(&ctrl.serialize());
+        }
+
+        // Forward transport feedback.
+        while let Ok(fb) = media.feedback_rx.try_recv() {
+            let _ = punched.send_control(&ControlMessage::TransportFeedback(fb).serialize());
+        }
+
+        // Forward pipeline control messages (keyframe requests, etc.)
+        while let Ok(ctrl) = pipeline_control_rx.try_recv() {
+            let _ = punched.send_control(&ctrl.serialize());
+        }
+
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // Cleanup.
+    bridge_running.store(false, Ordering::Relaxed);
+    stop_media_threads(media);
+    let _ = bridge_thread.join();
+
+    {
+        let mut s = state.lock().unwrap();
+        if !matches!(*s, ConnectionState::Error(_) | ConnectionState::Disconnected) {
             *s = ConnectionState::Disconnected;
         }
     }
