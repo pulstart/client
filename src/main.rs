@@ -199,9 +199,7 @@ fn default_menu_button_pos() -> egui::Pos2 {
     egui::pos2(FLOATING_MENU_BUTTON_MARGIN, FLOATING_MENU_BUTTON_MARGIN)
 }
 
-fn default_server_addr() -> String {
-    format!("127.0.0.1:{DEFAULT_APP_PORT}")
-}
+
 
 fn normalize_server_addr(input: &str) -> String {
     let trimmed = input.trim();
@@ -230,18 +228,7 @@ fn normalize_server_addr(input: &str) -> String {
     format!("{trimmed}:{DEFAULT_APP_PORT}")
 }
 
-fn load_last_server() -> Option<String> {
-    std::fs::read_to_string(state_dir().join("last_server"))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
 
-fn save_last_server(addr: &str) {
-    let dir = state_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join("last_server"), addr);
-}
 
 fn load_audio_enabled() -> bool {
     std::fs::read_to_string(state_dir().join("audio_enabled"))
@@ -280,6 +267,36 @@ fn save_token(token: &str) {
     let dir = state_dir();
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join("token"), token);
+}
+
+fn load_or_create_peer_id() -> String {
+    let path = state_dir().join("peer_id");
+    if let Ok(id) = std::fs::read_to_string(&path) {
+        let id = id.trim().to_string();
+        if !id.is_empty() {
+            return id;
+        }
+    }
+    // Generate and persist a new one.
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let s = RandomState::new();
+    let mut h = s.build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    let a = h.finish();
+    let mut h2 = s.build_hasher();
+    h2.write_u64(a ^ 0xdeadbeef);
+    let b = h2.finish();
+    let id = format!("{a:016x}{b:016x}");
+    let dir = state_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&path, &id);
+    id
 }
 
 /// Hardcoded API server URL. Override at build time or via ST_API_URL env var.
@@ -340,8 +357,7 @@ fn save_server_list(list: &[ServerEntry]) {
     }
 }
 
-/// Ensure the last-connected server is in the list and migrate the legacy
-/// `last_server` file if the list is empty.
+/// Ensure the given address is in the server list.
 fn ensure_server_in_list(list: &mut Vec<ServerEntry>, addr: &str) {
     let normalized = normalize_server_addr(addr);
     if normalized.is_empty() {
@@ -484,13 +500,7 @@ fn start_discovery_listener(
 
 impl StreamApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let saved = load_last_server().unwrap_or_else(default_server_addr);
-        let mut server_list = load_server_list();
-        // Migrate legacy last_server into the list
-        if server_list.is_empty() && !saved.trim().is_empty() {
-            ensure_server_in_list(&mut server_list, &saved);
-            save_server_list(&server_list);
-        }
+        let server_list = load_server_list();
         let token = load_token();
         let audio = load_audio_enabled();
         let debug_enabled = load_debug_enabled();
@@ -514,13 +524,15 @@ impl StreamApp {
         ));
         let discovered_servers = Arc::new(Mutex::new(Vec::<DiscoveredServer>::new()));
         start_discovery_listener(Arc::clone(&discovered_servers), cc.egui_ctx.clone());
+        let peer_id = load_or_create_peer_id();
         let api_discovery = Arc::new(api_client::ApiDiscoveryShared::new(
             resolve_api_url(),
             token.clone(),
+            peer_id,
         ));
         api_client::start_api_discovery(Arc::clone(&api_discovery), cc.egui_ctx.clone());
         Self {
-            server_addr: saved,
+            server_addr: String::new(),
             server_list,
             add_server_addr: String::new(),
             search_query: String::new(),
@@ -579,7 +591,6 @@ impl StreamApp {
 
     fn connect(&mut self, ctx: egui::Context) {
         let saved_addr = self.server_addr.trim().to_string();
-        save_last_server(&saved_addr);
         touch_server_connected(&mut self.server_list, &saved_addr);
 
         self.disconnect_flag.store(true, Ordering::SeqCst);
@@ -1947,13 +1958,14 @@ impl StreamApp {
             .collect();
         let lan_addrs: Vec<String> = lan_servers.iter().map(|d| d.address.clone()).collect();
 
-        // Collect API-discovered host candidates.
+        // Collect API-discovered host: best candidate (already sorted local-first) + hostname.
         let api_host = self.api_discovery.host.lock().unwrap().clone();
-        let api_candidates: Vec<String> = api_host
+        let api_best: Option<(String, Option<String>)> = api_host
             .as_ref()
             .filter(|h| !h.candidates.is_empty() && h.last_seen.elapsed() < Duration::from_secs(15))
-            .map(|h| h.candidates.clone())
-            .unwrap_or_default();
+            .map(|h| (h.candidates[0].clone(), h.hostname.clone()));
+        // For the empty-check below.
+        let api_candidates: Vec<String> = api_best.iter().map(|(a, _)| a.clone()).collect();
 
         // Merged entry for rendering.
         struct MergedServer {
@@ -1961,6 +1973,7 @@ impl StreamApp {
             display_name: String,
             subtitle: String,
             is_lan: bool,
+            is_dynamic: bool, // LAN or API discovered — don't allow delete
             saved_idx: Option<usize>,
             icon_active: bool,
         }
@@ -1975,9 +1988,11 @@ impl StreamApp {
                 .last_connected
                 .cmp(&self.server_list[a].last_connected)
         });
+        let api_addr = api_best.as_ref().map(|(a, _)| a.clone());
         for idx in &indices {
             let entry = &self.server_list[*idx];
             let is_lan = lan_addrs.contains(&entry.address);
+            let is_api = api_addr.as_deref() == Some(entry.address.as_str());
             let display_name = if entry.nickname.is_empty() {
                 entry.address.clone()
             } else {
@@ -1994,8 +2009,9 @@ impl StreamApp {
                 display_name,
                 subtitle,
                 is_lan,
+                is_dynamic: is_lan || is_api,
                 saved_idx: Some(*idx),
-                icon_active: entry.last_connected > 0 || is_lan,
+                icon_active: entry.last_connected > 0 || is_lan || is_api,
             });
         }
 
@@ -2008,21 +2024,24 @@ impl StreamApp {
                     display_name: srv.hostname.clone(),
                     subtitle: truncate_str(&srv.address, 24).to_string(),
                     is_lan: true,
+                    is_dynamic: true,
                     saved_idx: None,
                     icon_active: true,
                 });
             }
         }
 
-        // 3) API-discovered candidates not already shown.
-        for addr in &api_candidates {
+        // 3) API-discovered best candidate (not already shown).
+        if let Some((ref addr, ref hostname)) = api_best {
             if !seen_addrs.contains(addr) {
                 seen_addrs.push(addr.clone());
+                let name = hostname.as_deref().unwrap_or(addr.as_str());
                 merged.push(MergedServer {
                     address: addr.clone(),
-                    display_name: addr.clone(),
-                    subtitle: String::new(),
+                    display_name: name.to_string(),
+                    subtitle: if hostname.is_some() { addr.clone() } else { String::new() },
                     is_lan: false,
+                    is_dynamic: true,
                     saved_idx: None,
                     icon_active: true,
                 });
@@ -2172,8 +2191,8 @@ impl StreamApp {
                             save_server_list(&self.server_list);
                         }
 
-                        // Delete X in top-right corner (only for saved servers)
-                        if let Some(saved) = srv.saved_idx {
+                        // Delete X in top-right corner (only for saved, non-dynamic servers)
+                        if let Some(saved) = srv.saved_idx.filter(|_| !srv.is_dynamic) {
                             let x_rect = egui::Rect::from_min_size(
                                 egui::pos2(card_rect.right() - 22.0, card_rect.top() + 4.0),
                                 egui::vec2(18.0, 18.0),
@@ -4305,6 +4324,10 @@ fn render_debug_overlay(
 // ---------------------------------------------------------------------------
 
 impl eframe::App for StreamApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        api_client::unregister(&self.api_discovery);
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.process_update_events();
         let state = self.state.lock().unwrap().clone();

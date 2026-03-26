@@ -4,19 +4,53 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const API_EXPIRY: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug)]
 pub struct ApiDiscoveredHost {
-    /// Address candidates advertised by the host via the API server.
+    /// Address candidates advertised by the host, sorted: local first, then VPN, then public.
     pub candidates: Vec<String>,
+    /// Hostname reported by the host.
+    pub hostname: Option<String>,
     pub last_seen: Instant,
+}
+
+/// Sort candidates: private LAN first (192.168/172.16-31), then VPN/CGNAT (10.x/100.64-127),
+/// then everything else (public).
+fn sort_candidates(candidates: &mut [String]) {
+    fn priority(addr: &str) -> u8 {
+        let ip_part = addr.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(addr);
+        if let Ok(ip) = ip_part.parse::<std::net::Ipv4Addr>() {
+            let o = ip.octets();
+            // 192.168.x.x or 172.16-31.x.x — local LAN
+            if o[0] == 192 && o[1] == 168 {
+                return 0;
+            }
+            if o[0] == 172 && (16..=31).contains(&o[1]) {
+                return 0;
+            }
+            // 10.x.x.x or 100.64-127.x.x — VPN / CGNAT
+            if o[0] == 10 {
+                return 1;
+            }
+            if o[0] == 100 && (64..=127).contains(&o[1]) {
+                return 1;
+            }
+            // 169.254.x.x — link-local
+            if o[0] == 169 && o[1] == 254 {
+                return 2;
+            }
+        }
+        // Public or unknown
+        3
+    }
+    candidates.sort_by_key(|c| priority(c));
 }
 
 /// Shared state between the API discovery thread and the UI / connection flow.
 pub struct ApiDiscoveryShared {
     pub api_url: Mutex<String>,
     pub token: Mutex<String>,
+    pub peer_id: Mutex<String>,
     pub host: Mutex<Option<ApiDiscoveredHost>>,
     /// Derived ChaCha20 shared key (set once key exchange completes).
     pub shared_key: Mutex<Option<[u8; 32]>>,
@@ -27,10 +61,11 @@ pub struct ApiDiscoveryShared {
 }
 
 impl ApiDiscoveryShared {
-    pub fn new(api_url: String, token: String) -> Self {
+    pub fn new(api_url: String, token: String, peer_id: String) -> Self {
         Self {
             api_url: Mutex::new(api_url),
             token: Mutex::new(token),
+            peer_id: Mutex::new(peer_id),
             host: Mutex::new(None),
             shared_key: Mutex::new(None),
             partner_candidates: Mutex::new(Vec::new()),
@@ -123,6 +158,7 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
         let keys = TunnelKeys::generate();
         let pub_key_b64 = base64_encode(&keys.public_key_bytes());
         let keys = Mutex::new(Some(keys));
+        let peer_id = shared.peer_id.lock().unwrap().clone();
         let mut failures: u32 = 0;
 
         loop {
@@ -142,7 +178,7 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
 
             // 1. Register as client — this is the connectivity check.
             let reg_body =
-                format!(r#"{{"token":"{token}","role":"client","candidates":[]}}"#);
+                format!(r#"{{"token":"{token}","role":"client","peer_id":"{peer_id}","candidates":[]}}"#);
             let ok = ureq::post(&format!("{url}/api/register"))
                 .set("Content-Type", "application/json")
                 .send_string(&reg_body)
@@ -162,6 +198,9 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
             }
 
             // Connected.
+            if failures > 0 || !shared.is_connected() {
+                eprintln!("[api] Connected to API server");
+            }
             failures = 0;
             let was_disconnected = !shared.connected.swap(true, Ordering::Relaxed);
             if was_disconnected {
@@ -223,10 +262,11 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
                     if let Ok(text) = resp.into_string() {
                         parse_session_status(&shared, &text)
                     } else {
-                        expire_stale(&shared)
+                        clear_host(&shared)
                     }
                 }
-                Err(_) => expire_stale(&shared),
+                // 404 (session not found) or any error — no host.
+                Err(_) => clear_host(&shared),
             };
 
             if changed {
@@ -247,14 +287,14 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
 
 fn parse_session_status(shared: &ApiDiscoveryShared, json: &str) -> bool {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
-        return expire_stale(shared);
+        return clear_host(shared);
     };
 
     let host_joined = v["host_joined"].as_bool().unwrap_or(false);
 
     let mut h = shared.host.lock().unwrap();
     if host_joined {
-        let candidates: Vec<String> = v["host_candidates"]
+        let mut candidates: Vec<String> = v["host_candidates"]
             .as_array()
             .map(|arr| {
                 arr.iter()
@@ -262,10 +302,14 @@ fn parse_session_status(shared: &ApiDiscoveryShared, json: &str) -> bool {
                     .collect()
             })
             .unwrap_or_default();
+        sort_candidates(&mut candidates);
+
+        let hostname = v["host_hostname"].as_str().map(String::from);
 
         let was_none = h.is_none();
         *h = Some(ApiDiscoveredHost {
             candidates,
+            hostname,
             last_seen: Instant::now(),
         });
         was_none
@@ -276,12 +320,26 @@ fn parse_session_status(shared: &ApiDiscoveryShared, json: &str) -> bool {
     }
 }
 
-fn expire_stale(shared: &ApiDiscoveryShared) -> bool {
+/// Call on app exit to unregister from the API server.
+pub fn unregister(shared: &ApiDiscoveryShared) {
+    let url = shared.api_url.lock().unwrap().clone();
+    let token = shared.token.lock().unwrap().clone();
+    let peer_id = shared.peer_id.lock().unwrap().clone();
+    if url.is_empty() || token.is_empty() {
+        return;
+    }
+    let body = format!(r#"{{"token":"{token}","role":"client","peer_id":"{peer_id}"}}"#);
+    let _ = ureq::post(&format!("{url}/api/unregister"))
+        .set("Content-Type", "application/json")
+        .send_string(&body);
+    shared.connected.store(false, Ordering::Relaxed);
+    eprintln!("[api] Unregistered from API server");
+}
+
+/// Immediately clear the host entry. Returns true if state changed.
+fn clear_host(shared: &ApiDiscoveryShared) -> bool {
     let mut h = shared.host.lock().unwrap();
-    if h.as_ref()
-        .map(|host| host.last_seen.elapsed() > API_EXPIRY)
-        .unwrap_or(false)
-    {
+    if h.is_some() {
         *h = None;
         true
     } else {
