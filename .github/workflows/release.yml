@@ -107,7 +107,11 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install ffmpeg opus pkg-config
-          echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg)/lib/pkgconfig:$(brew --prefix opus)/lib/pkgconfig:${PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+          FFMPEG_PREFIX="$(brew --prefix ffmpeg)"
+          OPUS_PREFIX="$(brew --prefix opus)"
+          echo "PKG_CONFIG_PATH=${FFMPEG_PREFIX}/lib/pkgconfig:${OPUS_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+          echo "FFMPEG_DIR=${FFMPEG_PREFIX}" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=${FFMPEG_PREFIX}/lib:${OPUS_PREFIX}/lib:${LIBRARY_PATH}" >> "$GITHUB_ENV"
 
       # --- Windows: pre-built FFmpeg + vcpkg for opus only ---
 
