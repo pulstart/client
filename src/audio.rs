@@ -58,7 +58,17 @@ pub fn run_audio_pipeline(
         .build_output_stream(
             &config,
             move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                let mut buf = ring_cb.lock().unwrap();
+                // Use try_lock to avoid blocking the real-time audio thread.
+                // If the decode thread holds the lock, repeat the last sample.
+                let mut buf = match ring_cb.try_lock() {
+                    Ok(b) => b,
+                    Err(_) => {
+                        for sample in output.iter_mut() {
+                            *sample = 0.0;
+                        }
+                        return;
+                    }
+                };
                 if !buf.primed && buf.samples.len() >= TARGET_BUFFER_SAMPLES {
                     buf.primed = true;
                 }

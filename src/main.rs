@@ -2987,8 +2987,15 @@ fn run_connection(
             codec_support_summary(video_codec_support.hardware)
         );
     }
-    let excluded = *excluded_video_codecs.lock().unwrap();
-    let effective_supported = video_codec_support.supported.subtract(excluded);
+    let mut excluded = *excluded_video_codecs.lock().unwrap();
+    let mut effective_supported = video_codec_support.supported.subtract(excluded);
+    // If all supported codecs are excluded, reset the blacklist so we can retry.
+    if effective_supported.is_empty() && !excluded.is_empty() {
+        eprintln!("[codec] all codecs excluded — resetting blacklist to retry");
+        *excluded_video_codecs.lock().unwrap() = st_protocol::VideoCodecSupport::empty();
+        excluded = st_protocol::VideoCodecSupport::empty();
+        effective_supported = video_codec_support.supported;
+    }
     let effective_hardware = video_codec_support.hardware.subtract(excluded);
     if !excluded.is_empty() {
         eprintln!(
@@ -3556,8 +3563,14 @@ fn run_punched_session(
     eprintln!("[punch] Authenticated");
 
     // --- Send ClientDisplayInfo ---
-    let excluded = *excluded_video_codecs.lock().unwrap();
-    let effective_supported = video_codec_support.supported.subtract(excluded);
+    let mut excluded = *excluded_video_codecs.lock().unwrap();
+    let mut effective_supported = video_codec_support.supported.subtract(excluded);
+    if effective_supported.is_empty() && !excluded.is_empty() {
+        eprintln!("[codec] all codecs excluded — resetting blacklist to retry");
+        *excluded_video_codecs.lock().unwrap() = st_protocol::VideoCodecSupport::empty();
+        excluded = st_protocol::VideoCodecSupport::empty();
+        effective_supported = video_codec_support.supported;
+    }
     let effective_hardware = video_codec_support.hardware.subtract(excluded);
     let display_info = st_protocol::ClientDisplayInfo {
         max_refresh_millihz: display_refresh_millihz.unwrap_or(0),
@@ -3657,40 +3670,51 @@ fn run_punched_session(
     let bridge_thread = std::thread::spawn(move || {
         let _ = punched_bridge.set_nonblocking(false);
         let _ = punched_bridge.set_read_timeout(Some(Duration::from_millis(10)));
+        // Ensure bridge_running is set to false when this thread exits for ANY reason
+        // (panic, error, or clean shutdown) so the main loop does not spin.
+        struct BridgeGuard(Arc<AtomicBool>);
+        impl Drop for BridgeGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Relaxed);
+            }
+        }
+        let _guard = BridgeGuard(Arc::clone(&bridge_running_clone));
+
         while bridge_running_clone.load(Ordering::Relaxed) {
             punched_bridge.tick();
-            match punched_bridge.try_recv() {
-                Some(PunchedMessage::Media(data)) => {
-                    let _ = loopback_send.send_to(&data, loopback_addr);
-                }
-                Some(PunchedMessage::Control(data)) => {
-                    let mut offset = 0;
-                    while let Some((msg, used)) = ControlMessage::deserialize(&data[offset..]) {
-                        offset += used;
-                        match msg {
-                            ControlMessage::CursorShape(shape) => {
-                                shared_input_bridge.set_cursor_shape(shape);
-                                ctx_bridge.request_repaint();
+            for msg in punched_bridge.try_recv_all() {
+                match msg {
+                    PunchedMessage::Media(data) => {
+                        let _ = loopback_send.send_to(&data, loopback_addr);
+                    }
+                    PunchedMessage::Control(data) => {
+                        let mut offset = 0;
+                        while let Some((msg, used)) = ControlMessage::deserialize(&data[offset..]) {
+                            offset += used;
+                            match msg {
+                                ControlMessage::CursorShape(shape) => {
+                                    shared_input_bridge.set_cursor_shape(shape);
+                                    ctx_bridge.request_repaint();
+                                }
+                                ControlMessage::CursorState(cs) => {
+                                    shared_input_bridge.set_cursor_state(cs);
+                                    ctx_bridge.request_repaint();
+                                }
+                                ControlMessage::ControllerState(cs) => {
+                                    shared_input_bridge.set_controller_state(cs);
+                                    ctx_bridge.request_repaint();
+                                }
+                                ControlMessage::InputCapabilities(caps) => {
+                                    shared_input_bridge.set_capabilities(caps);
+                                }
+                                ControlMessage::Shutdown | ControlMessage::Error(_) => {
+                                    bridge_running_clone.store(false, Ordering::Relaxed);
+                                }
+                                _ => {}
                             }
-                            ControlMessage::CursorState(cs) => {
-                                shared_input_bridge.set_cursor_state(cs);
-                                ctx_bridge.request_repaint();
-                            }
-                            ControlMessage::ControllerState(cs) => {
-                                shared_input_bridge.set_controller_state(cs);
-                                ctx_bridge.request_repaint();
-                            }
-                            ControlMessage::InputCapabilities(caps) => {
-                                shared_input_bridge.set_capabilities(caps);
-                            }
-                            ControlMessage::Shutdown | ControlMessage::Error(_) => {
-                                bridge_running_clone.store(false, Ordering::Relaxed);
-                            }
-                            _ => {}
                         }
                     }
                 }
-                None => {}
             }
         }
     });
@@ -3743,6 +3767,8 @@ fn run_punched_session(
     // For simplicity: drain control_rx and forward, and periodically send feedback.
 
     let mut input_seq: u16 = 0;
+    let mut mouse_heartbeat = MouseInputHeartbeat::default();
+    let mut keyboard_heartbeat = KeyboardInputHeartbeat::default();
     loop {
         if session_cancelled(disconnect.as_ref(), connection_epoch.as_ref(), session_epoch) {
             break;
@@ -3752,8 +3778,24 @@ fn run_punched_session(
         }
 
         // Forward input from UI thread to server via punched socket media channel.
+        let now = Instant::now();
         while let Ok(input_pkt) = input_rx.try_recv() {
+            mouse_heartbeat.observe(input_pkt, now);
+            keyboard_heartbeat.observe(input_pkt, now);
             let serialized = input_pkt.serialize(input_seq);
+            input_seq = input_seq.wrapping_add(1);
+            let _ = punched.send_media(&serialized);
+            mouse_heartbeat.mark_sent(input_pkt, now);
+            keyboard_heartbeat.mark_sent(input_pkt, now);
+        }
+        // Heartbeat retransmission for button/key state repair over lossy UDP.
+        if let Some(pkt) = mouse_heartbeat.due_packet(now) {
+            let serialized = pkt.serialize(input_seq);
+            input_seq = input_seq.wrapping_add(1);
+            let _ = punched.send_media(&serialized);
+        }
+        if let Some(pkt) = keyboard_heartbeat.due_packet(now) {
+            let serialized = pkt.serialize(input_seq);
             input_seq = input_seq.wrapping_add(1);
             let _ = punched.send_media(&serialized);
         }

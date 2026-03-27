@@ -195,7 +195,6 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
             Vec::new()
         };
         *shared.punch_candidates.lock().unwrap() = local_candidates.clone();
-        let cands_json = serde_json::to_string(&local_candidates).unwrap_or_else(|_| "[]".into());
 
         loop {
             let url = shared.api_url.lock().unwrap().clone();
@@ -213,8 +212,12 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
             }
 
             // 1. Register as client — this is the connectivity check.
-            let reg_body =
-                format!(r#"{{"token":"{token}","role":"client","peer_id":"{peer_id}","candidates":{cands_json}}}"#);
+            let reg_body = serde_json::json!({
+                "token": token,
+                "role": "client",
+                "peer_id": peer_id,
+                "candidates": local_candidates,
+            }).to_string();
             let ok = ureq::post(&format!("{url}/api/register"))
                 .set("Content-Type", "application/json")
                 .send_string(&reg_body)
@@ -244,9 +247,11 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
             }
 
             // 2. Upload our public key and try to get host's key
-            let key_body = format!(
-                r#"{{"token":"{token}","role":"client","public_key":"{pub_key_b64}"}}"#,
-            );
+            let key_body = serde_json::json!({
+                "token": token,
+                "role": "client",
+                "public_key": pub_key_b64,
+            }).to_string();
             if let Ok(resp) = ureq::post(&format!("{url}/api/key"))
                 .set("Content-Type", "application/json")
                 .send_string(&key_body)
@@ -271,8 +276,11 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
             }
 
             // 3. Fetch candidates
-            let cand_body =
-                format!(r#"{{"token":"{token}","role":"client","candidates":{cands_json}}}"#);
+            let cand_body = serde_json::json!({
+                "token": token,
+                "role": "client",
+                "candidates": local_candidates,
+            }).to_string();
             if let Ok(resp) = ureq::post(&format!("{url}/api/candidates"))
                 .set("Content-Type", "application/json")
                 .send_string(&cand_body)
