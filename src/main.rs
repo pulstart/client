@@ -2783,7 +2783,7 @@ fn run_connection(
     ctx: egui::Context,
     api_discovery: Arc<api_client::ApiDiscoveryShared>,
 ) {
-    let tunnel_crypto = api_discovery.crypto_context();
+    let punched_crypto = api_discovery.crypto_context();
 
     if session_cancelled(
         disconnect.as_ref(),
@@ -2818,7 +2818,7 @@ fn run_connection(
     }
 
     // Try direct TCP first. If it fails and we have tunnel state, fall back to hole punch.
-    let tcp_timeout = if tunnel_crypto.is_some() { 3 } else { 5 };
+    let tcp_timeout = if punched_crypto.is_some() { 3 } else { 5 };
     let tcp_result = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(tcp_timeout));
 
     let mut tcp = match tcp_result {
@@ -2827,14 +2827,14 @@ fn run_connection(
             // Check if we can fall back to hole punching.
             let partner_cands: Vec<std::net::SocketAddr> =
                 api_discovery.partner_candidates.lock().unwrap().clone();
-            if tunnel_crypto.is_some() && !partner_cands.is_empty() {
+            if punched_crypto.is_some() && !partner_cands.is_empty() {
                 eprintln!(
                     "[connect] Direct TCP to {socket_addr} failed ({tcp_err}), attempting hole punch..."
                 );
                 // Delegate to the punched session path.
                 run_punched_session(
                     partner_cands,
-                    tunnel_crypto.unwrap(),
+                    punched_crypto.unwrap(),
                     token,
                     display_refresh_millihz,
                     video_codec_support,
@@ -3088,7 +3088,7 @@ fn run_connection(
                                     input_rx.take().expect("input receiver already taken"),
                                     cfg,
                                     udp_socket.take().expect("udp socket already taken"),
-                                    tunnel_crypto.clone(),
+                                    None,
                                 ) {
                                     Ok(media) => media,
                                     Err(err) => {
