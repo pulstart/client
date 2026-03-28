@@ -63,6 +63,7 @@ pub fn run_receive_pipeline(
     shutdown_rx: Receiver<()>,
     audio_tx: Sender<AudioPacket>,
     feedback_tx: Sender<TransportFeedback>,
+    decode_started_tx: Sender<()>,
     audio_enabled: Arc<AtomicBool>,
     native_surfaces: Arc<NativeSurfaceControl>,
     control_tx: Sender<ControlMessage>,
@@ -217,6 +218,7 @@ pub fn run_receive_pipeline(
                 }
 
                 if produced_frame {
+                    let _ = decode_started_tx.try_send(());
                     decoded_frame.debug_timing = latest_timing;
                     if debug_enabled.load(Ordering::Relaxed) {
                         if let Some(timing) = decoded_frame.debug_timing.as_ref() {

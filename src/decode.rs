@@ -305,6 +305,7 @@ impl VideoDecoder {
 
     fn new_internal(codec: VideoCodec, verbose: bool) -> Result<Self, String> {
         ffmpeg::init().map_err(|e| format!("ffmpeg init: {e}"))?;
+        let test_bitstream = generate_test_bitstream(codec).ok();
 
         // 1. User override
         if let Some(hint) = decoder_hint(codec) {
@@ -331,7 +332,7 @@ impl VideoDecoder {
             if verbose {
                 eprintln!("[decode] probing {}...", probe_step_name(step));
             }
-            match Self::try_probe_step(codec, step) {
+            match Self::try_validated_probe_step(codec, step, test_bitstream.as_deref()) {
                 Ok(d) => {
                     if verbose {
                         eprintln!("[decode] using hardware decoder: {}", d.decoder_name);
@@ -447,6 +448,21 @@ impl VideoDecoder {
             }
         }
         Err("no frame produced after send_packet".into())
+    }
+
+    fn try_validated_probe_step(
+        codec: VideoCodec,
+        step: ProbeStep,
+        test_bitstream: Option<&[u8]>,
+    ) -> Result<Self, String> {
+        let Some(test_data) = test_bitstream else {
+            return Self::try_probe_step(codec, step);
+        };
+
+        let mut probe = Self::try_probe_step(codec, step)?;
+        probe.try_test_decode(test_data)?;
+        drop(probe);
+        Self::try_probe_step(codec, step)
     }
 
     fn try_hint(codec: VideoCodec, hint: &str) -> Result<Self, String> {

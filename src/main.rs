@@ -2673,6 +2673,7 @@ struct MediaThreads {
     audio_stop_tx: crossbeam_channel::Sender<()>,
     audio_thread: std::thread::JoinHandle<()>,
     feedback_rx: crossbeam_channel::Receiver<TransportFeedback>,
+    decode_started_rx: crossbeam_channel::Receiver<()>,
 }
 
 fn start_media_threads(
@@ -2702,6 +2703,7 @@ fn start_media_threads(
 
     let (audio_data_tx, audio_data_rx) = crossbeam_channel::bounded::<AudioPacket>(60);
     let (feedback_tx, feedback_rx) = crossbeam_channel::bounded::<TransportFeedback>(8);
+    let (decode_started_tx, decode_started_rx) = crossbeam_channel::bounded::<()>(1);
     let present_refresh_millihz =
         display::desired_present_refresh_millihz(display_refresh_millihz, stream_config.framerate);
 
@@ -2719,6 +2721,7 @@ fn start_media_threads(
             video_stop_rx,
             audio_data_tx,
             feedback_tx,
+            decode_started_tx,
             pipeline_audio_flag,
             native_surfaces,
             control_tx,
@@ -2744,6 +2747,7 @@ fn start_media_threads(
         audio_stop_tx,
         audio_thread,
         feedback_rx,
+        decode_started_rx,
     })
 }
 
@@ -3249,6 +3253,7 @@ fn run_connection(
     let stream_config = stream_config.unwrap();
     let media_threads = media_threads.expect("media threads not started");
     let feedback_rx = media_threads.feedback_rx.clone();
+    let decode_started_rx = media_threads.decode_started_rx.clone();
 
     // Connected!
     {
@@ -3307,10 +3312,10 @@ fn run_connection(
         while let Ok(msg) = pipeline_control_rx.try_recv() {
             let _ = tcp.write_all(&msg.serialize());
         }
+        while decode_started_rx.try_recv().is_ok() {
+            startup_decode_ok = true;
+        }
         while let Ok(feedback) = feedback_rx.try_recv() {
-            if !startup_decode_ok && feedback.completed_frames > 0 {
-                startup_decode_ok = true;
-            }
             if tcp
                 .write_all(&ControlMessage::TransportFeedback(feedback).serialize())
                 .is_err()
