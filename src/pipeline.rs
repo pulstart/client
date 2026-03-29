@@ -136,6 +136,16 @@ pub fn run_receive_pipeline(
             let _ = feedback_tx.try_send(stats.feedback());
         }
 
+        if receiver.take_pending_recovery() {
+            decoder.enter_recovery_mode("transport loss");
+            request_recovery_keyframe(
+                &control_tx,
+                &mut last_recovery_keyframe_request,
+                trace,
+                "immediate transport gap",
+            );
+        }
+
         match data {
             ReceivedData::Audio(opus) => {
                 if audio_enabled.load(Ordering::Relaxed) {
@@ -187,13 +197,13 @@ pub fn run_receive_pipeline(
                         }
                     };
                     if decoder.waiting_for_recovery()
-                        && last_recovery_keyframe_request.elapsed() >= Duration::from_millis(250)
                     {
-                        let _ = control_tx.try_send(ControlMessage::RequestKeyframe);
-                        last_recovery_keyframe_request = Instant::now();
-                        if trace {
-                            eprintln!("[trace][client] requested recovery keyframe");
-                        }
+                        request_recovery_keyframe(
+                            &control_tx,
+                            &mut last_recovery_keyframe_request,
+                            trace,
+                            "decoder recovery wait",
+                        );
                     }
                     let decode_done_micros = unix_time_micros();
 
@@ -243,18 +253,34 @@ fn maybe_request_transport_recovery_keyframe(
     trace: bool,
 ) {
     if !stats.needs_recovery_keyframe()
-        || last_recovery_keyframe_request.elapsed() < Duration::from_millis(250)
     {
+        return;
+    }
+
+    request_recovery_keyframe(
+        control_tx,
+        last_recovery_keyframe_request,
+        trace,
+        &format!(
+            "transport loss: lost_packets={} dropped_frames={}",
+            stats.lost_packets, stats.dropped_frames
+        ),
+    );
+}
+
+fn request_recovery_keyframe(
+    control_tx: &Sender<ControlMessage>,
+    last_recovery_keyframe_request: &mut Instant,
+    trace: bool,
+    reason: &str,
+) {
+    if last_recovery_keyframe_request.elapsed() < Duration::from_millis(250) {
         return;
     }
 
     let _ = control_tx.try_send(ControlMessage::RequestKeyframe);
     *last_recovery_keyframe_request = Instant::now();
     if trace {
-        eprintln!(
-            "[trace][client] requested recovery keyframe after transport loss: lost_packets={} dropped_frames={}",
-            stats.lost_packets,
-            stats.dropped_frames
-        );
+        eprintln!("[trace][client] requested recovery keyframe after {reason}");
     }
 }

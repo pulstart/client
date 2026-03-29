@@ -52,6 +52,7 @@ const MAX_REMOTE_CURSOR_TEXTURES: usize = 8;
 const INPUT_SENDER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const INPUT_STATE_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
 const INPUT_STATE_REPAIR_WINDOW: Duration = Duration::from_millis(200);
+const HOVER_EDGE_MISMATCH_UPDATES_THRESHOLD: u8 = 6;
 
 fn trace_enabled() -> bool {
     std::env::var_os("ST_TRACE").is_some()
@@ -156,7 +157,8 @@ struct StreamApp {
     hover_cursor_pos: Option<egui::Pos2>,
     resume_hover_after_relative_drag: bool,
     hover_cursor_resync_pending: bool,
-    hover_drag_edge_mismatch_frames: u8,
+    hover_drag_edge_mismatch_updates: u8,
+    hover_drag_edge_mismatch_cursor_state_version: u64,
     remote_cursor_textures: BTreeMap<u64, RemoteCursorTexture>,
     latest_remote_cursor_serial: Option<u64>,
     seen_cursor_shape_version: u64,
@@ -566,7 +568,8 @@ impl StreamApp {
             hover_cursor_pos: None,
             resume_hover_after_relative_drag: false,
             hover_cursor_resync_pending: false,
-            hover_drag_edge_mismatch_frames: 0,
+            hover_drag_edge_mismatch_updates: 0,
+            hover_drag_edge_mismatch_cursor_state_version: 0,
             remote_cursor_textures: BTreeMap::new(),
             latest_remote_cursor_serial: None,
             seen_cursor_shape_version: 0,
@@ -608,7 +611,8 @@ impl StreamApp {
         self.hover_cursor_pos = None;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
-        self.hover_drag_edge_mismatch_frames = 0;
+        self.hover_drag_edge_mismatch_updates = 0;
+        self.hover_drag_edge_mismatch_cursor_state_version = 0;
         self.await_pointer_exit_after_auto_release = false;
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
@@ -686,7 +690,8 @@ impl StreamApp {
         self.hover_cursor_pos = None;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
-        self.hover_drag_edge_mismatch_frames = 0;
+        self.hover_drag_edge_mismatch_updates = 0;
+        self.hover_drag_edge_mismatch_cursor_state_version = 0;
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
         self.seen_cursor_shape_version = 0;
@@ -706,7 +711,8 @@ impl StreamApp {
         self.hover_cursor_pos = None;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
-        self.hover_drag_edge_mismatch_frames = 0;
+        self.hover_drag_edge_mismatch_updates = 0;
+        self.hover_drag_edge_mismatch_cursor_state_version = 0;
         self.await_pointer_exit_after_auto_release = false;
     }
 
@@ -723,7 +729,8 @@ impl StreamApp {
         self.hover_cursor_pos = None;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
-        self.hover_drag_edge_mismatch_frames = 0;
+        self.hover_drag_edge_mismatch_updates = 0;
+        self.hover_drag_edge_mismatch_cursor_state_version = 0;
         self.menu_open = false;
         self.await_pointer_exit_after_auto_release = false;
         self.local_overlay_hit_rects.clear();
@@ -737,7 +744,8 @@ impl StreamApp {
         self.hover_cursor_pos = None;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
-        self.hover_drag_edge_mismatch_frames = 0;
+        self.hover_drag_edge_mismatch_updates = 0;
+        self.hover_drag_edge_mismatch_cursor_state_version = 0;
         self.await_pointer_exit_after_auto_release = false;
         self.clear_remote_keyboard();
         if let Some(client_id) = self.shared_input.snapshot().client_id {
@@ -1525,15 +1533,22 @@ impl StreamApp {
             false
         };
         if edge_mismatch_relative_drag {
-            self.hover_drag_edge_mismatch_frames =
-                self.hover_drag_edge_mismatch_frames.saturating_add(1);
+            if snapshot.cursor_state_version != self.hover_drag_edge_mismatch_cursor_state_version {
+                self.hover_drag_edge_mismatch_updates =
+                    self.hover_drag_edge_mismatch_updates.saturating_add(1);
+                self.hover_drag_edge_mismatch_cursor_state_version =
+                    snapshot.cursor_state_version;
+            }
         } else {
-            self.hover_drag_edge_mismatch_frames = 0;
+            self.hover_drag_edge_mismatch_updates = 0;
+            self.hover_drag_edge_mismatch_cursor_state_version = snapshot.cursor_state_version;
         }
         if self.capture_mode == LocalCaptureMode::HoverAbsolute
             && snapshot.controller_state == ControllerState::OwnedByYou
             && self.pointer_buttons & drag_buttons != 0
-            && (hidden_cursor_relative_drag || self.hover_drag_edge_mismatch_frames >= 2)
+            && (hidden_cursor_relative_drag
+                || self.hover_drag_edge_mismatch_updates
+                    >= HOVER_EDGE_MISMATCH_UPDATES_THRESHOLD)
         {
             if let Some(pos) = pointer_pos.filter(|pos| {
                 video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
@@ -1543,13 +1558,15 @@ impl StreamApp {
             } else if self.hover_cursor_pos.is_none() {
                 // Don't fall back to center — skip the transition until we
                 // have a real pointer position to anchor the drag.
-                self.hover_drag_edge_mismatch_frames = 0;
+                self.hover_drag_edge_mismatch_updates = 0;
             }
             if self.hover_cursor_pos.is_some() {
                 self.capture_mode = LocalCaptureMode::CapturedRelative;
                 self.resume_hover_after_relative_drag = true;
                 self.hover_cursor_resync_pending = false;
-                self.hover_drag_edge_mismatch_frames = 0;
+                self.hover_drag_edge_mismatch_updates = 0;
+                self.hover_drag_edge_mismatch_cursor_state_version =
+                    snapshot.cursor_state_version;
                 ctx.request_repaint();
             }
         }

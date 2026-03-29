@@ -1083,6 +1083,20 @@ impl VideoDecoder {
         self.waiting_for_recovery
     }
 
+    pub fn enter_recovery_mode(&mut self, reason: &str) {
+        if !self.waiting_for_recovery {
+            eprintln!(
+                "[decode] {} waiting for recovery frame after {reason}",
+                self.decoder_name
+            );
+        }
+        unsafe {
+            ffmpeg::sys::avcodec_flush_buffers(self.decoder.as_mut_ptr());
+        }
+        self.waiting_for_recovery = true;
+        self.consecutive_failures = 0;
+    }
+
     fn copy_rgba_frame(
         &mut self,
         source: &VideoFrame,

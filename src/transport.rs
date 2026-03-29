@@ -29,6 +29,7 @@ pub struct UdpReceiver {
     buf: Vec<u8>,
     decrypt_buf: Vec<u8>,
     feedback: FeedbackWindow,
+    pending_recovery: bool,
     trace_packets_logged: usize,
     crypto: Option<Arc<CryptoContext>>,
 }
@@ -74,6 +75,7 @@ impl UdpReceiver {
             buf: vec![0u8; 1500 + CRYPTO_OVERHEAD],
             decrypt_buf: Vec::with_capacity(1500),
             feedback: FeedbackWindow::default(),
+            pending_recovery: false,
             trace_packets_logged: 0,
             crypto,
         })
@@ -148,6 +150,7 @@ impl UdpReceiver {
                         .dropped_frames
                         .saturating_add(outcome.feedback.dropped_frames);
                     if outcome.feedback.lost_packets > 0 || outcome.feedback.dropped_frames > 0 {
+                        self.pending_recovery = true;
                         self.feedback.urgent = true;
                     }
                     if let Some(frame) = outcome.completed {
@@ -164,6 +167,10 @@ impl UdpReceiver {
 
     pub fn take_stats(&mut self) -> Option<TransportWindowStats> {
         self.feedback.take_if_due()
+    }
+
+    pub fn take_pending_recovery(&mut self) -> bool {
+        std::mem::take(&mut self.pending_recovery)
     }
 }
 
