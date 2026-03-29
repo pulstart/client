@@ -40,7 +40,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
-use transport::AudioPacket;
+use transport::{AudioPacket, MediaReceiver};
 use video_frame::{NativeSurfaceControl, VideoFrameBuffer};
 
 use crate::debug_state::{unix_time_micros, ConnectionDebugSnapshot, ConnectionDebugState};
@@ -140,6 +140,7 @@ struct StreamApp {
     debug_enabled_flag: Arc<AtomicBool>,
     state: Arc<Mutex<ConnectionState>>,
     frame: Arc<Mutex<VideoFrameBuffer>>,
+    upload_frame: VideoFrameBuffer,
     debug_state: Arc<ConnectionDebugState>,
     video_texture: NativeVideoTexture,
     keep_awake: KeepAwakeController,
@@ -602,6 +603,7 @@ impl StreamApp {
             debug_enabled_flag: Arc::new(AtomicBool::new(debug_enabled)),
             state: Arc::new(Mutex::new(ConnectionState::Disconnected)),
             frame: Arc::new(Mutex::new(VideoFrameBuffer::default())),
+            upload_frame: VideoFrameBuffer::default(),
             debug_state: Arc::new(ConnectionDebugState::new()),
             video_texture,
             keep_awake: KeepAwakeController::new(),
@@ -2790,8 +2792,8 @@ impl StreamApp {
 // ---------------------------------------------------------------------------
 
 struct MediaThreads {
-    input_stop_tx: crossbeam_channel::Sender<()>,
-    input_thread: std::thread::JoinHandle<()>,
+    input_stop_tx: Option<crossbeam_channel::Sender<()>>,
+    input_thread: Option<std::thread::JoinHandle<()>>,
     video_stop_tx: crossbeam_channel::Sender<()>,
     video_thread: std::thread::JoinHandle<()>,
     audio_stop_tx: crossbeam_channel::Sender<()>,
@@ -2819,8 +2821,9 @@ fn start_media_threads(
         .try_clone()
         .map_err(|err| format!("Failed to clone UDP socket: {err}"))?;
     let input_target = std::net::SocketAddr::new(socket_addr.ip(), socket_addr.port());
-    let (input_stop_tx, input_stop_rx) = crossbeam_channel::bounded::<()>(1);
     let input_crypto = crypto.clone();
+    let receiver = MediaReceiver::from_udp_socket(udp_socket, crypto)?;
+    let (input_stop_tx, input_stop_rx) = crossbeam_channel::bounded::<()>(1);
     let input_thread = std::thread::spawn(move || {
         run_input_sender(input_socket, input_target, input_rx, input_stop_rx, input_crypto);
     });
@@ -2851,8 +2854,7 @@ fn start_media_threads(
             control_tx,
             present_refresh_millihz,
             stream_config,
-            udp_socket,
-            crypto,
+            receiver,
         );
     });
 
@@ -2864,8 +2866,8 @@ fn start_media_threads(
     });
 
     Ok(MediaThreads {
-        input_stop_tx,
-        input_thread,
+        input_stop_tx: Some(input_stop_tx),
+        input_thread: Some(input_thread),
         video_stop_tx,
         video_thread,
         audio_stop_tx,
@@ -2875,13 +2877,79 @@ fn start_media_threads(
     })
 }
 
+fn start_punched_media_threads(
+    frame_buf: Arc<Mutex<VideoFrameBuffer>>,
+    debug_state: Arc<ConnectionDebugState>,
+    debug_enabled: Arc<AtomicBool>,
+    ctx: egui::Context,
+    display_refresh_millihz: Option<u32>,
+    audio_enabled: Arc<AtomicBool>,
+    native_surfaces: Arc<NativeSurfaceControl>,
+    control_tx: crossbeam_channel::Sender<ControlMessage>,
+    stream_config: StreamConfig,
+    media_packet_rx: crossbeam_channel::Receiver<Vec<u8>>,
+) -> MediaThreads {
+    let receiver = MediaReceiver::from_packet_channel(media_packet_rx);
+    let (audio_data_tx, audio_data_rx) = crossbeam_channel::bounded::<AudioPacket>(60);
+    let (feedback_tx, feedback_rx) = crossbeam_channel::bounded::<TransportFeedback>(8);
+    let (decode_started_tx, decode_started_rx) = crossbeam_channel::bounded::<()>(1);
+    let present_refresh_millihz =
+        display::desired_present_refresh_millihz(display_refresh_millihz, stream_config.framerate);
+
+    let (video_stop_tx, video_stop_rx) = crossbeam_channel::bounded(1);
+    let pipeline_frame = Arc::clone(&frame_buf);
+    let pipeline_debug_state = Arc::clone(&debug_state);
+    let pipeline_ctx = ctx.clone();
+    let pipeline_audio_flag = Arc::clone(&audio_enabled);
+    let video_thread = std::thread::spawn(move || {
+        pipeline::run_receive_pipeline(
+            pipeline_frame,
+            pipeline_debug_state,
+            debug_enabled,
+            pipeline_ctx,
+            video_stop_rx,
+            audio_data_tx,
+            feedback_tx,
+            decode_started_tx,
+            pipeline_audio_flag,
+            native_surfaces,
+            control_tx,
+            present_refresh_millihz,
+            stream_config,
+            receiver,
+        );
+    });
+
+    let (audio_stop_tx, audio_stop_rx) = crossbeam_channel::bounded(1);
+    let audio_thread = std::thread::spawn(move || {
+        if let Err(e) = audio::run_audio_pipeline(audio_data_rx, audio_stop_rx) {
+            eprintln!("[audio] {e}");
+        }
+    });
+
+    MediaThreads {
+        input_stop_tx: None,
+        input_thread: None,
+        video_stop_tx,
+        video_thread,
+        audio_stop_tx,
+        audio_thread,
+        feedback_rx,
+        decode_started_rx,
+    }
+}
+
 fn stop_media_threads(media_threads: MediaThreads) {
     let _ = media_threads.video_stop_tx.send(());
     let _ = media_threads.audio_stop_tx.send(());
-    let _ = media_threads.input_stop_tx.send(());
+    if let Some(input_stop_tx) = media_threads.input_stop_tx {
+        let _ = input_stop_tx.send(());
+    }
     let _ = media_threads.video_thread.join();
     let _ = media_threads.audio_thread.join();
-    let _ = media_threads.input_thread.join();
+    if let Some(input_thread) = media_threads.input_thread {
+        let _ = input_thread.join();
+    }
 }
 
 const STARTUP_DECODE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -3606,9 +3674,8 @@ fn run_connection(
 /// Run a full streaming session over a hole-punched UDP socket.
 /// Called when direct TCP connection fails but tunnel crypto + partner candidates are available.
 ///
-/// Uses a loopback UDP bridge: a background thread reads from the PunchedSocket and
-/// forwards media packets into a local UDP socket that the existing `run_receive_pipeline`
-/// reads from. This avoids duplicating the decode/render pipeline.
+/// Uses a packet channel bridge: a background thread reads from the PunchedSocket and
+/// forwards decrypted media packets directly into the existing receive pipeline.
 #[allow(clippy::too_many_arguments)]
 fn run_punched_session(
     partner_candidates: Vec<std::net::SocketAddr>,
@@ -3783,30 +3850,9 @@ fn run_punched_session(
     }
 
     eprintln!("[punch] Stream started, setting up media bridge");
+    let (media_packet_tx, media_packet_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
-    // --- Loopback UDP bridge ---
-    // Create a local UDP socket pair. The bridge thread reads media packets from the
-    // PunchedSocket and sends them to the loopback socket. The existing pipeline reads
-    // from the loopback socket as if it were a normal UDP receiver.
-    let loopback_recv = match std::net::UdpSocket::bind("127.0.0.1:0") {
-        Ok(s) => s,
-        Err(e) => {
-            set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch,
-                format!("Failed to bind loopback socket: {e}"));
-            return;
-        }
-    };
-    let loopback_addr = loopback_recv.local_addr().unwrap();
-    let loopback_send = match std::net::UdpSocket::bind("127.0.0.1:0") {
-        Ok(s) => s,
-        Err(e) => {
-            set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch,
-                format!("Failed to bind loopback sender: {e}"));
-            return;
-        }
-    };
-
-    // Bridge thread: PunchedSocket → loopback, plus control message handling.
+    // Bridge thread: PunchedSocket → receive pipeline, plus control message handling.
     let bridge_running = Arc::new(AtomicBool::new(true));
     let bridge_running_clone = Arc::clone(&bridge_running);
     let punched_bridge = Arc::clone(&punched);
@@ -3830,7 +3876,10 @@ fn run_punched_session(
             for msg in punched_bridge.try_recv_all() {
                 match msg {
                     PunchedMessage::Media(data) => {
-                        let _ = loopback_send.send_to(&data, loopback_addr);
+                        if media_packet_tx.send(data).is_err() {
+                            bridge_running_clone.store(false, Ordering::Relaxed);
+                            break;
+                        }
                     }
                     PunchedMessage::Control(data) => {
                         let mut offset = 0;
@@ -3871,15 +3920,9 @@ fn run_punched_session(
     }
     ctx.request_repaint();
 
-    // --- Start media threads using the loopback socket ---
-    // The loopback socket receives unencrypted media packets from the bridge,
-    // so no crypto is needed on the pipeline side.
-    // Use a dummy input_rx for media threads — input goes through the punched socket instead.
+    // --- Start media threads using direct bridged packets ---
     let (pipeline_control_tx, pipeline_control_rx) = crossbeam_channel::bounded::<ControlMessage>(8);
-    let (_dummy_input_tx, dummy_input_rx) = crossbeam_channel::bounded::<InputPacket>(1);
-    set_udp_recv_buffer(&loopback_recv, 4 * 1024 * 1024);
-    let media = match start_media_threads(
-        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 1),
+    let media = start_punched_media_threads(
         Arc::clone(&frame_buf),
         Arc::clone(&debug_state),
         Arc::clone(&debug_enabled),
@@ -3888,29 +3931,14 @@ fn run_punched_session(
         Arc::clone(&audio_enabled),
         Arc::clone(&native_surfaces),
         pipeline_control_tx,
-        dummy_input_rx, // Dummy — input goes through punched socket
         stream_config,
-        loopback_recv,
-        None, // No crypto — loopback is plaintext
-    ) {
-        Ok(m) => m,
-        Err(e) => {
-            bridge_running.store(false, Ordering::Relaxed);
-            let _ = bridge_thread.join();
-            set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch, e);
-            return;
-        }
-    };
+        media_packet_rx,
+    );
 
     // --- Control + input forwarding loop ---
-    // The input sender thread from start_media_threads sends to `peer` which won't work
-    // for punched connections. Override: forward input from control_rx to punched socket.
-    // The media thread's input sender will fail silently (sends to peer directly, which is fine
-    // as the packets arrive at the punched socket bridge). Actually, the input sender sends to
-    // `peer` address using the cloned loopback socket — those packets go nowhere useful.
-    // We need to separately forward input to the punched socket.
-    // For simplicity: drain control_rx and forward, and periodically send feedback.
-
+    let decode_started_rx = media.decode_started_rx.clone();
+    let mut startup_decode_ok = false;
+    let startup_deadline = Instant::now() + STARTUP_DECODE_TIMEOUT;
     let mut input_seq: u16 = 0;
     let mut mouse_heartbeat = MouseInputHeartbeat::default();
     let mut keyboard_heartbeat = KeyboardInputHeartbeat::default();
@@ -3924,7 +3952,9 @@ fn run_punched_session(
 
         // Forward input from UI thread to server via punched socket media channel.
         let now = Instant::now();
+        let mut did_work = false;
         while let Ok(input_pkt) = input_rx.try_recv() {
+            did_work = true;
             mouse_heartbeat.observe(input_pkt, now);
             keyboard_heartbeat.observe(input_pkt, now);
             let serialized = input_pkt.serialize(input_seq);
@@ -3935,11 +3965,13 @@ fn run_punched_session(
         }
         // Heartbeat retransmission for button/key state repair over lossy UDP.
         if let Some(pkt) = mouse_heartbeat.due_packet(now) {
+            did_work = true;
             let serialized = pkt.serialize(input_seq);
             input_seq = input_seq.wrapping_add(1);
             let _ = punched.send_media(&serialized);
         }
         if let Some(pkt) = keyboard_heartbeat.due_packet(now) {
+            did_work = true;
             let serialized = pkt.serialize(input_seq);
             input_seq = input_seq.wrapping_add(1);
             let _ = punched.send_media(&serialized);
@@ -3947,20 +3979,41 @@ fn run_punched_session(
 
         // Forward outgoing control messages to punched socket.
         while let Ok(ctrl) = control_rx.try_recv() {
+            did_work = true;
             let _ = punched.send_control(&ctrl.serialize());
         }
 
         // Forward transport feedback.
         while let Ok(fb) = media.feedback_rx.try_recv() {
+            did_work = true;
             let _ = punched.send_control(&ControlMessage::TransportFeedback(fb).serialize());
         }
 
         // Forward pipeline control messages (keyframe requests, etc.)
         while let Ok(ctrl) = pipeline_control_rx.try_recv() {
+            did_work = true;
             let _ = punched.send_control(&ctrl.serialize());
         }
 
-        std::thread::sleep(Duration::from_millis(2));
+        while decode_started_rx.try_recv().is_ok() {
+            startup_decode_ok = true;
+        }
+        if !startup_decode_ok && Instant::now() >= startup_deadline {
+            let codec = stream_config.codec;
+            eprintln!(
+                "[codec] no frames decoded within {}s over punched transport — excluding {:?} and reconnecting",
+                STARTUP_DECODE_TIMEOUT.as_secs(),
+                codec,
+            );
+            excluded_video_codecs.lock().unwrap().insert(codec);
+            *state.lock().unwrap() = ConnectionState::Disconnected;
+            ctx.request_repaint();
+            break;
+        }
+
+        if !did_work {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     // Cleanup.
@@ -4936,30 +4989,39 @@ impl eframe::App for StreamApp {
 
         // Upload the latest frame directly into a native GL texture.
         let upload_error = {
-            let mut fb = self.frame.lock().unwrap();
-            if fb.dirty && fb.width > 0 {
-                fb.dirty = false;
-                if self.video_texture.stage_direct_frame(&fb) {
-                    if self.debug_enabled {
-                        self.debug_state.record_present(&fb, unix_time_micros());
-                    }
-                    None
-                } else {
-                    match self
-                        .video_texture
-                        .upload(frame, &fb, self.native_surfaces.as_ref())
-                    {
-                        Ok(()) => {
-                            if self.debug_enabled {
-                                self.debug_state.record_present(&fb, unix_time_micros());
-                            }
-                            None
-                        }
-                        Err(err) => Some(err),
-                    }
+            let mut has_pending_upload = false;
+            {
+                let mut fb = self.frame.lock().unwrap();
+                if fb.dirty && fb.width > 0 {
+                    std::mem::swap(&mut self.upload_frame, &mut *fb);
+                    fb.dirty = false;
+                    self.upload_frame.dirty = false;
+                    has_pending_upload = true;
                 }
-            } else {
+            }
+
+            if !has_pending_upload {
                 None
+            } else if self.video_texture.stage_direct_frame(&self.upload_frame) {
+                if self.debug_enabled {
+                    self.debug_state
+                        .record_present(&self.upload_frame, unix_time_micros());
+                }
+                None
+            } else {
+                match self
+                    .video_texture
+                    .upload(frame, &self.upload_frame, self.native_surfaces.as_ref())
+                {
+                    Ok(()) => {
+                        if self.debug_enabled {
+                            self.debug_state
+                                .record_present(&self.upload_frame, unix_time_micros());
+                        }
+                        None
+                    }
+                    Err(err) => Some(err),
+                }
             }
         };
         if let Some(err) = upload_error {

@@ -1,12 +1,11 @@
 use crate::debug_state::{unix_time_micros, ConnectionDebugState};
 use crate::decode::VideoDecoder;
-use crate::transport::{AudioPacket, ReceivedData, TransportWindowStats, UdpReceiver};
+use crate::transport::{AudioPacket, MediaReceiver, ReceivedData, TransportWindowStats};
 use crate::video_frame::{FrameDebugTiming, NativeSurfaceControl, VideoFrameBuffer};
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 use st_protocol::{ControlMessage, StreamConfig, TransportFeedback};
 use std::collections::VecDeque;
-use std::net::UdpSocket;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -198,16 +197,8 @@ pub fn run_receive_pipeline(
     control_tx: Sender<ControlMessage>,
     present_refresh_millihz: Option<u32>,
     stream_config: StreamConfig,
-    udp_socket: UdpSocket,
-    crypto: Option<std::sync::Arc<st_protocol::tunnel::CryptoContext>>,
+    mut receiver: MediaReceiver,
 ) {
-    let mut receiver = match UdpReceiver::from_socket(udp_socket, crypto) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Failed to create UDP receiver: {e}");
-            return;
-        }
-    };
     let trace = std::env::var_os("ST_TRACE").is_some();
     let mut trace_completed_logged = 0usize;
     let mut last_recovery_keyframe_request = Instant::now() - Duration::from_secs(2);
