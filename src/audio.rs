@@ -5,7 +5,10 @@
 use crate::transport::AudioPacket;
 use crossbeam_channel::Receiver;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc, Mutex,
+};
 
 const SAMPLE_RATE: u32 = 48000;
 const CHANNELS: u32 = 2;
@@ -13,6 +16,7 @@ const CHANNELS: u32 = 2;
 const MAX_OPUS_FRAME_SAMPLES: usize = 5760;
 /// Conceal up to 60ms of consecutive missing packets before resyncing.
 const MAX_CONCEALED_AUDIO_PACKETS: usize = 3;
+const AUDIO_PACKET_DURATION_MS: usize = 20;
 const DEFAULT_TARGET_BUFFER_MS: usize = 20;
 const DEFAULT_MAX_BUFFER_MS: usize = 60;
 const DEFAULT_MAX_QUEUED_PACKETS: usize = 2;
@@ -67,6 +71,8 @@ pub fn run_audio_pipeline(
         last_sample: 0.0,
     }));
     let ring_cb = Arc::clone(&ring);
+    let last_sample_bits = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+    let last_sample_bits_cb = Arc::clone(&last_sample_bits);
 
     let stream = device
         .build_output_stream(
@@ -77,8 +83,9 @@ pub fn run_audio_pipeline(
                 let mut buf = match ring_cb.try_lock() {
                     Ok(b) => b,
                     Err(_) => {
+                        let held = f32::from_bits(last_sample_bits_cb.load(Ordering::Relaxed));
                         for sample in output.iter_mut() {
-                            *sample = 0.0;
+                            *sample = held;
                         }
                         return;
                     }
@@ -90,6 +97,7 @@ pub fn run_audio_pipeline(
                     if buf.primed {
                         if let Some(next) = buf.samples.pop_front() {
                             buf.last_sample = next;
+                            last_sample_bits_cb.store(next.to_bits(), Ordering::Relaxed);
                             *sample = next;
                         } else {
                             buf.primed = false;
@@ -111,6 +119,7 @@ pub fn run_audio_pipeline(
     // Decode loop: receive Opus packets from pipeline, decode, push to ring
     let mut pcm_buf = vec![0.0f32; MAX_OPUS_FRAME_SAMPLES * CHANNELS as usize];
     let mut expected_seq = None::<u16>;
+    let packet_samples = audio_packet_samples();
     let trace = std::env::var_os("ST_TRACE").is_some();
     let mut concealment_logs = 0usize;
     let mut backlog_logs = 0usize;
@@ -130,6 +139,8 @@ pub fn run_audio_pipeline(
             &mut packet,
             &ring,
             max_queued_packets,
+            target_buffer_samples,
+            packet_samples,
             trace,
             &mut backlog_logs,
         ) {
@@ -141,11 +152,57 @@ pub fn run_audio_pipeline(
             if delta != 0 {
                 if delta < 0x8000 {
                     let missing_packets = delta as usize;
-                    if missing_packets <= MAX_CONCEALED_AUDIO_PACKETS {
-                        let mut concealed_packets = 0usize;
-                        if missing_packets > 1 {
-                            for _ in 0..(missing_packets - 1) {
-                                if decode_and_enqueue(
+                    let plc_packets = missing_packets.saturating_sub(1);
+                    if plc_packets <= MAX_CONCEALED_AUDIO_PACKETS {
+                        let mut recovered_packets = 0usize;
+                        for _ in 0..plc_packets {
+                            if decode_and_enqueue(
+                                &mut decoder,
+                                &[],
+                                false,
+                                &mut pcm_buf,
+                                &ring,
+                                target_buffer_samples,
+                                max_buffer_samples,
+                            )
+                            .is_ok()
+                            {
+                                recovered_packets += 1;
+                            }
+                        }
+
+                        let mut recovery_mode = "plc";
+                        let recovered_last_missing = if let Some(redundant_prev) =
+                            packet.redundant_prev.as_deref()
+                        {
+                            if decode_and_enqueue(
+                                &mut decoder,
+                                redundant_prev,
+                                false,
+                                &mut pcm_buf,
+                                &ring,
+                                target_buffer_samples,
+                                max_buffer_samples,
+                            )
+                            .is_ok()
+                            {
+                                recovery_mode = "redundancy";
+                                true
+                            } else if decode_and_enqueue(
+                                &mut decoder,
+                                &packet.data,
+                                true,
+                                &mut pcm_buf,
+                                &ring,
+                                target_buffer_samples,
+                                max_buffer_samples,
+                            )
+                            .is_ok()
+                            {
+                                recovery_mode = "fec";
+                                true
+                            } else {
+                                decode_and_enqueue(
                                     &mut decoder,
                                     &[],
                                     false,
@@ -155,13 +212,8 @@ pub fn run_audio_pipeline(
                                     max_buffer_samples,
                                 )
                                 .is_ok()
-                                {
-                                    concealed_packets += 1;
-                                }
                             }
-                        }
-
-                        let recovered_with_fec = decode_and_enqueue(
+                        } else if decode_and_enqueue(
                             &mut decoder,
                             &packet.data,
                             true,
@@ -170,27 +222,30 @@ pub fn run_audio_pipeline(
                             target_buffer_samples,
                             max_buffer_samples,
                         )
-                        .is_ok();
-                        if recovered_with_fec {
-                            concealed_packets += 1;
-                        } else if decode_and_enqueue(
-                            &mut decoder,
-                            &[],
-                            false,
-                            &mut pcm_buf,
-                            &ring,
-                            target_buffer_samples,
-                            max_buffer_samples,
-                        )
                         .is_ok()
                         {
-                            concealed_packets += 1;
+                            recovery_mode = "fec";
+                            true
+                        } else {
+                            decode_and_enqueue(
+                                &mut decoder,
+                                &[],
+                                false,
+                                &mut pcm_buf,
+                                &ring,
+                                target_buffer_samples,
+                                max_buffer_samples,
+                            )
+                            .is_ok()
+                        };
+                        if recovered_last_missing {
+                            recovered_packets += 1;
                         }
 
                         if trace && concealment_logs < 12 {
                             eprintln!(
-                                "[trace][audio] concealed {} missing packet(s) before seq={}",
-                                concealed_packets, packet.seq
+                                "[trace][audio] recovered {} missing packet(s) before seq={} via {}",
+                                recovered_packets, packet.seq, recovery_mode
                             );
                             concealment_logs += 1;
                         }
@@ -233,6 +288,10 @@ pub fn run_audio_pipeline(
     Ok(())
 }
 
+fn audio_packet_samples() -> usize {
+    (SAMPLE_RATE as usize * CHANNELS as usize * AUDIO_PACKET_DURATION_MS) / 1000
+}
+
 fn configured_audio_buffer_samples(var: &str, default_ms: usize) -> usize {
     let buffer_ms = std::env::var(var)
         .ok()
@@ -247,6 +306,8 @@ fn trim_packet_backlog(
     latest_packet: &mut AudioPacket,
     ring: &Arc<Mutex<PlaybackBuffer>>,
     max_queued_packets: usize,
+    target_buffer_samples: usize,
+    packet_samples: usize,
     trace: bool,
     backlog_logs: &mut usize,
 ) -> bool {
@@ -269,7 +330,7 @@ fn trim_packet_backlog(
         return false;
     }
 
-    reset_playback_buffer(ring);
+    trim_playback_buffer(ring, dropped_packets.saturating_mul(packet_samples), target_buffer_samples);
     if trace && *backlog_logs < 12 {
         eprintln!(
             "[trace][audio] dropped {} stale queued packet(s) to cut playback latency",
@@ -280,10 +341,25 @@ fn trim_packet_backlog(
     true
 }
 
-fn reset_playback_buffer(ring: &Arc<Mutex<PlaybackBuffer>>) {
+fn trim_playback_buffer(
+    ring: &Arc<Mutex<PlaybackBuffer>>,
+    dropped_samples: usize,
+    target_buffer_samples: usize,
+) {
     let mut playback = ring.lock().unwrap();
-    playback.samples.clear();
-    playback.primed = false;
+    let to_drop = dropped_samples.min(playback.samples.len());
+    if to_drop > 0 {
+        playback.samples.drain(..to_drop);
+    }
+    if dropped_samples > to_drop {
+        playback.samples.clear();
+    }
+    if playback.samples.is_empty() {
+        playback.primed = false;
+    } else if playback.samples.len() > target_buffer_samples.saturating_mul(2) {
+        let trim_extra = playback.samples.len() - target_buffer_samples.saturating_mul(2);
+        playback.samples.drain(..trim_extra);
+    }
 }
 
 fn decode_and_enqueue(

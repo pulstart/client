@@ -1,5 +1,7 @@
 use crossbeam_channel::{Receiver as PacketChannel, TryRecvError};
-use st_protocol::packet::{PacketHeader, PayloadType, HEADER_SIZE};
+use st_protocol::packet::{
+    AudioRedundancyMeta, AUDIO_REDUNDANCY_HEADER_SIZE, PacketHeader, PayloadType, HEADER_SIZE,
+};
 use st_protocol::tunnel::CryptoContext;
 use st_protocol::{CompletedFrame, FrameAssembler, TransportFeedback};
 use std::io::ErrorKind;
@@ -16,6 +18,7 @@ const MAX_UDP_DATAGRAM_SIZE: usize = 65_535;
 pub struct AudioPacket {
     pub seq: u16,
     pub data: Vec<u8>,
+    pub redundant_prev: Option<Vec<u8>>,
 }
 
 pub enum ReceivedData {
@@ -235,13 +238,30 @@ impl PacketProcessor {
             }
             if header.payload_type == PayloadType::Audio {
                 if raw_len > HEADER_SIZE {
+                    let payload = &raw[HEADER_SIZE..];
+                    let (data, redundant_prev) = if let Some(meta) =
+                        AudioRedundancyMeta::deserialize(payload)
+                    {
+                        let primary_start = AUDIO_REDUNDANCY_HEADER_SIZE;
+                        let primary_end = payload.len().saturating_sub(meta.redundant_len as usize);
+                        let primary = payload[primary_start..primary_end].to_vec();
+                        let redundant_prev = if meta.redundant_len > 0 {
+                            Some(payload[primary_end..].to_vec())
+                        } else {
+                            None
+                        };
+                        (primary, redundant_prev)
+                    } else {
+                        (payload.to_vec(), None)
+                    };
                     self.feedback.received_bytes =
                         self.feedback.received_bytes.saturating_add(raw_len as u64);
                     self.feedback.received_audio_bytes =
                         self.feedback.received_audio_bytes.saturating_add(raw_len as u64);
                     return Some(ReceivedData::Audio(AudioPacket {
                         seq: header.seq,
-                        data: raw[HEADER_SIZE..].to_vec(),
+                        data,
+                        redundant_prev,
                     }));
                 }
                 return None;
