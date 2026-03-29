@@ -3316,6 +3316,7 @@ name = "st-protocol"
 version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
+ "libc",
  "rand",
  "x25519-dalek",
 ]

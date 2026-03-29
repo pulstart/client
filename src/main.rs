@@ -3165,10 +3165,9 @@ fn run_connection(
     tcp.set_read_timeout(Some(Duration::from_millis(200))).ok();
     let udp_socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(socket) => {
-            // Increase the receive buffer to handle bursts of video packets.
-            // The default OS buffer (~208KB on Linux) can overflow during
-            // initial connection when queued frames are sent rapidly.
-            set_udp_recv_buffer(&socket, 4 * 1024 * 1024);
+            // Give the unified media socket more headroom for bursty video and
+            // low-latency input packets on the same fd.
+            configure_media_udp_socket(&socket, socket_addr);
             socket
         }
         Err(err) => {
@@ -4367,6 +4366,118 @@ fn set_udp_recv_buffer(socket: &UdpSocket, size: i32) {
 
 #[cfg(not(unix))]
 fn set_udp_recv_buffer(_socket: &UdpSocket, _size: i32) {}
+
+#[cfg(unix)]
+fn set_udp_send_buffer(socket: &UdpSocket, size: i32) {
+    use std::os::unix::io::AsRawFd;
+    let fd = socket.as_raw_fd();
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &size as *const i32 as *const _,
+            std::mem::size_of::<i32>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 && trace_enabled() {
+        eprintln!(
+            "[udp] setsockopt SO_SNDBUF failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn set_udp_send_buffer(_socket: &UdpSocket, _size: i32) {}
+
+#[cfg(unix)]
+fn set_udp_dscp(socket: &UdpSocket, peer: std::net::SocketAddr, dscp: u8) {
+    use std::os::unix::io::AsRawFd;
+
+    let tos = i32::from(dscp) << 2;
+    let (level, optname) = match peer.ip() {
+        std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
+            (libc::IPPROTO_IPV6, libc::IPV6_TCLASS)
+        }
+        _ => (libc::IPPROTO_IP, libc::IP_TOS),
+    };
+    let fd = socket.as_raw_fd();
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            optname,
+            &tos as *const i32 as *const _,
+            std::mem::size_of::<i32>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 && trace_enabled() {
+        eprintln!(
+            "[udp] setsockopt DSCP failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn set_udp_dscp(_socket: &UdpSocket, _peer: std::net::SocketAddr, _dscp: u8) {}
+
+#[cfg(target_os = "linux")]
+fn set_udp_priority(socket: &UdpSocket, priority: i32) {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = socket.as_raw_fd();
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PRIORITY,
+            &priority as *const i32 as *const _,
+            std::mem::size_of::<i32>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 && trace_enabled() {
+        eprintln!(
+            "[udp] setsockopt SO_PRIORITY failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_udp_priority(_socket: &UdpSocket, _priority: i32) {}
+
+fn configure_media_udp_socket(socket: &UdpSocket, peer: std::net::SocketAddr) {
+    let recv_buf = std::env::var("ST_UDP_RCVBUF")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4 * 1024 * 1024);
+    let send_buf = std::env::var("ST_UDP_SNDBUF")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1024 * 1024);
+
+    set_udp_recv_buffer(socket, recv_buf);
+    set_udp_send_buffer(socket, send_buf);
+
+    if let Some(dscp) = std::env::var("ST_UDP_DSCP")
+        .ok()
+        .and_then(|raw| raw.parse::<u8>().ok())
+        .filter(|value| *value <= 63)
+    {
+        set_udp_dscp(socket, peer, dscp);
+    }
+
+    let priority = std::env::var("ST_UDP_SO_PRIORITY")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+        .filter(|value| *value >= 0)
+        .unwrap_or(5);
+    set_udp_priority(socket, priority);
+}
 
 fn stream_supports_client_audio(stream_config: &StreamConfig) -> bool {
     stream_config.audio_sample_rate == 48_000 && stream_config.audio_channels == 2
