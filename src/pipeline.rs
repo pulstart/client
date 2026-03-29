@@ -5,6 +5,7 @@ use crate::video_frame::{FrameDebugTiming, NativeSurfaceControl, VideoFrameBuffe
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 use st_protocol::{ControlMessage, StreamConfig, TransportFeedback};
+use std::collections::VecDeque;
 use std::net::UdpSocket;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -55,6 +56,134 @@ impl RepaintPacer {
     }
 }
 
+struct QueuedVideoFrame {
+    present_at: Instant,
+    frame: VideoFrameBuffer,
+}
+
+#[derive(Default)]
+struct DueVideoFrames {
+    present: Option<VideoFrameBuffer>,
+    dropped: Vec<VideoFrameBuffer>,
+}
+
+struct VideoPlayoutBuffer {
+    min_delay: Duration,
+    frame_interval: Option<Duration>,
+    max_queued_frames: usize,
+    queued: VecDeque<QueuedVideoFrame>,
+    last_scheduled_at: Option<Instant>,
+}
+
+impl VideoPlayoutBuffer {
+    fn new(stream_fps: u16) -> Self {
+        Self {
+            min_delay: configured_video_jitter_delay(stream_fps),
+            frame_interval: if stream_fps > 0 {
+                Some(Duration::from_secs_f64(1.0 / f64::from(stream_fps)))
+            } else {
+                None
+            },
+            max_queued_frames: configured_video_jitter_max_frames(),
+            queued: VecDeque::new(),
+            last_scheduled_at: None,
+        }
+    }
+
+    fn enqueue(&mut self, frame: VideoFrameBuffer) -> Option<VideoFrameBuffer> {
+        let now = Instant::now();
+        let candidate = now + self.min_delay;
+        let present_at = self
+            .last_scheduled_at
+            .zip(self.frame_interval)
+            .map(|(last, interval)| candidate.max(last + interval))
+            .unwrap_or(candidate);
+        self.last_scheduled_at = Some(present_at);
+        self.queued.push_back(QueuedVideoFrame { present_at, frame });
+        if self.queued.len() > self.max_queued_frames.max(1) {
+            return self.queued.pop_front().map(|queued| queued.frame);
+        }
+        None
+    }
+
+    fn take_due_frames(&mut self) -> DueVideoFrames {
+        let now = Instant::now();
+        let Some(front) = self.queued.front() else {
+            return DueVideoFrames::default();
+        };
+        if front.present_at > now {
+            return DueVideoFrames::default();
+        }
+
+        let mut due = DueVideoFrames::default();
+        while self
+            .queued
+            .front()
+            .map(|queued| queued.present_at <= now)
+            .unwrap_or(false)
+        {
+            let frame = self.queued.pop_front().expect("front checked").frame;
+            if let Some(previous) = due.present.replace(frame) {
+                due.dropped.push(previous);
+            }
+        }
+        due
+    }
+}
+
+fn configured_video_jitter_delay(stream_fps: u16) -> Duration {
+    if let Ok(raw) = std::env::var("ST_CLIENT_VIDEO_JITTER_MS") {
+        if let Ok(parsed) = raw.parse::<u64>() {
+            return Duration::from_millis(parsed.min(250));
+        }
+    }
+
+    if stream_fps == 0 {
+        return Duration::from_millis(18);
+    }
+
+    Duration::from_secs_f64((1.0 / f64::from(stream_fps)).clamp(0.012, 0.030))
+}
+
+fn configured_video_jitter_max_frames() -> usize {
+    std::env::var("ST_CLIENT_VIDEO_JITTER_MAX_FRAMES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .map(|value| value.clamp(1, 8))
+        .unwrap_or(3)
+}
+
+fn recycle_video_frame(recycled_frames: &mut Vec<VideoFrameBuffer>, mut frame: VideoFrameBuffer) {
+    if recycled_frames.len() >= 3 {
+        return;
+    }
+    frame.dirty = false;
+    recycled_frames.push(frame);
+}
+
+fn present_due_video_frames(
+    playout: &mut VideoPlayoutBuffer,
+    recycled_frames: &mut Vec<VideoFrameBuffer>,
+    frame_buf: &Arc<Mutex<VideoFrameBuffer>>,
+    ctx: &egui::Context,
+    repaint_pacer: &mut RepaintPacer,
+) {
+    let due = playout.take_due_frames();
+    for dropped in due.dropped {
+        recycle_video_frame(recycled_frames, dropped);
+    }
+
+    let Some(mut frame) = due.present else {
+        return;
+    };
+
+    let mut fb = frame_buf.lock().unwrap();
+    std::mem::swap(&mut *fb, &mut frame);
+    fb.dirty = true;
+    recycle_video_frame(recycled_frames, frame);
+    repaint_pacer.request(ctx);
+}
+
 pub fn run_receive_pipeline(
     frame_buf: Arc<Mutex<VideoFrameBuffer>>,
     debug_state: Arc<ConnectionDebugState>,
@@ -96,6 +225,8 @@ pub fn run_receive_pipeline(
     };
     decoder.set_native_surface_control(native_surfaces);
     let mut decoded_frame = VideoFrameBuffer::default();
+    let mut playout = VideoPlayoutBuffer::new(stream_config.framerate);
+    let mut recycled_frames = Vec::new();
     let mut repaint_pacer = RepaintPacer::new(present_refresh_millihz);
 
     loop {
@@ -103,26 +234,7 @@ pub fn run_receive_pipeline(
             break;
         }
 
-        let data = match receiver.try_receive() {
-            Some(d) => d,
-            None => {
-                if let Some(stats) = receiver.take_stats() {
-                    if debug_enabled.load(Ordering::Relaxed) {
-                        debug_state.update_transport_window(&stats);
-                    }
-                    maybe_request_transport_recovery_keyframe(
-                        stats,
-                        &control_tx,
-                        &mut last_recovery_keyframe_request,
-                        trace,
-                    );
-                    let _ = feedback_tx.try_send(stats.feedback());
-                }
-                std::thread::sleep(Duration::from_micros(500));
-                continue;
-            }
-        };
-
+        let data = receiver.try_receive();
         if let Some(stats) = receiver.take_stats() {
             if debug_enabled.load(Ordering::Relaxed) {
                 debug_state.update_transport_window(&stats);
@@ -147,12 +259,23 @@ pub fn run_receive_pipeline(
         }
 
         match data {
-            ReceivedData::Audio(opus) => {
+            None => {
+                present_due_video_frames(
+                    &mut playout,
+                    &mut recycled_frames,
+                    &frame_buf,
+                    &ctx,
+                    &mut repaint_pacer,
+                );
+                std::thread::sleep(Duration::from_micros(500));
+                continue;
+            }
+            Some(ReceivedData::Audio(opus)) => {
                 if audio_enabled.load(Ordering::Relaxed) {
                     let _ = audio_tx.try_send(opus);
                 }
             }
-            ReceivedData::Video(completed) => {
+            Some(ReceivedData::Video(completed)) => {
                 if trace && trace_completed_logged < 12 {
                     eprintln!(
                         "[trace][client] assembled video unit #{}: frame_id={} bytes={} capture_ts={} send_ts={}",
@@ -235,11 +358,18 @@ pub fn run_receive_pipeline(
                             debug_state.record_decoded(timing);
                         }
                     }
-                    let mut fb = frame_buf.lock().unwrap();
-                    std::mem::swap(&mut *fb, &mut decoded_frame);
-                    fb.dirty = true;
-                    decoded_frame.dirty = false;
-                    repaint_pacer.request(&ctx);
+                    let mut queued_frame = recycled_frames.pop().unwrap_or_default();
+                    std::mem::swap(&mut queued_frame, &mut decoded_frame);
+                    if let Some(dropped) = playout.enqueue(queued_frame) {
+                        recycle_video_frame(&mut recycled_frames, dropped);
+                    }
+                    present_due_video_frames(
+                        &mut playout,
+                        &mut recycled_frames,
+                        &frame_buf,
+                        &ctx,
+                        &mut repaint_pacer,
+                    );
                 }
             }
         }

@@ -1,5 +1,5 @@
 use st_protocol::packet::{PacketHeader, PayloadType, HEADER_SIZE};
-use st_protocol::tunnel::{CryptoContext, CRYPTO_OVERHEAD};
+use st_protocol::tunnel::CryptoContext;
 use st_protocol::{CompletedFrame, FrameAssembler, TransportFeedback};
 use std::io::ErrorKind;
 use std::net::UdpSocket;
@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 const FEEDBACK_INTERVAL: Duration = Duration::from_millis(500);
 const URGENT_FEEDBACK_MIN_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_UDP_DATAGRAM_SIZE: usize = 65_535;
 
 /// Demuxed data from the unified UDP stream.
 #[derive(Debug, Clone)]
@@ -72,8 +73,11 @@ impl UdpReceiver {
         Ok(Self {
             socket,
             assembler: FrameAssembler::new(),
-            buf: vec![0u8; 1500 + CRYPTO_OVERHEAD],
-            decrypt_buf: Vec::with_capacity(1500),
+            // The server can tune UDP slice size at runtime, so the receive
+            // buffer must handle the largest datagram the OS can deliver
+            // instead of assuming an Ethernet-sized packet.
+            buf: vec![0u8; MAX_UDP_DATAGRAM_SIZE],
+            decrypt_buf: Vec::with_capacity(MAX_UDP_DATAGRAM_SIZE),
             feedback: FeedbackWindow::default(),
             pending_recovery: false,
             trace_packets_logged: 0,
