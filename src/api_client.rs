@@ -1,9 +1,8 @@
 use st_protocol::tunnel::{CryptoContext, TunnelKeys};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
 
 #[derive(Clone, Debug)]
 pub struct ApiDiscoveredHost {
@@ -54,14 +53,17 @@ pub struct ApiDiscoveryShared {
     pub token: Mutex<String>,
     pub peer_id: Mutex<String>,
     pub host: Mutex<Option<ApiDiscoveredHost>>,
-    /// Derived ChaCha20 shared key (set once key exchange completes).
-    pub shared_key: Mutex<Option<[u8; 32]>>,
+    tunnel_keys: Mutex<TunnelKeys>,
+    /// Derived ChaCha20 shared key from the latest partner key, if available.
+    shared_key: Mutex<Option<[u8; 32]>>,
     /// Partner (host) NAT candidates parsed as SocketAddr.
     pub partner_candidates: Mutex<Vec<SocketAddr>>,
-    /// Pre-bound UDP socket for hole punching (taken once by the connection flow).
-    pub punch_socket: Mutex<Option<UdpSocket>>,
+    /// Process-lifetime UDP socket used for STUN and hole punching.
+    punch_socket: Mutex<Option<UdpSocket>>,
     /// Local candidates advertised to the API server (ip:port strings).
     pub punch_candidates: Mutex<Vec<String>>,
+    /// Monotonic punch-request nonce sent to the API server.
+    next_punch_nonce: AtomicU64,
     /// Whether the last API request succeeded.
     pub connected: AtomicBool,
 }
@@ -73,10 +75,12 @@ impl ApiDiscoveryShared {
             token: Mutex::new(token),
             peer_id: Mutex::new(peer_id),
             host: Mutex::new(None),
+            tunnel_keys: Mutex::new(TunnelKeys::generate()),
             shared_key: Mutex::new(None),
             partner_candidates: Mutex::new(Vec::new()),
             punch_socket: Mutex::new(None),
             punch_candidates: Mutex::new(Vec::new()),
+            next_punch_nonce: AtomicU64::new(1),
             connected: AtomicBool::new(false),
         }
     }
@@ -89,13 +93,88 @@ impl ApiDiscoveryShared {
             .map(|key| Arc::new(CryptoContext::new(key, false)))
     }
 
-    /// Take the pre-bound punch socket for use in hole punching (one-shot).
-    pub fn take_punch_socket(&self) -> Option<UdpSocket> {
-        self.punch_socket.lock().unwrap().take()
+    /// Clone the process-lifetime punch socket for an individual attempt/session.
+    pub fn clone_punch_socket(&self) -> Result<UdpSocket, String> {
+        self.ensure_punch_socket()?;
+        self.punch_socket
+            .lock()
+            .unwrap()
+            .as_ref()
+            .ok_or_else(|| "punch socket unavailable".to_string())?
+            .try_clone()
+            .map_err(|e| format!("clone punch socket: {e}"))
     }
 
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
+    }
+
+    fn public_key_b64(&self) -> String {
+        let keys = self.tunnel_keys.lock().unwrap();
+        base64_encode(&keys.public_key_bytes())
+    }
+
+    fn set_shared_key(&self, shared_key: Option<[u8; 32]>) {
+        let mut current = self.shared_key.lock().unwrap();
+        if *current != shared_key {
+            let had_key = current.is_some();
+            let has_key = shared_key.is_some();
+            *current = shared_key;
+            if has_key && !had_key {
+                eprintln!("[api] Shared key derived");
+            }
+        }
+    }
+
+    fn update_shared_key_from_partner_b64(&self, partner_b64: Option<&str>) {
+        let Some(partner_b64) = partner_b64 else {
+            self.set_shared_key(None);
+            return;
+        };
+        let Some(partner_bytes) = base64_decode(partner_b64) else {
+            self.set_shared_key(None);
+            return;
+        };
+        if partner_bytes.len() != 32 {
+            self.set_shared_key(None);
+            return;
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&partner_bytes);
+        let shared_key = {
+            let keys = self.tunnel_keys.lock().unwrap();
+            keys.derive_shared_key(&arr)
+        };
+        self.set_shared_key(Some(shared_key));
+    }
+
+    fn ensure_punch_socket(&self) -> Result<Vec<String>, String> {
+        let has_socket = self.punch_socket.lock().unwrap().is_some();
+        if has_socket {
+            let candidates = self.punch_candidates.lock().unwrap().clone();
+            if !candidates.is_empty() {
+                return Ok(candidates);
+            }
+        }
+
+        let mut socket_guard = self.punch_socket.lock().unwrap();
+        if socket_guard.is_none() {
+            let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind punch socket: {e}"))?;
+            *socket_guard = Some(socket);
+        }
+
+        let socket = socket_guard
+            .as_ref()
+            .ok_or_else(|| "punch socket unavailable".to_string())?;
+        let port = socket
+            .local_addr()
+            .map_err(|e| format!("punch socket local_addr: {e}"))?
+            .port();
+        let candidates = st_protocol::tunnel::gather_candidates_with_stun(port, Some(socket));
+        drop(socket_guard);
+
+        *self.punch_candidates.lock().unwrap() = candidates.clone();
+        Ok(candidates)
     }
 }
 
@@ -168,35 +247,12 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 /// 4. Stores the derived shared key and partner candidates.
 pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::Context) {
     std::thread::spawn(move || {
-        let keys = TunnelKeys::generate();
-        let pub_key_b64 = base64_encode(&keys.public_key_bytes());
-        let keys = Mutex::new(Some(keys));
         let peer_id = shared.peer_id.lock().unwrap().clone();
         let mut failures: u32 = 0;
 
-        // Bind a UDP socket for hole punching and gather local candidates.
-        let punch_port = match UdpSocket::bind("0.0.0.0:0") {
-            Ok(sock) => {
-                let port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
-                *shared.punch_socket.lock().unwrap() = Some(sock);
-                port
-            }
-            Err(e) => {
-                eprintln!("[api] Failed to bind punch socket: {e}");
-                0
-            }
-        };
-        // Gather local candidates + discover public IP via STUN on the punch socket.
-        let local_candidates = if punch_port > 0 {
-            let sock_guard = shared.punch_socket.lock().unwrap();
-            st_protocol::tunnel::gather_candidates_with_stun(
-                punch_port,
-                sock_guard.as_ref(),
-            )
-        } else {
-            Vec::new()
-        };
-        *shared.punch_candidates.lock().unwrap() = local_candidates.clone();
+        if let Err(e) = shared.ensure_punch_socket() {
+            eprintln!("[api] Failed to prepare punch socket: {e}");
+        }
 
         loop {
             let url = shared.api_url.lock().unwrap().clone();
@@ -204,14 +260,22 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
 
             if url.is_empty() || token.is_empty() {
                 shared.connected.store(false, Ordering::Relaxed);
-                let mut h = shared.host.lock().unwrap();
-                if h.is_some() {
-                    *h = None;
+                let changed = clear_host(&shared);
+                if changed {
                     ctx.request_repaint();
                 }
                 std::thread::sleep(Duration::from_secs(5));
                 continue;
             }
+
+            let local_candidates = match shared.ensure_punch_socket() {
+                Ok(candidates) => candidates,
+                Err(e) => {
+                    eprintln!("[api] Failed to prepare punch socket: {e}");
+                    shared.punch_candidates.lock().unwrap().clear();
+                    Vec::new()
+                }
+            };
 
             // 1. Register as client — this is the connectivity check.
             let reg_body = serde_json::json!({
@@ -219,14 +283,14 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
                 "role": "client",
                 "peer_id": peer_id,
                 "candidates": local_candidates,
-            }).to_string();
+            })
+            .to_string();
             let ok = ureq::post(&format!("{url}/api/register"))
                 .set("Content-Type", "application/json")
                 .send_string(&reg_body)
                 .is_ok();
 
             if !ok {
-                // Failed — backoff retry.
                 let was_connected = shared.connected.swap(false, Ordering::Relaxed);
                 if was_connected {
                     ctx.request_repaint();
@@ -238,7 +302,6 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
                 continue;
             }
 
-            // Connected.
             if failures > 0 || !shared.is_connected() {
                 eprintln!("[api] Connected to API server");
             }
@@ -248,61 +311,65 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
                 ctx.request_repaint();
             }
 
-            // 2. Upload our public key and try to get host's key
+            // 2. Upload our public key and try to get host's key.
             let key_body = serde_json::json!({
                 "token": token,
                 "role": "client",
-                "public_key": pub_key_b64,
-            }).to_string();
-            if let Ok(resp) = ureq::post(&format!("{url}/api/key"))
+                "public_key": shared.public_key_b64(),
+            })
+            .to_string();
+            match ureq::post(&format!("{url}/api/key"))
                 .set("Content-Type", "application/json")
                 .send_string(&key_body)
             {
-                if let Ok(text) = resp.into_string() {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let Some(partner_b64) = v["partner_key"].as_str() {
-                            if let Some(partner_bytes) = base64_decode(partner_b64) {
-                                if partner_bytes.len() == 32 {
-                                    let mut arr = [0u8; 32];
-                                    arr.copy_from_slice(&partner_bytes);
-                                    if let Some(k) = keys.lock().unwrap().take() {
-                                        let shared_key = k.derive_shared_key(&arr);
-                                        *shared.shared_key.lock().unwrap() = Some(shared_key);
-                                        eprintln!("[api] Shared key derived");
-                                    }
-                                }
-                            }
+                Ok(resp) => {
+                    if let Ok(text) = resp.into_string() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                            shared.update_shared_key_from_partner_b64(v["partner_key"].as_str());
+                        } else {
+                            shared.set_shared_key(None);
                         }
+                    } else {
+                        shared.set_shared_key(None);
                     }
                 }
+                Err(_) => shared.set_shared_key(None),
             }
 
-            // 3. Fetch candidates
+            // 3. Fetch fresh partner candidates.
             let cand_body = serde_json::json!({
                 "token": token,
                 "role": "client",
                 "candidates": local_candidates,
-            }).to_string();
-            if let Ok(resp) = ureq::post(&format!("{url}/api/candidates"))
+            })
+            .to_string();
+            match ureq::post(&format!("{url}/api/candidates"))
                 .set("Content-Type", "application/json")
                 .send_string(&cand_body)
             {
-                if let Ok(text) = resp.into_string() {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let Some(arr) = v["partner_candidates"].as_array() {
-                            let addrs: Vec<SocketAddr> = arr
-                                .iter()
-                                .filter_map(|v| v.as_str()?.parse().ok())
-                                .collect();
-                            if !addrs.is_empty() {
-                                *shared.partner_candidates.lock().unwrap() = addrs;
-                            }
+                Ok(resp) => {
+                    if let Ok(text) = resp.into_string() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                            let addrs: Vec<SocketAddr> = v["partner_candidates"]
+                                .as_array()
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|value| value.as_str()?.parse().ok())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            *shared.partner_candidates.lock().unwrap() = addrs;
+                        } else {
+                            shared.partner_candidates.lock().unwrap().clear();
                         }
+                    } else {
+                        shared.partner_candidates.lock().unwrap().clear();
                     }
                 }
+                Err(_) => shared.partner_candidates.lock().unwrap().clear(),
             }
 
-            // 4. Poll session status for UI
+            // 4. Poll session status for UI.
             let session_body = format!(r#"{{"token":"{token}"}}"#);
             let changed = match ureq::post(&format!("{url}/api/session"))
                 .set("Content-Type", "application/json")
@@ -315,7 +382,6 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
                         clear_host(&shared)
                     }
                 }
-                // 404 (session not found) or any error — no host.
                 Err(_) => clear_host(&shared),
             };
 
@@ -323,7 +389,6 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
                 ctx.request_repaint();
             }
 
-            // Normal poll interval.
             let has_key = shared.shared_key.lock().unwrap().is_some();
             let interval = if has_key {
                 Duration::from_secs(30)
@@ -335,20 +400,107 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
     });
 }
 
+/// Refresh candidates and key material immediately before a punched connection attempt.
+pub fn prepare_punch_attempt(
+    shared: &ApiDiscoveryShared,
+) -> Result<(Vec<SocketAddr>, Arc<CryptoContext>), String> {
+    let url = shared.api_url.lock().unwrap().clone();
+    let token = shared.token.lock().unwrap().clone();
+    let peer_id = shared.peer_id.lock().unwrap().clone();
+    if url.is_empty() || token.is_empty() {
+        return Err("API discovery is not configured".into());
+    }
+
+    let local_candidates = shared.ensure_punch_socket()?;
+
+    let reg_body = serde_json::json!({
+        "token": token,
+        "role": "client",
+        "peer_id": peer_id,
+        "candidates": local_candidates,
+    })
+    .to_string();
+    ureq::post(&format!("{url}/api/register"))
+        .set("Content-Type", "application/json")
+        .send_string(&reg_body)
+        .map_err(|e| format!("register with API: {e}"))?;
+
+    let key_body = serde_json::json!({
+        "token": token,
+        "role": "client",
+        "public_key": shared.public_key_b64(),
+    })
+    .to_string();
+    let key_resp = ureq::post(&format!("{url}/api/key"))
+        .set("Content-Type", "application/json")
+        .send_string(&key_body)
+        .map_err(|e| format!("exchange tunnel key: {e}"))?;
+    let key_text = key_resp
+        .into_string()
+        .map_err(|e| format!("read key response: {e}"))?;
+    let key_json: serde_json::Value =
+        serde_json::from_str(&key_text).map_err(|e| format!("parse key response: {e}"))?;
+    shared.update_shared_key_from_partner_b64(key_json["partner_key"].as_str());
+    let crypto = shared
+        .crypto_context()
+        .ok_or_else(|| "shared tunnel key not ready".to_string())?;
+
+    let cand_body = serde_json::json!({
+        "token": token,
+        "role": "client",
+        "candidates": local_candidates,
+    })
+    .to_string();
+    let cand_resp = ureq::post(&format!("{url}/api/candidates"))
+        .set("Content-Type", "application/json")
+        .send_string(&cand_body)
+        .map_err(|e| format!("refresh punch candidates: {e}"))?;
+    let cand_text = cand_resp
+        .into_string()
+        .map_err(|e| format!("read candidates response: {e}"))?;
+    let cand_json: serde_json::Value = serde_json::from_str(&cand_text)
+        .map_err(|e| format!("parse candidates response: {e}"))?;
+    let partner_candidates: Vec<SocketAddr> = cand_json["partner_candidates"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|value| value.as_str()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    if partner_candidates.is_empty() {
+        return Err("API session does not have any host punch candidates yet".into());
+    }
+    *shared.partner_candidates.lock().unwrap() = partner_candidates.clone();
+
+    let punch_nonce = shared.next_punch_nonce.fetch_add(1, Ordering::Relaxed);
+    let punch_body = serde_json::json!({
+        "token": token,
+        "role": "client",
+        "nonce": punch_nonce,
+    })
+    .to_string();
+    ureq::post(&format!("{url}/api/punch"))
+        .set("Content-Type", "application/json")
+        .send_string(&punch_body)
+        .map_err(|e| format!("request punch from server: {e}"))?;
+
+    Ok((partner_candidates, crypto))
+}
+
 fn parse_session_status(shared: &ApiDiscoveryShared, json: &str) -> bool {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
         return clear_host(shared);
     };
 
     let host_joined = v["host_joined"].as_bool().unwrap_or(false);
-
-    let mut h = shared.host.lock().unwrap();
+    let mut host_guard = shared.host.lock().unwrap();
     if host_joined {
         let mut candidates: Vec<String> = v["host_candidates"]
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
+                    .filter_map(|value| value.as_str().map(String::from))
                     .collect()
             })
             .unwrap_or_default();
@@ -357,17 +509,27 @@ fn parse_session_status(shared: &ApiDiscoveryShared, json: &str) -> bool {
         let hostname = v["host_hostname"].as_str().map(String::from);
         let peer_id = v["host_peer_id"].as_str().map(String::from);
 
-        let was_none = h.is_none();
-        *h = Some(ApiDiscoveredHost {
+        let changed = match host_guard.as_ref() {
+            Some(existing) => {
+                existing.candidates != candidates
+                    || existing.hostname != hostname
+                    || existing.peer_id != peer_id
+            }
+            None => true,
+        };
+        *host_guard = Some(ApiDiscoveredHost {
             candidates,
             hostname,
             peer_id,
             last_seen: Instant::now(),
         });
-        was_none
+        changed
     } else {
-        let was_some = h.is_some();
-        *h = None;
+        let was_some = host_guard.is_some();
+        drop(host_guard);
+        if was_some {
+            clear_host(shared);
+        }
         was_some
     }
 }
@@ -388,11 +550,13 @@ pub fn unregister(shared: &ApiDiscoveryShared) {
     eprintln!("[api] Unregistered from API server");
 }
 
-/// Immediately clear the host entry. Returns true if state changed.
+/// Immediately clear partner-derived state. Returns true if the visible host changed.
 fn clear_host(shared: &ApiDiscoveryShared) -> bool {
-    let mut h = shared.host.lock().unwrap();
-    if h.is_some() {
-        *h = None;
+    shared.partner_candidates.lock().unwrap().clear();
+    shared.set_shared_key(None);
+    let mut host_guard = shared.host.lock().unwrap();
+    if host_guard.is_some() {
+        *host_guard = None;
         true
     } else {
         false

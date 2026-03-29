@@ -2907,7 +2907,7 @@ fn run_connection(
     ctx: egui::Context,
     api_discovery: Arc<api_client::ApiDiscoveryShared>,
 ) {
-    let punched_crypto = api_discovery.crypto_context();
+    let punch_fallback_available = api_discovery.is_connected();
 
     if session_cancelled(
         disconnect.as_ref(),
@@ -2942,46 +2942,56 @@ fn run_connection(
     }
 
     // Try direct TCP first. If it fails and we have tunnel state, fall back to hole punch.
-    let tcp_timeout = if punched_crypto.is_some() { 3 } else { 5 };
+    let tcp_timeout = if punch_fallback_available { 3 } else { 5 };
     let tcp_result = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(tcp_timeout));
 
     let mut tcp = match tcp_result {
         Ok(s) => s,
         Err(tcp_err) => {
-            // Check if we can fall back to hole punching.
-            let partner_cands: Vec<std::net::SocketAddr> =
-                api_discovery.partner_candidates.lock().unwrap().clone();
-            if allow_hole_punch_fallback(socket_addr)
-                && punched_crypto.is_some()
-                && !partner_cands.is_empty()
-            {
-                eprintln!(
-                    "[connect] Direct TCP to {socket_addr} failed ({tcp_err}), attempting hole punch..."
-                );
-                // Delegate to the punched session path.
-                run_punched_session(
-                    partner_cands,
-                    punched_crypto.unwrap(),
-                    token,
-                    display_refresh_millihz,
-                    video_codec_support,
-                    excluded_video_codecs,
-                    state,
-                    frame_buf,
-                    debug_state,
-                    disconnect,
-                    connection_epoch,
-                    session_epoch,
-                    audio_enabled,
-                    debug_enabled,
-                    native_surfaces,
-                    shared_input,
-                    control_rx,
-                    input_rx,
-                    ctx,
-                    api_discovery,
-                );
-                return;
+            if allow_hole_punch_fallback(socket_addr) && punch_fallback_available {
+                match api_client::prepare_punch_attempt(api_discovery.as_ref()) {
+                    Ok((partner_cands, punched_crypto)) => {
+                        eprintln!(
+                            "[connect] Direct TCP to {socket_addr} failed ({tcp_err}), attempting hole punch..."
+                        );
+                        run_punched_session(
+                            partner_cands,
+                            punched_crypto,
+                            token,
+                            display_refresh_millihz,
+                            video_codec_support,
+                            excluded_video_codecs,
+                            state,
+                            frame_buf,
+                            debug_state,
+                            disconnect,
+                            connection_epoch,
+                            session_epoch,
+                            audio_enabled,
+                            debug_enabled,
+                            native_surfaces,
+                            shared_input,
+                            control_rx,
+                            input_rx,
+                            ctx,
+                            api_discovery,
+                        );
+                        return;
+                    }
+                    Err(punch_err) => {
+                        set_error(
+                            &state,
+                            &ctx,
+                            &disconnect,
+                            &connection_epoch,
+                            session_epoch,
+                            format!(
+                                "Connection failed: {tcp_err}. Hole punch setup failed: {punch_err}"
+                            ),
+                        );
+                        return;
+                    }
+                }
             }
             set_error(
                 &state,
@@ -3624,17 +3634,20 @@ fn run_punched_session(
 ) {
     use st_protocol::reliable_udp::{PunchedMessage, PunchedSocket};
 
-    // Take the pre-bound punch socket from API discovery.
-    let socket = match api_discovery.take_punch_socket() {
-        Some(s) => s,
-        None => match std::net::UdpSocket::bind("0.0.0.0:0") {
-            Ok(s) => s,
-            Err(e) => {
-                set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch,
-                    format!("Failed to bind punch socket: {e}"));
-                return;
-            }
-        },
+    // Clone the process-lifetime punch socket from API discovery.
+    let socket = match api_discovery.clone_punch_socket() {
+        Ok(socket) => socket,
+        Err(e) => {
+            set_error(
+                &state,
+                &ctx,
+                &disconnect,
+                &connection_epoch,
+                session_epoch,
+                format!("Failed to prepare punch socket: {e}"),
+            );
+            return;
+        }
     };
 
     {
