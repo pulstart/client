@@ -1051,14 +1051,16 @@ impl VideoDecoder {
         frame_out.plane0.clear();
         frame_out.plane1.clear();
         frame_out.plane2.clear();
+        let decoder_frame_ref = Some(FfmpegVideoFrameRef::retain(decoded)?);
         frame_out.clear_native_surfaces();
         frame_out.dmabuf = Some(LinuxDmaBufFrame {
             width: drm_frame.width(),
             height: drm_frame.height(),
             format: dmabuf_format,
             planes,
+            decoder_frame_ref: decoder_frame_ref.clone(),
         });
-        frame_out.decoder_frame_ref = Some(FfmpegVideoFrameRef::retain(decoded)?);
+        frame_out.decoder_frame_ref = decoder_frame_ref;
         self.note_hw_frame_access(HwFrameAccess::DmaBuf, Pixel::DRM_PRIME);
         Ok(())
     }
@@ -1093,14 +1095,16 @@ impl VideoDecoder {
         frame_out.plane0.clear();
         frame_out.plane1.clear();
         frame_out.plane2.clear();
+        let decoder_frame_ref = Some(FfmpegVideoFrameRef::retain(decoded)?);
         frame_out.clear_native_surfaces();
         frame_out.videotoolbox = Some(MacosVideoToolboxFrame {
             width: decoded.width(),
             height: decoded.height(),
             format,
             pixel_buffer,
+            decoder_frame_ref: decoder_frame_ref.clone(),
         });
-        frame_out.decoder_frame_ref = Some(FfmpegVideoFrameRef::retain(decoded)?);
+        frame_out.decoder_frame_ref = decoder_frame_ref;
         self.note_hw_frame_access(HwFrameAccess::DirectMap, Pixel::VIDEOTOOLBOX);
         Ok(())
     }
@@ -1148,6 +1152,7 @@ impl VideoDecoder {
         frame_out.plane0.clear();
         frame_out.plane1.clear();
         frame_out.plane2.clear();
+        let decoder_frame_ref = Some(FfmpegVideoFrameRef::retain(decoded)?);
         frame_out.clear_native_surfaces();
         frame_out.d3d11 = Some(WindowsD3d11Frame {
             width: decoded.width(),
@@ -1158,8 +1163,9 @@ impl VideoDecoder {
             video_context,
             texture,
             array_index,
+            decoder_frame_ref: decoder_frame_ref.clone(),
         });
-        frame_out.decoder_frame_ref = Some(FfmpegVideoFrameRef::retain(decoded)?);
+        frame_out.decoder_frame_ref = decoder_frame_ref;
         self.note_hw_frame_access(HwFrameAccess::DirectMap, Pixel::D3D11);
         Ok(())
     }

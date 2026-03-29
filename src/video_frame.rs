@@ -5,7 +5,10 @@ use std::ffi::c_void;
 use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VideoFormat {
@@ -88,6 +91,8 @@ impl NativeSurfaceControl {
     }
 }
 
+pub type FfmpegVideoFrameHold = Arc<FfmpegVideoFrameRef>;
+
 pub struct FfmpegVideoFrameRef {
     ptr: *mut ffmpeg::sys::AVFrame,
 }
@@ -96,7 +101,7 @@ unsafe impl Send for FfmpegVideoFrameRef {}
 unsafe impl Sync for FfmpegVideoFrameRef {}
 
 impl FfmpegVideoFrameRef {
-    pub fn retain(frame: &ffmpeg::util::frame::Video) -> Result<Self, String> {
+    pub fn retain(frame: &ffmpeg::util::frame::Video) -> Result<FfmpegVideoFrameHold, String> {
         unsafe {
             let mut ptr = ffmpeg::sys::av_frame_alloc();
             if ptr.is_null() {
@@ -107,7 +112,7 @@ impl FfmpegVideoFrameRef {
                 ffmpeg::sys::av_frame_free(&mut ptr);
                 return Err(format!("av_frame_ref failed: {ret}"));
             }
-            Ok(Self { ptr })
+            Ok(Arc::new(Self { ptr }))
         }
     }
 }
@@ -146,6 +151,7 @@ pub struct LinuxDmaBufFrame {
     pub height: u32,
     pub format: LinuxDmaBufFormat,
     pub planes: Vec<LinuxDmaBufPlane>,
+    pub decoder_frame_ref: Option<FfmpegVideoFrameHold>,
 }
 
 #[cfg(target_os = "linux")]
@@ -176,6 +182,7 @@ impl LinuxDmaBufFrame {
             height: self.height,
             format: self.format,
             planes,
+            decoder_frame_ref: self.decoder_frame_ref.clone(),
         })
     }
 }
@@ -228,6 +235,7 @@ pub struct MacosVideoToolboxFrame {
     pub height: u32,
     pub format: VideoFormat,
     pub pixel_buffer: MacosCvPixelBuffer,
+    pub decoder_frame_ref: Option<FfmpegVideoFrameHold>,
 }
 
 #[cfg(target_os = "macos")]
@@ -238,6 +246,7 @@ impl Clone for MacosVideoToolboxFrame {
             height: self.height,
             format: self.format,
             pixel_buffer: self.pixel_buffer.clone(),
+            decoder_frame_ref: self.decoder_frame_ref.clone(),
         }
     }
 }
@@ -294,6 +303,7 @@ pub struct WindowsD3d11Frame {
     pub video_context: WindowsComPtr,
     pub texture: WindowsComPtr,
     pub array_index: u32,
+    pub decoder_frame_ref: Option<FfmpegVideoFrameHold>,
 }
 
 #[cfg(target_os = "windows")]
@@ -308,6 +318,7 @@ impl Clone for WindowsD3d11Frame {
             video_context: self.video_context.clone(),
             texture: self.texture.clone(),
             array_index: self.array_index,
+            decoder_frame_ref: self.decoder_frame_ref.clone(),
         }
     }
 }
@@ -335,7 +346,7 @@ pub struct VideoFrameBuffer {
     pub videotoolbox: Option<MacosVideoToolboxFrame>,
     #[cfg(target_os = "windows")]
     pub d3d11: Option<WindowsD3d11Frame>,
-    pub decoder_frame_ref: Option<FfmpegVideoFrameRef>,
+    pub decoder_frame_ref: Option<FfmpegVideoFrameHold>,
     pub debug_timing: Option<FrameDebugTiming>,
     pub dirty: bool,
 }

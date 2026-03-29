@@ -23,6 +23,12 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
 
+fn direct_present_enabled() -> bool {
+    std::env::var("ST_CLIENT_DISABLE_DIRECT_PRESENT")
+        .map(|raw| raw == "0")
+        .unwrap_or(true)
+}
+
 pub struct NativeVideoTexture {
     texture: Option<glow::Texture>,
     texture_id: Option<egui::TextureId>,
@@ -227,6 +233,7 @@ impl LinuxDirectVideoPresenterState {
 
 impl NativeVideoTexture {
     pub fn new(gl: Option<&Arc<glow::Context>>) -> Self {
+        let direct_present = direct_present_enabled();
         Self {
             texture: None,
             texture_id: None,
@@ -238,7 +245,7 @@ impl NativeVideoTexture {
             #[cfg(target_os = "linux")]
             dmabuf_importer: None,
             #[cfg(target_os = "linux")]
-            linux_direct_presenter: Some(LinuxDirectVideoPresenter::new()),
+            linux_direct_presenter: direct_present.then(LinuxDirectVideoPresenter::new),
             #[cfg(target_os = "macos")]
             macos_videotoolbox_supported: MacosMetalVideoPresenter::supported()
                 || gl
@@ -249,9 +256,9 @@ impl NativeVideoTexture {
             #[cfg(target_os = "macos")]
             rect_yuv_pipeline: None,
             #[cfg(target_os = "macos")]
-            macos_metal_presenter: Some(MacosMetalVideoPresenter::new()),
+            macos_metal_presenter: direct_present.then(MacosMetalVideoPresenter::new),
             #[cfg(target_os = "macos")]
-            macos_direct_presenter: Some(MacosDirectVideoPresenter::new()),
+            macos_direct_presenter: direct_present.then(MacosDirectVideoPresenter::new),
             #[cfg(target_os = "windows")]
             windows_d3d11_supported: gl
                 .map(|gl| WindowsD3d11Importer::probe(gl))
@@ -259,7 +266,7 @@ impl NativeVideoTexture {
             #[cfg(target_os = "windows")]
             windows_d3d11_importer: None,
             #[cfg(target_os = "windows")]
-            windows_direct_presenter: Some(WindowsDirectVideoPresenter::new()),
+            windows_direct_presenter: direct_present.then(WindowsDirectVideoPresenter::new),
         }
     }
 
