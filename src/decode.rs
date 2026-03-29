@@ -7,7 +7,8 @@ use crate::video_frame::WindowsD3d11Frame;
 #[cfg(target_os = "linux")]
 use crate::video_frame::{LinuxDmaBufFormat, LinuxDmaBufFrame, LinuxDmaBufPlane};
 use crate::video_frame::{
-    NativeSurfaceCapabilities, NativeSurfaceControl, VideoFormat, VideoFrameBuffer,
+    FfmpegVideoFrameRef, NativeSurfaceCapabilities, NativeSurfaceControl, VideoFormat,
+    VideoFrameBuffer,
 };
 use ffmpeg::codec::{self, packet, Context as CodecContext};
 use ffmpeg::decoder::Video as FfmpegVideoDecoder;
@@ -1057,6 +1058,7 @@ impl VideoDecoder {
             format: dmabuf_format,
             planes,
         });
+        frame_out.decoder_frame_ref = Some(FfmpegVideoFrameRef::retain(decoded)?);
         self.note_hw_frame_access(HwFrameAccess::DmaBuf, Pixel::DRM_PRIME);
         Ok(())
     }
@@ -1098,6 +1100,7 @@ impl VideoDecoder {
             format,
             pixel_buffer,
         });
+        frame_out.decoder_frame_ref = Some(FfmpegVideoFrameRef::retain(decoded)?);
         self.note_hw_frame_access(HwFrameAccess::DirectMap, Pixel::VIDEOTOOLBOX);
         Ok(())
     }
@@ -1156,6 +1159,7 @@ impl VideoDecoder {
             texture,
             array_index,
         });
+        frame_out.decoder_frame_ref = Some(FfmpegVideoFrameRef::retain(decoded)?);
         self.note_hw_frame_access(HwFrameAccess::DirectMap, Pixel::D3D11);
         Ok(())
     }

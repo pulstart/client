@@ -1,3 +1,4 @@
+use ffmpeg_next as ffmpeg;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::ffi::c_void;
 #[cfg(target_os = "linux")]
@@ -83,6 +84,40 @@ impl NativeSurfaceControl {
             linux_dmabuf: mask & Self::LINUX_DMABUF_BIT != 0,
             macos_videotoolbox: mask & Self::MACOS_VIDEOTOOLBOX_BIT != 0,
             windows_d3d11: mask & Self::WINDOWS_D3D11_BIT != 0,
+        }
+    }
+}
+
+pub struct FfmpegVideoFrameRef {
+    ptr: *mut ffmpeg::sys::AVFrame,
+}
+
+unsafe impl Send for FfmpegVideoFrameRef {}
+unsafe impl Sync for FfmpegVideoFrameRef {}
+
+impl FfmpegVideoFrameRef {
+    pub fn retain(frame: &ffmpeg::util::frame::Video) -> Result<Self, String> {
+        unsafe {
+            let mut ptr = ffmpeg::sys::av_frame_alloc();
+            if ptr.is_null() {
+                return Err("av_frame_alloc failed".into());
+            }
+            let ret = ffmpeg::sys::av_frame_ref(ptr, frame.as_ptr());
+            if ret < 0 {
+                ffmpeg::sys::av_frame_free(&mut ptr);
+                return Err(format!("av_frame_ref failed: {ret}"));
+            }
+            Ok(Self { ptr })
+        }
+    }
+}
+
+impl Drop for FfmpegVideoFrameRef {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.ptr.is_null() {
+                ffmpeg::sys::av_frame_free(&mut self.ptr);
+            }
         }
     }
 }
@@ -300,6 +335,7 @@ pub struct VideoFrameBuffer {
     pub videotoolbox: Option<MacosVideoToolboxFrame>,
     #[cfg(target_os = "windows")]
     pub d3d11: Option<WindowsD3d11Frame>,
+    pub decoder_frame_ref: Option<FfmpegVideoFrameRef>,
     pub debug_timing: Option<FrameDebugTiming>,
     pub dirty: bool,
 }
@@ -319,6 +355,7 @@ impl Default for VideoFrameBuffer {
             videotoolbox: None,
             #[cfg(target_os = "windows")]
             d3d11: None,
+            decoder_frame_ref: None,
             debug_timing: None,
             dirty: false,
         }
@@ -350,6 +387,7 @@ impl VideoFrameBuffer {
         {
             self.d3d11 = None;
         }
+        self.decoder_frame_ref = None;
     }
 
     pub fn chroma_width(&self) -> u32 {
