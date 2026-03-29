@@ -31,7 +31,7 @@ use st_protocol::{
     StreamConfig, TransportFeedback, VideoCodec, VideoCodecSupport, MOUSE_BUTTON_EXTRA1,
     MOUSE_BUTTON_EXTRA2, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::{Ipv6Addr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
@@ -85,6 +85,7 @@ struct DiscoveredServer {
     hostname: String,
     address: String,
     token: String,
+    peer_id: Option<String>,
     last_seen: Instant,
 }
 
@@ -230,6 +231,46 @@ fn normalize_server_addr(input: &str) -> String {
     format!("{trimmed}:{DEFAULT_APP_PORT}")
 }
 
+fn addr_host(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some((host, _)) = rest.split_once(']') {
+            return host;
+        }
+    }
+    addr.rsplit_once(':').map(|(host, _)| host).unwrap_or(addr)
+}
+
+fn addr_ip(addr: &str) -> Option<std::net::IpAddr> {
+    addr_host(addr).parse().ok()
+}
+
+fn is_privateish_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
+        }
+    }
+}
+
+fn is_public_addr(addr: &str) -> bool {
+    addr_ip(addr).map(|ip| !is_privateish_ip(ip)).unwrap_or(false)
+}
+
+fn preferred_api_display_addr(host: &api_client::ApiDiscoveredHost) -> Option<String> {
+    host.candidates
+        .iter()
+        .find(|candidate| is_public_addr(candidate))
+        .cloned()
+        .or_else(|| host.candidates.first().cloned())
+}
+
+fn allow_hole_punch_fallback(socket_addr: std::net::SocketAddr) -> bool {
+    !is_privateish_ip(socket_addr.ip())
+}
+
 
 
 fn load_audio_enabled() -> bool {
@@ -338,6 +379,8 @@ struct ServerEntry {
     address: String,
     #[serde(default)]
     nickname: String,
+    #[serde(default)]
+    peer_id: Option<String>,
     /// Unix timestamp (seconds) of last successful connection, 0 if never.
     #[serde(default)]
     last_connected: u64,
@@ -369,6 +412,7 @@ fn ensure_server_in_list(list: &mut Vec<ServerEntry>, addr: &str) {
         list.push(ServerEntry {
             address: normalized,
             nickname: String::new(),
+            peer_id: None,
             last_connected: 0,
         });
     }
@@ -386,6 +430,7 @@ fn touch_server_connected(list: &mut Vec<ServerEntry>, addr: &str) {
         list.push(ServerEntry {
             address: normalized,
             nickname: String::new(),
+            peer_id: None,
             last_connected: now,
         });
     }
@@ -453,6 +498,11 @@ fn start_discovery_listener(
                         let hostname = lines[1].to_string();
                         let port: u16 = lines[2].parse().unwrap_or(DEFAULT_APP_PORT);
                         let token = lines[3].to_string();
+                        let peer_id = lines
+                            .get(4)
+                            .map(|value| value.trim())
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string);
                         let address = format!("{}:{port}", src_addr.ip());
 
                         let mut servers = discovered.lock().unwrap();
@@ -461,6 +511,7 @@ fn start_discovery_listener(
                         if let Some(existing) = servers.iter_mut().find(|s| s.address == address) {
                             existing.hostname = hostname;
                             existing.token = token;
+                            existing.peer_id = peer_id;
                             existing.last_seen = Instant::now();
                             changed = servers.len() != before;
                         } else {
@@ -468,6 +519,7 @@ fn start_discovery_listener(
                                 hostname,
                                 address,
                                 token,
+                                peer_id,
                                 last_seen: Instant::now(),
                             });
                             changed = true;
@@ -1974,21 +2026,39 @@ impl StreamApp {
             .filter(|d| d.last_seen.elapsed() < DISCOVERY_EXPIRY)
             .collect();
         let lan_addrs: Vec<String> = lan_servers.iter().map(|d| d.address.clone()).collect();
+        let lan_peer_ids: BTreeSet<String> = lan_servers
+            .iter()
+            .filter_map(|d| d.peer_id.clone())
+            .collect();
 
-        // Collect API-discovered host: best candidate (already sorted local-first) + hostname.
+        // Collect API-discovered host: prefer a public address for fallback UI,
+        // but suppress the API card entirely when the same peer is already on LAN.
         let api_host = self.api_discovery.host.lock().unwrap().clone();
-        let api_best: Option<(String, Option<String>)> = api_host
+        let api_best: Option<(String, Option<String>, Option<String>)> = api_host
             .as_ref()
             .filter(|h| !h.candidates.is_empty() && h.last_seen.elapsed() < Duration::from_secs(15))
-            .map(|h| (h.candidates[0].clone(), h.hostname.clone()));
+            .and_then(|h| {
+                if h.peer_id
+                    .as_ref()
+                    .map(|peer_id| lan_peer_ids.contains(peer_id))
+                    .unwrap_or(false)
+                {
+                    None
+                } else {
+                    preferred_api_display_addr(h).map(|addr| {
+                        (addr, h.hostname.clone(), h.peer_id.clone())
+                    })
+                }
+            });
         // For the empty-check below.
-        let api_candidates: Vec<String> = api_best.iter().map(|(a, _)| a.clone()).collect();
+        let api_candidates: Vec<String> = api_best.iter().map(|(a, _, _)| a.clone()).collect();
 
         // Merged entry for rendering.
         struct MergedServer {
             address: String,
             display_name: String,
             subtitle: String,
+            peer_id: Option<String>,
             is_lan: bool,
             is_dynamic: bool, // LAN or API discovered — don't allow delete
             saved_idx: Option<usize>,
@@ -1997,6 +2067,7 @@ impl StreamApp {
 
         let mut merged: Vec<MergedServer> = Vec::new();
         let mut seen_addrs: Vec<String> = Vec::new();
+        let mut seen_peer_ids: BTreeSet<String> = BTreeSet::new();
 
         // 1) Saved servers (preserve order: most recently connected first).
         let mut indices: Vec<usize> = (0..self.server_list.len()).collect();
@@ -2005,9 +2076,14 @@ impl StreamApp {
                 .last_connected
                 .cmp(&self.server_list[a].last_connected)
         });
-        let api_addr = api_best.as_ref().map(|(a, _)| a.clone());
+        let api_addr = api_best.as_ref().map(|(a, _, _)| a.clone());
         for idx in &indices {
             let entry = &self.server_list[*idx];
+            if let Some(peer_id) = entry.peer_id.as_ref() {
+                if lan_peer_ids.contains(peer_id) || seen_peer_ids.contains(peer_id) {
+                    continue;
+                }
+            }
             let is_lan = lan_addrs.contains(&entry.address);
             let is_api = api_addr.as_deref() == Some(entry.address.as_str());
             let display_name = if entry.nickname.is_empty() {
@@ -2021,10 +2097,14 @@ impl StreamApp {
                 format_last_connected(entry.last_connected)
             };
             seen_addrs.push(entry.address.clone());
+            if let Some(peer_id) = entry.peer_id.as_ref() {
+                seen_peer_ids.insert(peer_id.clone());
+            }
             merged.push(MergedServer {
                 address: entry.address.clone(),
                 display_name,
                 subtitle,
+                peer_id: entry.peer_id.clone(),
                 is_lan,
                 is_dynamic: is_lan || is_api,
                 saved_idx: Some(*idx),
@@ -2034,12 +2114,24 @@ impl StreamApp {
 
         // 2) LAN-discovered servers not already in the saved list.
         for srv in &lan_servers {
+            if srv
+                .peer_id
+                .as_ref()
+                .map(|peer_id| seen_peer_ids.contains(peer_id))
+                .unwrap_or(false)
+            {
+                continue;
+            }
             if !seen_addrs.contains(&srv.address) {
                 seen_addrs.push(srv.address.clone());
+                if let Some(peer_id) = srv.peer_id.as_ref() {
+                    seen_peer_ids.insert(peer_id.clone());
+                }
                 merged.push(MergedServer {
                     address: srv.address.clone(),
                     display_name: srv.hostname.clone(),
                     subtitle: truncate_str(&srv.address, 24).to_string(),
+                    peer_id: srv.peer_id.clone(),
                     is_lan: true,
                     is_dynamic: true,
                     saved_idx: None,
@@ -2049,14 +2141,26 @@ impl StreamApp {
         }
 
         // 3) API-discovered best candidate (not already shown).
-        if let Some((ref addr, ref hostname)) = api_best {
-            if !seen_addrs.contains(addr) {
+        if let Some((ref addr, ref hostname, ref peer_id)) = api_best {
+            let peer_seen = peer_id
+                .as_ref()
+                .map(|peer_id| seen_peer_ids.contains(peer_id))
+                .unwrap_or(false);
+            if !peer_seen && !seen_addrs.contains(addr) {
                 seen_addrs.push(addr.clone());
+                if let Some(peer_id) = peer_id.as_ref() {
+                    seen_peer_ids.insert(peer_id.clone());
+                }
                 let name = hostname.as_deref().unwrap_or(addr.as_str());
                 merged.push(MergedServer {
                     address: addr.clone(),
                     display_name: name.to_string(),
-                    subtitle: if hostname.is_some() { addr.clone() } else { String::new() },
+                    subtitle: if hostname.is_some() {
+                        addr.clone()
+                    } else {
+                        String::new()
+                    },
+                    peer_id: peer_id.clone(),
                     is_lan: false,
                     is_dynamic: true,
                     saved_idx: None,
@@ -2197,12 +2301,15 @@ impl StreamApp {
                             connect_addr = Some(srv.address.clone());
                             // Ensure it gets into saved list.
                             ensure_server_in_list(&mut self.server_list, &srv.address);
-                            // Copy hostname as nickname for LAN-discovered entries.
-                            if srv.saved_idx.is_none() {
-                                if let Some(entry) = self.server_list.iter_mut().find(|e| e.address == srv.address) {
+                            if let Some(entry) = self.server_list.iter_mut().find(|e| e.address == srv.address) {
+                                // Copy hostname as nickname for LAN-discovered entries.
+                                if srv.saved_idx.is_none() {
                                     if entry.nickname.is_empty() && srv.display_name != srv.address {
                                         entry.nickname = srv.display_name.clone();
                                     }
+                                }
+                                if entry.peer_id.is_none() {
+                                    entry.peer_id = srv.peer_id.clone();
                                 }
                             }
                             save_server_list(&self.server_list);
@@ -2844,7 +2951,10 @@ fn run_connection(
             // Check if we can fall back to hole punching.
             let partner_cands: Vec<std::net::SocketAddr> =
                 api_discovery.partner_candidates.lock().unwrap().clone();
-            if punched_crypto.is_some() && !partner_cands.is_empty() {
+            if allow_hole_punch_fallback(socket_addr)
+                && punched_crypto.is_some()
+                && !partner_cands.is_empty()
+            {
                 eprintln!(
                     "[connect] Direct TCP to {socket_addr} failed ({tcp_err}), attempting hole punch..."
                 );

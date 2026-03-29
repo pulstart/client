@@ -11,6 +11,8 @@ pub struct ApiDiscoveredHost {
     pub candidates: Vec<String>,
     /// Hostname reported by the host.
     pub hostname: Option<String>,
+    /// Stable host identifier from the signaling service.
+    pub peer_id: Option<String>,
     pub last_seen: Instant,
 }
 
@@ -353,11 +355,13 @@ fn parse_session_status(shared: &ApiDiscoveryShared, json: &str) -> bool {
         sort_candidates(&mut candidates);
 
         let hostname = v["host_hostname"].as_str().map(String::from);
+        let peer_id = v["host_peer_id"].as_str().map(String::from);
 
         let was_none = h.is_none();
         *h = Some(ApiDiscoveredHost {
             candidates,
             hostname,
+            peer_id,
             last_seen: Instant::now(),
         });
         was_none
