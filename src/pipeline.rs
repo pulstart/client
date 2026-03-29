@@ -57,6 +57,7 @@ impl RepaintPacer {
 
 struct QueuedVideoFrame {
     present_at: Instant,
+    frame_id: Option<u32>,
     frame: VideoFrameBuffer,
 }
 
@@ -72,6 +73,7 @@ struct VideoPlayoutBuffer {
     max_queued_frames: usize,
     queued: VecDeque<QueuedVideoFrame>,
     last_scheduled_at: Option<Instant>,
+    last_presented_frame_id: Option<u32>,
 }
 
 impl VideoPlayoutBuffer {
@@ -86,10 +88,33 @@ impl VideoPlayoutBuffer {
             max_queued_frames: configured_video_jitter_max_frames(),
             queued: VecDeque::new(),
             last_scheduled_at: None,
+            last_presented_frame_id: None,
         }
     }
 
     fn enqueue(&mut self, frame: VideoFrameBuffer) -> Option<VideoFrameBuffer> {
+        let frame_id = frame.debug_timing.as_ref().map(|timing| timing.frame_id);
+        if let Some(frame_id) = frame_id {
+            if self
+                .last_presented_frame_id
+                .map(|last| !frame_id_is_newer(frame_id, last))
+                .unwrap_or(false)
+            {
+                return Some(frame);
+            }
+
+            if self
+                .queued
+                .iter()
+                .rev()
+                .find_map(|queued| queued.frame_id)
+                .map(|last| !frame_id_is_newer(frame_id, last))
+                .unwrap_or(false)
+            {
+                return Some(frame);
+            }
+        }
+
         let now = Instant::now();
         let candidate = now + self.min_delay;
         let present_at = self
@@ -98,7 +123,11 @@ impl VideoPlayoutBuffer {
             .map(|(last, interval)| candidate.max(last + interval))
             .unwrap_or(candidate);
         self.last_scheduled_at = Some(present_at);
-        self.queued.push_back(QueuedVideoFrame { present_at, frame });
+        self.queued.push_back(QueuedVideoFrame {
+            present_at,
+            frame_id,
+            frame,
+        });
         if self.queued.len() > self.max_queued_frames.max(1) {
             return self.queued.pop_front().map(|queued| queued.frame);
         }
@@ -121,13 +150,32 @@ impl VideoPlayoutBuffer {
             .map(|queued| queued.present_at <= now)
             .unwrap_or(false)
         {
-            let frame = self.queued.pop_front().expect("front checked").frame;
+            let queued = self.queued.pop_front().expect("front checked");
+            if queued
+                .frame_id
+                .zip(self.last_presented_frame_id)
+                .map(|(frame_id, last)| !frame_id_is_newer(frame_id, last))
+                .unwrap_or(false)
+            {
+                due.dropped.push(queued.frame);
+                continue;
+            }
+
+            if let Some(frame_id) = queued.frame_id {
+                self.last_presented_frame_id = Some(frame_id);
+            }
+            let frame = queued.frame;
             if let Some(previous) = due.present.replace(frame) {
                 due.dropped.push(previous);
             }
         }
         due
     }
+}
+
+fn frame_id_is_newer(candidate: u32, previous: u32) -> bool {
+    let delta = candidate.wrapping_sub(previous);
+    delta > 0 && delta < 0x8000_0000
 }
 
 fn configured_video_jitter_delay(stream_fps: u16) -> Duration {
@@ -403,5 +451,82 @@ fn request_recovery_keyframe(
     *last_recovery_keyframe_request = Instant::now();
     if trace {
         eprintln!("[trace][client] requested recovery keyframe after {reason}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{frame_id_is_newer, VideoPlayoutBuffer};
+    use crate::video_frame::{FrameDebugTiming, VideoFrameBuffer};
+    use std::time::Duration;
+
+    fn frame_with_id(frame_id: u32) -> VideoFrameBuffer {
+        let mut frame = VideoFrameBuffer::default();
+        frame.debug_timing = Some(FrameDebugTiming {
+            frame_id,
+            ..FrameDebugTiming::default()
+        });
+        frame
+    }
+
+    #[test]
+    fn frame_ids_use_wrap_aware_ordering() {
+        assert!(frame_id_is_newer(11, 10));
+        assert!(!frame_id_is_newer(10, 10));
+        assert!(!frame_id_is_newer(9, 10));
+        assert!(frame_id_is_newer(0, u32::MAX));
+        assert!(frame_id_is_newer(1, u32::MAX));
+        assert!(!frame_id_is_newer(u32::MAX, 0));
+    }
+
+    #[test]
+    fn enqueue_drops_frame_older_than_last_queued() {
+        let mut playout = VideoPlayoutBuffer::new(60);
+        playout.min_delay = Duration::ZERO;
+        playout.frame_interval = None;
+        playout.max_queued_frames = 8;
+
+        assert!(playout.enqueue(frame_with_id(11)).is_none());
+        let dropped = playout.enqueue(frame_with_id(10)).expect("stale frame dropped");
+        assert_eq!(
+            dropped
+                .debug_timing
+                .as_ref()
+                .expect("frame id")
+                .frame_id,
+            10
+        );
+        assert_eq!(playout.queued.len(), 1);
+    }
+
+    #[test]
+    fn enqueue_drops_frame_older_than_last_presented() {
+        let mut playout = VideoPlayoutBuffer::new(60);
+        playout.min_delay = Duration::ZERO;
+        playout.frame_interval = None;
+        playout.max_queued_frames = 8;
+
+        assert!(playout.enqueue(frame_with_id(10)).is_none());
+        let due = playout.take_due_frames();
+        let presented = due.present.expect("presented frame");
+        assert_eq!(
+            presented
+                .debug_timing
+                .as_ref()
+                .expect("frame id")
+                .frame_id,
+            10
+        );
+
+        let dropped = playout.enqueue(frame_with_id(9)).expect("stale frame dropped");
+        assert_eq!(
+            dropped
+                .debug_timing
+                .as_ref()
+                .expect("frame id")
+                .frame_id,
+            9
+        );
+        assert!(playout.queued.is_empty());
     }
 }
