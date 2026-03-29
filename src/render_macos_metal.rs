@@ -377,6 +377,7 @@ impl MetalVideoRenderer {
         self.pending_submissions.push(PendingSubmission {
             command_buffer,
             cv_textures: imported_textures.cv_textures,
+            frame: frame.clone(),
         });
 
         Ok(())
@@ -530,6 +531,7 @@ impl Drop for MetalVideoRenderer {
 struct PendingSubmission {
     command_buffer: CommandBuffer,
     cv_textures: Vec<NonNull<c_void>>,
+    frame: MacosVideoToolboxFrame,
 }
 
 struct ImportedTextures<'a> {

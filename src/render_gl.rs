@@ -6,6 +6,8 @@ use crate::render_macos_metal::MacosMetalVideoPresenter;
 use crate::render_windows::{WindowsD3d11Importer, WindowsDirectVideoPresenter};
 #[cfg(target_os = "linux")]
 use crate::video_frame::{LinuxDmaBufFormat, LinuxDmaBufFrame, LinuxDmaBufPlane};
+#[cfg(target_os = "macos")]
+use crate::video_frame::MacosVideoToolboxFrame;
 use crate::video_frame::{
     NativeSurfaceCapabilities, NativeSurfaceControl, VideoFormat, VideoFrameBuffer,
 };
@@ -22,6 +24,11 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
+#[cfg(target_os = "macos")]
+use std::collections::VecDeque;
+
+#[cfg(target_os = "macos")]
+const MACOS_FRAME_KEEPALIVE_DEPTH: usize = 6;
 
 fn direct_present_enabled() -> bool {
     std::env::var("ST_CLIENT_DISABLE_DIRECT_PRESENT")
@@ -51,6 +58,8 @@ pub struct NativeVideoTexture {
     macos_metal_presenter: Option<MacosMetalVideoPresenter>,
     #[cfg(target_os = "macos")]
     macos_direct_presenter: Option<MacosDirectVideoPresenter>,
+    #[cfg(target_os = "macos")]
+    macos_recent_frames: VecDeque<MacosVideoToolboxFrame>,
     #[cfg(target_os = "windows")]
     windows_d3d11_supported: bool,
     #[cfg(target_os = "windows")]
@@ -259,6 +268,8 @@ impl NativeVideoTexture {
             macos_metal_presenter: direct_present.then(MacosMetalVideoPresenter::new),
             #[cfg(target_os = "macos")]
             macos_direct_presenter: direct_present.then(MacosDirectVideoPresenter::new),
+            #[cfg(target_os = "macos")]
+            macos_recent_frames: VecDeque::with_capacity(MACOS_FRAME_KEEPALIVE_DEPTH),
             #[cfg(target_os = "windows")]
             windows_d3d11_supported: gl
                 .map(|gl| WindowsD3d11Importer::probe(gl))
@@ -355,9 +366,21 @@ impl NativeVideoTexture {
         if let Some(presenter) = self.macos_direct_presenter.as_ref() {
             presenter.clear();
         }
+        #[cfg(target_os = "macos")]
+        {
+            self.macos_recent_frames.clear();
+        }
         #[cfg(target_os = "windows")]
         if let Some(presenter) = self.windows_direct_presenter.as_ref() {
             presenter.clear();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn retain_recent_macos_frame(&mut self, frame: &MacosVideoToolboxFrame) {
+        self.macos_recent_frames.push_back(frame.clone());
+        while self.macos_recent_frames.len() > MACOS_FRAME_KEEPALIVE_DEPTH {
+            self.macos_recent_frames.pop_front();
         }
     }
 
@@ -387,6 +410,7 @@ impl NativeVideoTexture {
             };
             if let Some(presenter) = self.macos_metal_presenter.as_mut() {
                 if presenter.is_enabled() && presenter.stage_frame(frame) {
+                    self.retain_recent_macos_frame(frame);
                     self.width = video.width;
                     self.height = video.height;
                     return true;
@@ -400,6 +424,7 @@ impl NativeVideoTexture {
             }
 
             presenter.stage_frame(frame);
+            self.retain_recent_macos_frame(frame);
             self.width = video.width;
             self.height = video.height;
             return true;
@@ -634,6 +659,7 @@ impl NativeVideoTexture {
                 .ok_or_else(|| "failed to initialize rectangle YUV pipeline".to_string())?;
             match importer.import_and_render(gl.as_ref(), output_texture, pipeline, videotoolbox) {
                 Ok(()) => {
+                    self.retain_recent_macos_frame(videotoolbox);
                     self.width = video.width;
                     self.height = video.height;
                     return Ok(());
