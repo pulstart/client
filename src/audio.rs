@@ -11,12 +11,11 @@ const SAMPLE_RATE: u32 = 48000;
 const CHANNELS: u32 = 2;
 /// Maximum Opus frame size at 48kHz (120ms frame).
 const MAX_OPUS_FRAME_SAMPLES: usize = 5760;
-/// Target steady-state client audio buffer (~40ms at 48kHz stereo).
-const TARGET_BUFFER_SAMPLES: usize = (SAMPLE_RATE as usize * CHANNELS as usize) / 25;
-/// Maximum audio buffer in samples (~120ms at 48kHz stereo).
-const MAX_BUFFER_SAMPLES: usize = (SAMPLE_RATE as usize * CHANNELS as usize * 12) / 100;
 /// Conceal up to 60ms of consecutive missing packets before resyncing.
 const MAX_CONCEALED_AUDIO_PACKETS: usize = 3;
+const DEFAULT_TARGET_BUFFER_MS: usize = 20;
+const DEFAULT_MAX_BUFFER_MS: usize = 60;
+const DEFAULT_MAX_QUEUED_PACKETS: usize = 2;
 
 struct PlaybackBuffer {
     samples: VecDeque<f32>,
@@ -29,6 +28,21 @@ pub fn run_audio_pipeline(
     shutdown_rx: Receiver<()>,
 ) -> Result<(), String> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    let target_buffer_samples = configured_audio_buffer_samples(
+        "ST_CLIENT_AUDIO_BUFFER_MS",
+        DEFAULT_TARGET_BUFFER_MS,
+    );
+    let max_buffer_samples = configured_audio_buffer_samples(
+        "ST_CLIENT_AUDIO_MAX_BUFFER_MS",
+        DEFAULT_MAX_BUFFER_MS,
+    )
+    .max(target_buffer_samples * 2);
+    let max_queued_packets = std::env::var("ST_CLIENT_AUDIO_MAX_BACKLOG_PACKETS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .map(|value| value.clamp(1, 8))
+        .unwrap_or(DEFAULT_MAX_QUEUED_PACKETS);
 
     // Create Opus decoder
     let mut decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo)
@@ -48,7 +62,7 @@ pub fn run_audio_pipeline(
 
     // Shared ring buffer between decode thread and cpal callback
     let ring: Arc<Mutex<PlaybackBuffer>> = Arc::new(Mutex::new(PlaybackBuffer {
-        samples: VecDeque::with_capacity(MAX_BUFFER_SAMPLES),
+        samples: VecDeque::with_capacity(max_buffer_samples),
         primed: false,
         last_sample: 0.0,
     }));
@@ -69,7 +83,7 @@ pub fn run_audio_pipeline(
                         return;
                     }
                 };
-                if !buf.primed && buf.samples.len() >= TARGET_BUFFER_SAMPLES {
+                if !buf.primed && buf.samples.len() >= target_buffer_samples {
                     buf.primed = true;
                 }
                 for sample in output.iter_mut() {
@@ -99,17 +113,28 @@ pub fn run_audio_pipeline(
     let mut expected_seq = None::<u16>;
     let trace = std::env::var_os("ST_TRACE").is_some();
     let mut concealment_logs = 0usize;
+    let mut backlog_logs = 0usize;
 
     loop {
         if shutdown_rx.try_recv().is_ok() {
             break;
         }
 
-        let packet = match opus_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+        let mut packet = match opus_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(d) => d,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
+        if trim_packet_backlog(
+            &opus_rx,
+            &mut packet,
+            &ring,
+            max_queued_packets,
+            trace,
+            &mut backlog_logs,
+        ) {
+            expected_seq = None;
+        }
 
         if let Some(expected) = expected_seq {
             let delta = packet.seq.wrapping_sub(expected);
@@ -120,8 +145,16 @@ pub fn run_audio_pipeline(
                         let mut concealed_packets = 0usize;
                         if missing_packets > 1 {
                             for _ in 0..(missing_packets - 1) {
-                                if decode_and_enqueue(&mut decoder, &[], false, &mut pcm_buf, &ring)
-                                    .is_ok()
+                                if decode_and_enqueue(
+                                    &mut decoder,
+                                    &[],
+                                    false,
+                                    &mut pcm_buf,
+                                    &ring,
+                                    target_buffer_samples,
+                                    max_buffer_samples,
+                                )
+                                .is_ok()
                                 {
                                     concealed_packets += 1;
                                 }
@@ -134,12 +167,22 @@ pub fn run_audio_pipeline(
                             true,
                             &mut pcm_buf,
                             &ring,
+                            target_buffer_samples,
+                            max_buffer_samples,
                         )
                         .is_ok();
                         if recovered_with_fec {
                             concealed_packets += 1;
-                        } else if decode_and_enqueue(&mut decoder, &[], false, &mut pcm_buf, &ring)
-                            .is_ok()
+                        } else if decode_and_enqueue(
+                            &mut decoder,
+                            &[],
+                            false,
+                            &mut pcm_buf,
+                            &ring,
+                            target_buffer_samples,
+                            max_buffer_samples,
+                        )
+                        .is_ok()
                         {
                             concealed_packets += 1;
                         }
@@ -167,7 +210,15 @@ pub fn run_audio_pipeline(
             }
         }
 
-        match decode_and_enqueue(&mut decoder, &packet.data, false, &mut pcm_buf, &ring) {
+        match decode_and_enqueue(
+            &mut decoder,
+            &packet.data,
+            false,
+            &mut pcm_buf,
+            &ring,
+            target_buffer_samples,
+            max_buffer_samples,
+        ) {
             Ok(()) => {
                 expected_seq = Some(packet.seq.wrapping_add(1));
             }
@@ -182,21 +233,78 @@ pub fn run_audio_pipeline(
     Ok(())
 }
 
+fn configured_audio_buffer_samples(var: &str, default_ms: usize) -> usize {
+    let buffer_ms = std::env::var(var)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .map(|value| value.clamp(10, 200))
+        .unwrap_or(default_ms);
+    (SAMPLE_RATE as usize * CHANNELS as usize * buffer_ms) / 1000
+}
+
+fn trim_packet_backlog(
+    opus_rx: &Receiver<AudioPacket>,
+    latest_packet: &mut AudioPacket,
+    ring: &Arc<Mutex<PlaybackBuffer>>,
+    max_queued_packets: usize,
+    trace: bool,
+    backlog_logs: &mut usize,
+) -> bool {
+    if opus_rx.len() <= max_queued_packets {
+        return false;
+    }
+
+    let mut dropped_packets = 0usize;
+    while opus_rx.len() > max_queued_packets {
+        match opus_rx.try_recv() {
+            Ok(newer) => {
+                *latest_packet = newer;
+                dropped_packets += 1;
+            }
+            Err(_) => break,
+        }
+    }
+
+    if dropped_packets == 0 {
+        return false;
+    }
+
+    reset_playback_buffer(ring);
+    if trace && *backlog_logs < 12 {
+        eprintln!(
+            "[trace][audio] dropped {} stale queued packet(s) to cut playback latency",
+            dropped_packets
+        );
+        *backlog_logs += 1;
+    }
+    true
+}
+
+fn reset_playback_buffer(ring: &Arc<Mutex<PlaybackBuffer>>) {
+    let mut playback = ring.lock().unwrap();
+    playback.samples.clear();
+    playback.primed = false;
+}
+
 fn decode_and_enqueue(
     decoder: &mut opus::Decoder,
     opus_data: &[u8],
     fec: bool,
     pcm_buf: &mut [f32],
     ring: &Arc<Mutex<PlaybackBuffer>>,
+    target_buffer_samples: usize,
+    max_buffer_samples: usize,
 ) -> Result<(), opus::Error> {
     let samples_per_channel = decoder.decode_float(opus_data, pcm_buf, fec)?;
     let total = samples_per_channel * CHANNELS as usize;
     let mut playback = ring.lock().unwrap();
-    if playback.samples.len() + total > MAX_BUFFER_SAMPLES {
-        let buf_len = playback.samples.len();
-        let excess = buf_len + total - MAX_BUFFER_SAMPLES;
-        playback.samples.drain(..excess.min(buf_len));
-    }
     playback.samples.extend(&pcm_buf[..total]);
+    if playback.samples.len() > max_buffer_samples {
+        let retain = target_buffer_samples
+            .saturating_add(total)
+            .min(max_buffer_samples);
+        let excess = playback.samples.len().saturating_sub(retain);
+        playback.samples.drain(..excess);
+    }
     Ok(())
 }

@@ -2828,7 +2828,7 @@ fn start_media_threads(
         run_input_sender(input_socket, input_target, input_rx, input_stop_rx, input_crypto);
     });
 
-    let (audio_data_tx, audio_data_rx) = crossbeam_channel::bounded::<AudioPacket>(60);
+    let (audio_data_tx, audio_data_rx) = crossbeam_channel::unbounded::<AudioPacket>();
     let (feedback_tx, feedback_rx) = crossbeam_channel::bounded::<TransportFeedback>(8);
     let (decode_started_tx, decode_started_rx) = crossbeam_channel::bounded::<()>(1);
     let present_refresh_millihz =
@@ -2890,7 +2890,7 @@ fn start_punched_media_threads(
     media_packet_rx: crossbeam_channel::Receiver<Vec<u8>>,
 ) -> MediaThreads {
     let receiver = MediaReceiver::from_packet_channel(media_packet_rx);
-    let (audio_data_tx, audio_data_rx) = crossbeam_channel::bounded::<AudioPacket>(60);
+    let (audio_data_tx, audio_data_rx) = crossbeam_channel::unbounded::<AudioPacket>();
     let (feedback_tx, feedback_rx) = crossbeam_channel::bounded::<TransportFeedback>(8);
     let (decode_started_tx, decode_started_rx) = crossbeam_channel::bounded::<()>(1);
     let present_refresh_millihz =
@@ -3849,69 +3849,10 @@ fn run_punched_session(
         }
     }
 
-    eprintln!("[punch] Stream started, setting up media bridge");
+    eprintln!("[punch] Stream started, entering unified punched loop");
     let (media_packet_tx, media_packet_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
-
-    // Bridge thread: PunchedSocket → receive pipeline, plus control message handling.
-    let bridge_running = Arc::new(AtomicBool::new(true));
-    let bridge_running_clone = Arc::clone(&bridge_running);
-    let punched_bridge = Arc::clone(&punched);
-    let shared_input_bridge = Arc::clone(&shared_input);
-    let ctx_bridge = ctx.clone();
-    let bridge_thread = std::thread::spawn(move || {
-        let _ = punched_bridge.set_nonblocking(false);
-        let _ = punched_bridge.set_read_timeout(Some(Duration::from_millis(10)));
-        // Ensure bridge_running is set to false when this thread exits for ANY reason
-        // (panic, error, or clean shutdown) so the main loop does not spin.
-        struct BridgeGuard(Arc<AtomicBool>);
-        impl Drop for BridgeGuard {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Relaxed);
-            }
-        }
-        let _guard = BridgeGuard(Arc::clone(&bridge_running_clone));
-
-        while bridge_running_clone.load(Ordering::Relaxed) {
-            punched_bridge.tick();
-            for msg in punched_bridge.try_recv_all() {
-                match msg {
-                    PunchedMessage::Media(data) => {
-                        if media_packet_tx.send(data).is_err() {
-                            bridge_running_clone.store(false, Ordering::Relaxed);
-                            break;
-                        }
-                    }
-                    PunchedMessage::Control(data) => {
-                        let mut offset = 0;
-                        while let Some((msg, used)) = ControlMessage::deserialize(&data[offset..]) {
-                            offset += used;
-                            match msg {
-                                ControlMessage::CursorShape(shape) => {
-                                    shared_input_bridge.set_cursor_shape(shape);
-                                    ctx_bridge.request_repaint();
-                                }
-                                ControlMessage::CursorState(cs) => {
-                                    shared_input_bridge.set_cursor_state(cs);
-                                    ctx_bridge.request_repaint();
-                                }
-                                ControlMessage::ControllerState(cs) => {
-                                    shared_input_bridge.set_controller_state(cs);
-                                    ctx_bridge.request_repaint();
-                                }
-                                ControlMessage::InputCapabilities(caps) => {
-                                    shared_input_bridge.set_capabilities(caps);
-                                }
-                                ControlMessage::Shutdown | ControlMessage::Error(_) => {
-                                    bridge_running_clone.store(false, Ordering::Relaxed);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
+    let _ = punched.set_nonblocking(true);
+    let _ = punched.set_read_timeout(None);
 
     // --- Set Connected state ---
     {
@@ -3939,6 +3880,13 @@ fn run_punched_session(
     let decode_started_rx = media.decode_started_rx.clone();
     let mut startup_decode_ok = false;
     let startup_deadline = Instant::now() + STARTUP_DECODE_TIMEOUT;
+    let initial_audio =
+        audio_enabled.load(Ordering::SeqCst) && stream_supports_client_audio(&stream_config);
+    audio_enabled.store(initial_audio, Ordering::SeqCst);
+    let _ = punched.send_control(&ControlMessage::SetAudio(initial_audio).serialize());
+    let mut last_audio_state = initial_audio;
+    let mut last_debug_enabled = debug_enabled.load(Ordering::SeqCst);
+    let mut next_clock_ping = Instant::now();
     let mut input_seq: u16 = 0;
     let mut mouse_heartbeat = MouseInputHeartbeat::default();
     let mut keyboard_heartbeat = KeyboardInputHeartbeat::default();
@@ -3946,13 +3894,21 @@ fn run_punched_session(
         if session_cancelled(disconnect.as_ref(), connection_epoch.as_ref(), session_epoch) {
             break;
         }
-        if !bridge_running.load(Ordering::Relaxed) {
-            break;
-        }
 
         // Forward input from UI thread to server via punched socket media channel.
         let now = Instant::now();
         let mut did_work = false;
+        let current_audio = audio_enabled.load(Ordering::SeqCst);
+        if current_audio != last_audio_state {
+            last_audio_state = current_audio;
+            let _ = punched.send_control(&ControlMessage::SetAudio(current_audio).serialize());
+            did_work = true;
+        }
+        let current_debug_enabled = debug_enabled.load(Ordering::SeqCst);
+        if current_debug_enabled && !last_debug_enabled {
+            next_clock_ping = Instant::now();
+        }
+        last_debug_enabled = current_debug_enabled;
         while let Ok(input_pkt) = input_rx.try_recv() {
             did_work = true;
             mouse_heartbeat.observe(input_pkt, now);
@@ -3994,6 +3950,115 @@ fn run_punched_session(
             did_work = true;
             let _ = punched.send_control(&ctrl.serialize());
         }
+        if current_debug_enabled && Instant::now() >= next_clock_ping {
+            let ping = ControlMessage::ClockSyncPing(ClockSyncPing {
+                client_send_micros: unix_time_micros(),
+            });
+            let _ = punched.send_control(&ping.serialize());
+            next_clock_ping = Instant::now() + Duration::from_secs(2);
+            did_work = true;
+        }
+
+        punched.tick();
+        let mut stop_session = false;
+        loop {
+            let incoming = punched.try_recv_all();
+            if incoming.is_empty() {
+                break;
+            }
+            did_work = true;
+            for msg in incoming {
+                match msg {
+                    PunchedMessage::Media(data) => {
+                        if media_packet_tx.send(data).is_err() {
+                            stop_session = true;
+                            break;
+                        }
+                    }
+                    PunchedMessage::Control(data) => {
+                        let mut offset = 0;
+                        while let Some((msg, used)) = ControlMessage::deserialize(&data[offset..]) {
+                            offset += used;
+                            match msg {
+                                ControlMessage::StreamConfig(cfg) => {
+                                    shared_input.set_stream_config(cfg);
+                                }
+                                ControlMessage::SessionDebugInfo(info) => {
+                                    debug_state.set_session_info(info);
+                                }
+                                ControlMessage::ClockSyncPong(pong) => {
+                                    if current_debug_enabled {
+                                        debug_state.update_clock_sync(pong, unix_time_micros());
+                                    }
+                                }
+                                ControlMessage::InputSession(session) => {
+                                    shared_input.set_client_id(session.client_id);
+                                }
+                                ControlMessage::ControllerState(cs) => {
+                                    shared_input.set_controller_state(cs);
+                                    ctx.request_repaint();
+                                }
+                                ControlMessage::InputCapabilities(caps) => {
+                                    shared_input.set_capabilities(caps);
+                                }
+                                ControlMessage::CursorShape(shape) => {
+                                    shared_input.set_cursor_shape(shape);
+                                    ctx.request_repaint();
+                                }
+                                ControlMessage::CursorState(cs) => {
+                                    shared_input.set_cursor_state(cs);
+                                    ctx.request_repaint();
+                                }
+                                ControlMessage::Error(err) => {
+                                    set_error(
+                                        &state,
+                                        &ctx,
+                                        &disconnect,
+                                        &connection_epoch,
+                                        session_epoch,
+                                        format!("Server error: {err}"),
+                                    );
+                                    stop_session = true;
+                                    break;
+                                }
+                                ControlMessage::Shutdown => {
+                                    set_error(
+                                        &state,
+                                        &ctx,
+                                        &disconnect,
+                                        &connection_epoch,
+                                        session_epoch,
+                                        "Server shut down".into(),
+                                    );
+                                    stop_session = true;
+                                    break;
+                                }
+                                ControlMessage::SetAudio(_)
+                                | ControlMessage::ClientDisplayInfo(_)
+                                | ControlMessage::ClientReadyForMedia
+                                | ControlMessage::ClockSyncPing(_)
+                                | ControlMessage::TransportFeedback(_)
+                                | ControlMessage::AcquireControl
+                                | ControlMessage::ReleaseControl
+                                | ControlMessage::RequestKeyframe
+                                | ControlMessage::Authenticate(_)
+                                | ControlMessage::AuthResult(_)
+                                | ControlMessage::StreamStarted => {}
+                            }
+                        }
+                    }
+                }
+                if stop_session {
+                    break;
+                }
+            }
+            if stop_session {
+                break;
+            }
+        }
+        if stop_session {
+            break;
+        }
 
         while decode_started_rx.try_recv().is_ok() {
             startup_decode_ok = true;
@@ -4017,9 +4082,7 @@ fn run_punched_session(
     }
 
     // Cleanup.
-    bridge_running.store(false, Ordering::Relaxed);
     stop_media_threads(media);
-    let _ = bridge_thread.join();
 
     {
         let mut s = state.lock().unwrap();
