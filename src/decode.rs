@@ -9,8 +9,7 @@ use crate::video_frame::{LinuxDmaBufFormat, LinuxDmaBufFrame, LinuxDmaBufPlane};
 use crate::video_frame::{
     NativeSurfaceCapabilities, NativeSurfaceControl, VideoFormat, VideoFrameBuffer,
 };
-use ffmpeg::codec::packet::Borrow as BorrowedPacket;
-use ffmpeg::codec::{self, Context as CodecContext};
+use ffmpeg::codec::{self, packet, Context as CodecContext};
 use ffmpeg::decoder::Video as FfmpegVideoDecoder;
 use ffmpeg::format::Pixel;
 use ffmpeg::software::scaling;
@@ -21,7 +20,7 @@ use std::ffi::CStr;
 #[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::raw::{c_int, c_void};
-use std::ptr;
+use std::{mem, ptr};
 use std::sync::Arc;
 
 /// Owns the hardware device context reference.
@@ -124,6 +123,65 @@ struct ScalerState {
     format: Pixel,
 }
 
+struct StampedBorrowedPacket<'a> {
+    packet: ffmpeg::sys::AVPacket,
+    _data: &'a [u8],
+}
+
+impl<'a> StampedBorrowedPacket<'a> {
+    fn new(data: &'a [u8], frame_id: Option<u32>) -> Self {
+        unsafe {
+            let mut packet: ffmpeg::sys::AVPacket = mem::zeroed();
+            packet.data = data.as_ptr() as *mut _;
+            packet.size = data.len() as c_int;
+            let pts = frame_id
+                .map(i64::from)
+                .unwrap_or(ffmpeg::sys::AV_NOPTS_VALUE);
+            packet.pts = pts;
+            packet.dts = pts;
+            Self {
+                packet,
+                _data: data,
+            }
+        }
+    }
+}
+
+impl packet::Ref for StampedBorrowedPacket<'_> {
+    fn as_ptr(&self) -> *const ffmpeg::sys::AVPacket {
+        &self.packet
+    }
+}
+
+impl Drop for StampedBorrowedPacket<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            self.packet.data = ptr::null_mut();
+            self.packet.size = 0;
+            ffmpeg::sys::av_packet_unref(&mut self.packet);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecodeOutput {
+    pub produced_frame: bool,
+    pub frame_id: Option<u32>,
+    pub dropped_stale_output: bool,
+}
+
+fn frame_id_is_newer(candidate: u32, previous: u32) -> bool {
+    let delta = candidate.wrapping_sub(previous);
+    delta > 0 && delta < 0x8000_0000
+}
+
+fn decoded_frame_id(frame: &VideoFrame) -> Option<u32> {
+    frame
+        .timestamp()
+        .or_else(|| frame.pts())
+        .and_then(|pts| u32::try_from(pts).ok())
+}
+
 pub struct VideoDecoder {
     // NOTE: field order matters for drop — decoder (AVCodecContext) must be
     // freed before hw (AVBufferRef) so the context can unref its copy first.
@@ -142,6 +200,7 @@ pub struct VideoDecoder {
     windows_d3d11_enabled: bool,
     consecutive_failures: u32,
     waiting_for_recovery: bool,
+    last_output_frame_id: Option<u32>,
     decoder_name: String,
     hardware_accelerated: bool,
 }
@@ -431,7 +490,7 @@ impl VideoDecoder {
     }
 
     fn try_test_decode(&mut self, test_data: &[u8]) -> Result<(), String> {
-        let pkt = BorrowedPacket::new(test_data);
+        let pkt = StampedBorrowedPacket::new(test_data, None);
         self.decoder
             .send_packet(&pkt)
             .map_err(|e| format!("send_packet: {e}"))?;
@@ -604,6 +663,7 @@ impl VideoDecoder {
             windows_d3d11_enabled: false,
             consecutive_failures: 0,
             waiting_for_recovery: false,
+            last_output_frame_id: None,
             decoder_name: name.to_string(),
             hardware_accelerated: true,
         })
@@ -636,6 +696,7 @@ impl VideoDecoder {
             windows_d3d11_enabled: false,
             consecutive_failures: 0,
             waiting_for_recovery: false,
+            last_output_frame_id: None,
             decoder_name: name.to_string(),
             hardware_accelerated: false,
         })
@@ -647,19 +708,20 @@ impl VideoDecoder {
     pub fn decode_into(
         &mut self,
         nal_data: &[u8],
+        packet_frame_id: u32,
         frame_out: &mut VideoFrameBuffer,
-    ) -> Result<bool, String> {
+    ) -> Result<DecodeOutput, String> {
         self.refresh_native_surface_capabilities();
         let has_recovery_point = packet_has_recovery_point(self.codec_id, nal_data);
         if self.waiting_for_recovery && !has_recovery_point {
-            return Ok(false);
+            return Ok(DecodeOutput::default());
         }
         if self.waiting_for_recovery && has_recovery_point {
             unsafe {
                 ffmpeg::sys::avcodec_flush_buffers(self.decoder.as_mut_ptr());
             }
         }
-        let pkt = BorrowedPacket::new(nal_data);
+        let pkt = StampedBorrowedPacket::new(nal_data, Some(packet_frame_id));
 
         if let Err(e) = self.decoder.send_packet(&pkt) {
             self.consecutive_failures += 1;
@@ -691,13 +753,13 @@ impl VideoDecoder {
                     self.decoder_name, self.consecutive_failures
                 ));
             }
-            return Ok(false);
+            return Ok(DecodeOutput::default());
         } else if self.waiting_for_recovery && has_recovery_point {
             eprintln!("[decode] {} recovered on recovery frame", self.decoder_name);
             self.waiting_for_recovery = false;
         }
 
-        let mut produced_frame = false;
+        let mut output = DecodeOutput::default();
         let mut decoded = VideoFrame::empty();
         let mut mapped_frame = VideoFrame::empty();
         let mut transferred_frame = VideoFrame::empty();
@@ -705,6 +767,22 @@ impl VideoDecoder {
         while self.decoder.receive_frame(&mut decoded).is_ok() {
             self.consecutive_failures = 0;
             self.waiting_for_recovery = false;
+            let decoded_frame_id = decoded_frame_id(&decoded);
+            if decoded_frame_id
+                .zip(self.last_output_frame_id)
+                .map(|(frame_id, last)| !frame_id_is_newer(frame_id, last))
+                .unwrap_or(false)
+            {
+                output.dropped_stale_output = true;
+                if std::env::var_os("ST_TRACE").is_some() {
+                    eprintln!(
+                        "[trace][decode] dropping stale decoder output frame_id={:?} after {:?}",
+                        decoded_frame_id,
+                        self.last_output_frame_id
+                    );
+                }
+                continue;
+            }
 
             #[cfg(target_os = "linux")]
             if self.linux_dmabuf_enabled {
@@ -712,7 +790,10 @@ impl VideoDecoder {
                     if hw.needs_transfer(&decoded) {
                         match self.try_fill_linux_dmabuf(&decoded, frame_out) {
                             Ok(()) => {
-                                produced_frame = true;
+                                output.produced_frame = true;
+                                let frame_id = decoded_frame_id.unwrap_or(packet_frame_id);
+                                output.frame_id = Some(frame_id);
+                                self.last_output_frame_id = Some(frame_id);
                                 continue;
                             }
                             Err(err) => {
@@ -733,7 +814,10 @@ impl VideoDecoder {
                     if hw.needs_transfer(&decoded) {
                         match self.try_fill_macos_videotoolbox(&decoded, frame_out) {
                             Ok(()) => {
-                                produced_frame = true;
+                                output.produced_frame = true;
+                                let frame_id = decoded_frame_id.unwrap_or(packet_frame_id);
+                                output.frame_id = Some(frame_id);
+                                self.last_output_frame_id = Some(frame_id);
                                 continue;
                             }
                             Err(err) => {
@@ -754,7 +838,10 @@ impl VideoDecoder {
                     if hw.needs_transfer(&decoded) {
                         match self.try_fill_windows_d3d11(&decoded, frame_out) {
                             Ok(()) => {
-                                produced_frame = true;
+                                output.produced_frame = true;
+                                let frame_id = decoded_frame_id.unwrap_or(packet_frame_id);
+                                output.frame_id = Some(frame_id);
+                                self.last_output_frame_id = Some(frame_id);
                                 continue;
                             }
                             Err(err) => {
@@ -799,10 +886,13 @@ impl VideoDecoder {
                 Pixel::NV12 => copy_nv12_frame(source, frame_out),
                 _ => self.copy_rgba_frame(source, frame_out)?,
             }
-            produced_frame = true;
+            output.produced_frame = true;
+            let frame_id = decoded_frame_id.unwrap_or(packet_frame_id);
+            output.frame_id = Some(frame_id);
+            self.last_output_frame_id = Some(frame_id);
         }
 
-        Ok(produced_frame)
+        Ok(output)
     }
 
     pub fn set_native_surface_control(&mut self, control: Arc<NativeSurfaceControl>) {

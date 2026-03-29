@@ -351,7 +351,11 @@ pub fn run_receive_pipeline(
                 for completed in pending_video {
                     let assembled_micros = unix_time_micros();
                     let decode_start_micros = unix_time_micros();
-                    let decoded = match decoder.decode_into(&completed.data, &mut decoded_frame) {
+                    let decoded = match decoder.decode_into(
+                        &completed.data,
+                        completed.frame_id,
+                        &mut decoded_frame,
+                    ) {
                         Ok(frame) => frame,
                         Err(e) => {
                             eprintln!("decode error: {e}");
@@ -367,19 +371,30 @@ pub fn run_receive_pipeline(
                             "decoder recovery wait",
                         );
                     }
+                    if decoded.dropped_stale_output {
+                        request_recovery_keyframe(
+                            &control_tx,
+                            &mut last_recovery_keyframe_request,
+                            trace,
+                            "stale decoder output",
+                        );
+                    }
                     let decode_done_micros = unix_time_micros();
 
                     if trace && trace_completed_logged < 12 {
                         eprintln!(
-                            "[trace][client] decode input frame_id={} produced_frame={decoded}",
-                            completed.frame_id
+                            "[trace][client] decode input frame_id={} produced_frame={} output_frame_id={:?}",
+                            completed.frame_id,
+                            decoded.produced_frame,
+                            decoded.frame_id
                         );
                         trace_completed_logged += 1;
                     }
-                    if decoded {
+                    if decoded.produced_frame {
+                        let frame_id = decoded.frame_id.unwrap_or(completed.frame_id);
                         produced_frame = true;
                         latest_timing = Some(FrameDebugTiming {
-                            frame_id: completed.frame_id,
+                            frame_id,
                             server_capture_micros: completed.timing.capture_ts_micros,
                             server_send_micros: completed.timing.send_ts_micros,
                             client_assembled_micros: assembled_micros,
