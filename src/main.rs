@@ -385,12 +385,23 @@ struct ServerEntry {
     /// Unix timestamp (seconds) of last successful connection, 0 if never.
     #[serde(default)]
     last_connected: u64,
+    /// True only for entries the user explicitly added.
+    #[serde(default)]
+    manually_added: bool,
 }
 
 fn load_server_list() -> Vec<ServerEntry> {
     let path = state_dir().join("servers.json");
     match std::fs::read_to_string(&path) {
-        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+        Ok(data) => {
+            let mut list: Vec<ServerEntry> = serde_json::from_str(&data).unwrap_or_default();
+            let original_len = list.len();
+            list.retain(|entry| entry.manually_added);
+            if list.len() != original_len {
+                save_server_list(&list);
+            }
+            list
+        }
         Err(_) => Vec::new(),
     }
 }
@@ -403,20 +414,27 @@ fn save_server_list(list: &[ServerEntry]) {
     }
 }
 
-/// Ensure the given address is in the server list.
-fn ensure_server_in_list(list: &mut Vec<ServerEntry>, addr: &str) {
+/// Ensure the given address is in the manually added server list.
+fn ensure_server_in_list(list: &mut Vec<ServerEntry>, addr: &str) -> bool {
     let normalized = normalize_server_addr(addr);
     if normalized.is_empty() {
-        return;
+        return false;
     }
-    if !list.iter().any(|s| s.address == normalized) {
-        list.push(ServerEntry {
-            address: normalized,
-            nickname: String::new(),
-            peer_id: None,
-            last_connected: 0,
-        });
+    if let Some(existing) = list.iter_mut().find(|s| s.address == normalized) {
+        if !existing.manually_added {
+            existing.manually_added = true;
+            return true;
+        }
+        return false;
     }
+    list.push(ServerEntry {
+        address: normalized,
+        nickname: String::new(),
+        peer_id: None,
+        last_connected: 0,
+        manually_added: true,
+    });
+    true
 }
 
 fn touch_server_connected(list: &mut Vec<ServerEntry>, addr: &str) {
@@ -427,15 +445,8 @@ fn touch_server_connected(list: &mut Vec<ServerEntry>, addr: &str) {
         .unwrap_or(0);
     if let Some(entry) = list.iter_mut().find(|s| s.address == normalized) {
         entry.last_connected = now;
-    } else {
-        list.push(ServerEntry {
-            address: normalized,
-            nickname: String::new(),
-            peer_id: None,
-            last_connected: now,
-        });
+        save_server_list(list);
     }
-    save_server_list(list);
 }
 
 fn format_last_connected(ts: u64) -> String {
@@ -1880,8 +1891,9 @@ impl StreamApp {
                 && can_add
             {
                 let addr = self.add_server_addr.trim().to_string();
-                ensure_server_in_list(&mut self.server_list, &addr);
-                save_server_list(&self.server_list);
+                if ensure_server_in_list(&mut self.server_list, &addr) {
+                    save_server_list(&self.server_list);
+                }
                 self.add_server_addr.clear();
             }
             bottom_ui.add_space(4.0);
@@ -1900,8 +1912,9 @@ impl StreamApp {
                 .clicked()
             {
                 let addr = self.add_server_addr.trim().to_string();
-                ensure_server_in_list(&mut self.server_list, &addr);
-                save_server_list(&self.server_list);
+                if ensure_server_in_list(&mut self.server_list, &addr) {
+                    save_server_list(&self.server_list);
+                }
                 self.add_server_addr.clear();
             }
         }
@@ -2301,20 +2314,23 @@ impl StreamApp {
                         );
                         if btn_resp.clicked() {
                             connect_addr = Some(srv.address.clone());
-                            // Ensure it gets into saved list.
-                            ensure_server_in_list(&mut self.server_list, &srv.address);
+                            let mut changed = false;
                             if let Some(entry) = self.server_list.iter_mut().find(|e| e.address == srv.address) {
                                 // Copy hostname as nickname for LAN-discovered entries.
                                 if srv.saved_idx.is_none() {
                                     if entry.nickname.is_empty() && srv.display_name != srv.address {
                                         entry.nickname = srv.display_name.clone();
+                                        changed = true;
                                     }
                                 }
                                 if entry.peer_id.is_none() {
                                     entry.peer_id = srv.peer_id.clone();
+                                    changed = true;
                                 }
                             }
-                            save_server_list(&self.server_list);
+                            if changed {
+                                save_server_list(&self.server_list);
+                            }
                         }
 
                         // Delete X in top-right corner (only for saved, non-dynamic servers)
