@@ -26,7 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, GetWindowLongW, SetWindowLongW, SetWindowPos, ShowWindow,
     HMENU, SHOW_WINDOW_CMD, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
     SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA, WINDOW_EX_STYLE,
-    WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WS_CHILD, WS_CLIPCHILDREN, WS_DISABLED, WS_VISIBLE,
+    WINDOW_LONG_PTR_INDEX, WS_CHILD, WS_CLIPCHILDREN, WS_DISABLED, WS_VISIBLE,
 };
 
 pub struct WindowsNativeVideoPresenter {
@@ -189,8 +189,8 @@ impl WindowsSwapchainRenderer {
                 0,
                 0,
                 Some(parent_hwnd),
-                Some(HMENU(0)),
-                Some(HINSTANCE(0)),
+                Some(HMENU(std::ptr::null_mut())),
+                Some(HINSTANCE(std::ptr::null_mut())),
                 None,
             )
             .map_err(|err| format!("CreateWindowExW(STATIC) failed: {err}"))?

@@ -196,11 +196,14 @@ fn configured_video_jitter_delay(stream_fps: u16) -> Duration {
         return Duration::from_secs_f64((0.5 / f64::from(stream_fps)).clamp(0.003, 0.008));
     }
 
-    if stream_fps == 0 {
-        return Duration::from_millis(18);
-    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if stream_fps == 0 {
+            return Duration::from_millis(18);
+        }
 
-    Duration::from_secs_f64((1.0 / f64::from(stream_fps)).clamp(0.012, 0.030))
+        Duration::from_secs_f64((1.0 / f64::from(stream_fps)).clamp(0.012, 0.030))
+    }
 }
 
 fn configured_video_jitter_max_frames() -> usize {
