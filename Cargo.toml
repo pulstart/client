@@ -8,6 +8,8 @@ eframe = "0.33"
 st-protocol = { path = "protocol", features = ["tunnel"] }
 ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "software-scaling"] }
 crossbeam-channel = "0.5"
+dirs = "5"
+sha2 = "0.10"
 cpal = "0.15"
 opus = "0.3"
 arboard = "3"

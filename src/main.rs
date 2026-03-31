@@ -5,6 +5,7 @@ mod audio;
 mod clipboard;
 mod debug_state;
 mod decode;
+mod file_transfer;
 mod graph_overlay;
 mod display;
 mod input;
@@ -183,6 +184,7 @@ struct StreamApp {
     suppress_mouse_delta: bool,
     suppress_pointer_pos_frames: u8,
     excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
+    file_transfer_state: file_transfer::SharedTransferState,
     update_ui_state: UpdateUiState,
     update_tx: crossbeam_channel::Sender<UpdateWorkerEvent>,
     update_rx: crossbeam_channel::Receiver<UpdateWorkerEvent>,
@@ -673,6 +675,7 @@ impl StreamApp {
             suppress_mouse_delta: false,
             suppress_pointer_pos_frames: 0,
             excluded_video_codecs: Arc::new(Mutex::new(st_protocol::VideoCodecSupport::empty())),
+            file_transfer_state: file_transfer::new_shared_state(),
             update_ui_state,
             update_tx,
             update_rx,
@@ -733,6 +736,8 @@ impl StreamApp {
         let shared_input = Arc::clone(&self.shared_input);
         let token = self.token.clone();
         let api_disc = Arc::clone(&self.api_discovery);
+        let ft_state = file_transfer::new_shared_state();
+        self.file_transfer_state = Arc::clone(&ft_state);
         debug_state.reset_for_connect(&addr, display_refresh_millihz);
 
         std::thread::spawn(move || {
@@ -756,6 +761,7 @@ impl StreamApp {
                 input_rx,
                 ctx,
                 api_disc,
+                ft_state,
             );
         });
     }
@@ -2906,6 +2912,150 @@ impl StreamApp {
 
         overlay_top
     }
+
+    fn render_file_transfer_overlay(&mut self, ctx: &egui::Context, menu_bottom: f32) {
+        use st_protocol::file_transfer::{format_bytes, TransferDirection, TransferStatus};
+
+        let (pending, entries) = {
+            let guard = self.file_transfer_state.lock().unwrap();
+            if guard.pending_offers.is_empty() && guard.entries.is_empty() {
+                return;
+            }
+            (guard.pending_offers.clone(), guard.entries.clone())
+        };
+
+        let panel_width = 280.0;
+        let x = self.menu_button_pos.x;
+        let y = menu_bottom + 4.0;
+        let text_color = egui::Color32::from_rgb(220, 220, 220);
+        let dim_color = egui::Color32::from_rgb(140, 140, 140);
+        let accent_color = egui::Color32::from_rgb(80, 160, 255);
+
+        let area = egui::Area::new(egui::Id::new("file_transfer_overlay"))
+            .fixed_pos(egui::pos2(x, y))
+            .order(egui::Order::Foreground);
+
+        let resp = area.show(ctx, |ui| {
+            let frame = egui::Frame::NONE
+                .fill(egui::Color32::from_rgba_unmultiplied(12, 12, 12, 220))
+                .rounding(egui::Rounding::same(6))
+                .inner_margin(egui::Margin::same(8));
+
+            frame.show(ui, |ui| {
+                ui.set_width(panel_width);
+
+                // --- Pending offers: "N files ready to paste" ---
+                if !pending.is_empty() {
+                    let total_size: u64 = pending.iter().map(|o| o.file_size).sum();
+                    let label = if pending.len() == 1 {
+                        format!("{} ({})", pending[0].file_name, format_bytes(total_size))
+                    } else {
+                        format!("{} files ({})", pending.len(), format_bytes(total_size))
+                    };
+
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(label)
+                                .color(text_color)
+                                .size(12.0),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .button(egui::RichText::new("Paste").color(accent_color).size(12.0))
+                                .clicked()
+                            {
+                                let mut guard = self.file_transfer_state.lock().unwrap();
+                                for offer in &pending {
+                                    guard.accept_queue.push(offer.transfer_id);
+                                }
+                            }
+                        });
+                    });
+                    if pending.len() > 1 {
+                        for offer in &pending {
+                            let name = if offer.file_name.len() > 30 {
+                                format!("  {}...", &offer.file_name[..27])
+                            } else {
+                                format!("  {}", offer.file_name)
+                            };
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} ({})",
+                                    name,
+                                    format_bytes(offer.file_size)
+                                ))
+                                .color(dim_color)
+                                .size(10.0),
+                            );
+                        }
+                    }
+                    if !entries.is_empty() {
+                        ui.add_space(4.0);
+                        ui.separator();
+                    }
+                }
+
+                // --- Active / completed transfers ---
+                for entry in &entries {
+                    let dir_icon = match entry.direction {
+                        TransferDirection::Sending => "^ ",
+                        TransferDirection::Receiving => "v ",
+                    };
+                    let display_name = if entry.file_name.len() > 24 {
+                        format!("{}...", &entry.file_name[..21])
+                    } else {
+                        entry.file_name.clone()
+                    };
+
+                    ui.label(
+                        egui::RichText::new(format!("{dir_icon}{display_name}"))
+                            .color(text_color)
+                            .size(12.0),
+                    );
+
+                    if matches!(entry.status, TransferStatus::Active | TransferStatus::Verifying) {
+                        let progress = if entry.total_bytes > 0 {
+                            entry.transferred_bytes as f32 / entry.total_bytes as f32
+                        } else {
+                            1.0
+                        };
+                        ui.add(egui::ProgressBar::new(progress).desired_height(10.0));
+
+                        let elapsed = entry.started_at.elapsed().as_secs_f64();
+                        let speed = if elapsed > 0.1 {
+                            entry.transferred_bytes as f64 / elapsed
+                        } else {
+                            0.0
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} / {}  {}/s",
+                                format_bytes(entry.transferred_bytes),
+                                format_bytes(entry.total_bytes),
+                                format_bytes(speed as u64),
+                            ))
+                            .color(dim_color)
+                            .size(10.0),
+                        );
+                    } else {
+                        let status = match entry.status {
+                            TransferStatus::AwaitingAccept => "waiting...",
+                            TransferStatus::Completed => "completed",
+                            TransferStatus::Cancelled => "cancelled",
+                            TransferStatus::Failed => "failed",
+                            _ => "",
+                        };
+                        ui.label(egui::RichText::new(status).color(dim_color).size(10.0));
+                    }
+
+                    ui.add_space(4.0);
+                }
+            });
+        });
+
+        self.local_overlay_hit_rects.push(resp.response.rect);
+        ctx.request_repaint();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3127,6 +3277,7 @@ fn run_connection(
     input_rx: crossbeam_channel::Receiver<InputPacket>,
     ctx: egui::Context,
     api_discovery: Arc<api_client::ApiDiscoveryShared>,
+    ft_shared_state: file_transfer::SharedTransferState,
 ) {
     let punch_fallback_available = api_discovery.is_connected();
 
@@ -3196,6 +3347,7 @@ fn run_connection(
                             input_rx,
                             ctx,
                             api_discovery,
+                            ft_shared_state,
                         );
                         return;
                     }
@@ -3594,6 +3746,7 @@ fn run_connection(
                         | ControlMessage::ClipboardText(_)
                         | ControlMessage::Authenticate(_)
                         | ControlMessage::AuthResult(_) => {}
+                        _ => {}
                     }
                 }
                 if stream_started && media_threads.is_some() {
@@ -3623,7 +3776,10 @@ fn run_connection(
     let decode_started_rx = media_threads.decode_started_rx.clone();
     let (clipboard_control_tx, clipboard_control_rx) =
         crossbeam_channel::bounded::<ControlMessage>(8);
-    let mut clipboard_sync = clipboard::ClipboardSync::start(
+    let (file_detect_tx, file_detect_rx) =
+        crossbeam_channel::bounded::<std::path::PathBuf>(8);
+    let suppressed_paths = clipboard::new_suppressed_paths();
+    let mut clipboard_sync = clipboard::ClipboardSync::start_with_file_detection(
         "client",
         true,
         {
@@ -3631,6 +3787,13 @@ fn run_connection(
             move || shared_input.snapshot().controller_state == ControllerState::OwnedByYou
         },
         clipboard_control_tx,
+        file_detect_tx,
+        Arc::clone(&suppressed_paths),
+    );
+    let mut ft_manager = file_transfer::FileTransferManager::start_full(
+        st_protocol::file_transfer::TransportMode::Direct,
+        Arc::clone(&ft_shared_state),
+        suppressed_paths,
     );
 
     // Connected!
@@ -3690,6 +3853,14 @@ fn run_connection(
         while let Ok(msg) = clipboard_control_rx.try_recv() {
             let _ = tcp.write_all(&msg.serialize());
         }
+        while let Ok(path) = file_detect_rx.try_recv() {
+            let _ = ft_manager.inbound_tx.try_send(
+                file_transfer::FtInbound::SendFile { path },
+            );
+        }
+        while let Ok(msg) = ft_manager.outbound_rx.try_recv() {
+            let _ = tcp.write_all(&msg.serialize());
+        }
         while let Ok(msg) = pipeline_control_rx.try_recv() {
             let _ = tcp.write_all(&msg.serialize());
         }
@@ -3716,6 +3887,7 @@ fn run_connection(
             *state.lock().unwrap() = ConnectionState::Disconnected;
             ctx.request_repaint();
             clipboard_sync.stop();
+            ft_manager.stop();
             stop_media_threads(media_threads);
             return;
         }
@@ -3782,6 +3954,36 @@ fn run_connection(
                         ControlMessage::ClipboardText(text) => {
                             clipboard_sync.set_remote_text(text);
                         }
+                        ControlMessage::FileOffer { transfer_id, file_size, file_name } => {
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::OfferReceived { transfer_id, file_size, file_name },
+                            );
+                        }
+                        ControlMessage::FileAccept { transfer_id, accepted } => {
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::AcceptReceived { transfer_id, accepted },
+                            );
+                        }
+                        ControlMessage::FileChunk { transfer_id, chunk_index, data } => {
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::ChunkReceived { transfer_id, chunk_index, data },
+                            );
+                        }
+                        ControlMessage::FileComplete { transfer_id, total_chunks, sha256 } => {
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::CompleteReceived { transfer_id, total_chunks, sha256 },
+                            );
+                        }
+                        ControlMessage::FileCancel { transfer_id } => {
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::CancelReceived { transfer_id },
+                            );
+                        }
+                        ControlMessage::FileProgress { transfer_id, chunks_received } => {
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::ProgressReceived { transfer_id, chunks_received },
+                            );
+                        }
                         ControlMessage::Error(err) => {
                             set_error(
                                 &state,
@@ -3804,17 +4006,7 @@ fn run_connection(
                             );
                             should_break = true;
                         }
-                        ControlMessage::SetAudio(_)
-                        | ControlMessage::ClientDisplayInfo(_)
-                        | ControlMessage::ClientReadyForMedia
-                        | ControlMessage::ClockSyncPing(_)
-                        | ControlMessage::TransportFeedback(_)
-                        | ControlMessage::AcquireControl
-                        | ControlMessage::ReleaseControl
-                        | ControlMessage::RequestKeyframe
-                        | ControlMessage::Authenticate(_)
-                        | ControlMessage::AuthResult(_) => {}
-                        ControlMessage::StreamStarted => {}
+                        _ => {}
                     }
                 }
                 if should_break {
@@ -3828,6 +4020,7 @@ fn run_connection(
 
     // Cleanup
     clipboard_sync.stop();
+    ft_manager.stop();
     stop_media_threads(media_threads);
 
     if !session_is_current(connection_epoch.as_ref(), session_epoch) {
@@ -3879,6 +4072,7 @@ fn run_punched_session(
     input_rx: crossbeam_channel::Receiver<InputPacket>,
     ctx: egui::Context,
     api_discovery: Arc<api_client::ApiDiscoveryShared>,
+    ft_shared_state: file_transfer::SharedTransferState,
 ) {
     use st_protocol::reliable_udp::{PunchedMessage, PunchedSocket};
 
@@ -4077,7 +4271,10 @@ fn run_punched_session(
     let mut keyboard_heartbeat = KeyboardInputHeartbeat::default();
     let (clipboard_control_tx, clipboard_control_rx) =
         crossbeam_channel::bounded::<ControlMessage>(8);
-    let mut clipboard_sync = clipboard::ClipboardSync::start(
+    let (file_detect_tx, file_detect_rx) =
+        crossbeam_channel::bounded::<std::path::PathBuf>(8);
+    let suppressed_paths = clipboard::new_suppressed_paths();
+    let mut clipboard_sync = clipboard::ClipboardSync::start_with_file_detection(
         "client-punched",
         true,
         {
@@ -4085,6 +4282,13 @@ fn run_punched_session(
             move || shared_input.snapshot().controller_state == ControllerState::OwnedByYou
         },
         clipboard_control_tx,
+        file_detect_tx,
+        Arc::clone(&suppressed_paths),
+    );
+    let mut ft_manager = file_transfer::FileTransferManager::start_full(
+        st_protocol::file_transfer::TransportMode::Punched,
+        Arc::clone(&ft_shared_state),
+        suppressed_paths,
     );
     loop {
         if session_cancelled(disconnect.as_ref(), connection_epoch.as_ref(), session_epoch) {
@@ -4135,6 +4339,16 @@ fn run_punched_session(
             let _ = punched.send_control(&ctrl.serialize());
         }
         while let Ok(ctrl) = clipboard_control_rx.try_recv() {
+            did_work = true;
+            let _ = punched.send_control(&ctrl.serialize());
+        }
+        while let Ok(path) = file_detect_rx.try_recv() {
+            did_work = true;
+            let _ = ft_manager.inbound_tx.try_send(
+                file_transfer::FtInbound::SendFile { path },
+            );
+        }
+        while let Ok(ctrl) = ft_manager.outbound_rx.try_recv() {
             did_work = true;
             let _ = punched.send_control(&ctrl.serialize());
         }
@@ -4212,6 +4426,36 @@ fn run_punched_session(
                                 ControlMessage::ClipboardText(text) => {
                                     clipboard_sync.set_remote_text(text);
                                 }
+                                ControlMessage::FileOffer { transfer_id, file_size, file_name } => {
+                                    let _ = ft_manager.inbound_tx.try_send(
+                                        file_transfer::FtInbound::OfferReceived { transfer_id, file_size, file_name },
+                                    );
+                                }
+                                ControlMessage::FileAccept { transfer_id, accepted } => {
+                                    let _ = ft_manager.inbound_tx.try_send(
+                                        file_transfer::FtInbound::AcceptReceived { transfer_id, accepted },
+                                    );
+                                }
+                                ControlMessage::FileChunk { transfer_id, chunk_index, data } => {
+                                    let _ = ft_manager.inbound_tx.try_send(
+                                        file_transfer::FtInbound::ChunkReceived { transfer_id, chunk_index, data },
+                                    );
+                                }
+                                ControlMessage::FileComplete { transfer_id, total_chunks, sha256 } => {
+                                    let _ = ft_manager.inbound_tx.try_send(
+                                        file_transfer::FtInbound::CompleteReceived { transfer_id, total_chunks, sha256 },
+                                    );
+                                }
+                                ControlMessage::FileCancel { transfer_id } => {
+                                    let _ = ft_manager.inbound_tx.try_send(
+                                        file_transfer::FtInbound::CancelReceived { transfer_id },
+                                    );
+                                }
+                                ControlMessage::FileProgress { transfer_id, chunks_received } => {
+                                    let _ = ft_manager.inbound_tx.try_send(
+                                        file_transfer::FtInbound::ProgressReceived { transfer_id, chunks_received },
+                                    );
+                                }
                                 ControlMessage::Error(err) => {
                                     set_error(
                                         &state,
@@ -4236,17 +4480,7 @@ fn run_punched_session(
                                     stop_session = true;
                                     break;
                                 }
-                                ControlMessage::SetAudio(_)
-                                | ControlMessage::ClientDisplayInfo(_)
-                                | ControlMessage::ClientReadyForMedia
-                                | ControlMessage::ClockSyncPing(_)
-                                | ControlMessage::TransportFeedback(_)
-                                | ControlMessage::AcquireControl
-                                | ControlMessage::ReleaseControl
-                                | ControlMessage::RequestKeyframe
-                                | ControlMessage::Authenticate(_)
-                                | ControlMessage::AuthResult(_)
-                                | ControlMessage::StreamStarted => {}
+                                _ => {}
                             }
                         }
                     }
@@ -4286,6 +4520,7 @@ fn run_punched_session(
 
     // Cleanup.
     clipboard_sync.stop();
+    ft_manager.stop();
     stop_media_threads(media);
 
     {
@@ -5443,7 +5678,9 @@ impl eframe::App for StreamApp {
         }
 
         let debug_top = if state == ConnectionState::Connected && !self.video_texture.occludes_egui_overlay() {
-            self.render_floating_menu(ctx)
+            let menu_bottom = self.render_floating_menu(ctx);
+            self.render_file_transfer_overlay(ctx, menu_bottom);
+            menu_bottom
         } else {
             self.local_overlay_hit_rects.clear();
             0.0
