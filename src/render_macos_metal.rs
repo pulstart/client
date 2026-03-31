@@ -354,7 +354,7 @@ impl MetalVideoRenderer {
 
         let fragment_params = FragmentParams {
             mode: match frame.format {
-                VideoFormat::Yuv420p8 => 0,
+                VideoFormat::Yuv420p8 | VideoFormat::Yuv444p8 => 0,
                 VideoFormat::Nv12 => 1,
                 VideoFormat::Rgba8 => return Err("unexpected RGBA VideoToolbox frame".into()),
             },
@@ -439,6 +439,7 @@ impl MetalVideoRenderer {
                     cv_textures: vec![y.cv_texture, u.cv_texture, v.cv_texture],
                 })
             }
+            VideoFormat::Yuv444p8 => Err("unsupported VideoToolbox YUV444 layout".into()),
             VideoFormat::Rgba8 => Err("unexpected RGBA VideoToolbox frame".into()),
         }
     }

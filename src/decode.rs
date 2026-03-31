@@ -16,7 +16,7 @@ use ffmpeg::format::Pixel;
 use ffmpeg::software::scaling;
 use ffmpeg::util::frame::Video as VideoFrame;
 use ffmpeg::Codec;
-use st_protocol::{VideoCodec, VideoCodecSupport};
+use st_protocol::{VideoChromaSampling, VideoCodec, VideoCodecSupport};
 use std::ffi::CStr;
 #[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -210,6 +210,8 @@ pub struct VideoDecoder {
 pub struct VideoCodecSupportReport {
     pub supported: VideoCodecSupport,
     pub hardware: VideoCodecSupport,
+    pub yuv444: VideoCodecSupport,
+    pub hardware_yuv444: VideoCodecSupport,
 }
 
 /// A hardware decoder to probe.
@@ -359,13 +361,23 @@ impl VideoDecoder {
     /// 1. `VIDEO_DECODER_HINT` / codec-specific decoder hint
     /// 2. Platform-ordered hardware device / decoder strategies
     /// 3. Software fallback
-    pub fn new(codec: VideoCodec) -> Result<Self, String> {
-        Self::new_internal(codec, true)
+    pub fn new(codec: VideoCodec, chroma: VideoChromaSampling) -> Result<Self, String> {
+        Self::new_internal(codec, chroma, true)
     }
 
-    fn new_internal(codec: VideoCodec, verbose: bool) -> Result<Self, String> {
+    #[allow(dead_code)]
+    pub fn new_software(codec: VideoCodec) -> Result<Self, String> {
         ffmpeg::init().map_err(|e| format!("ffmpeg init: {e}"))?;
-        let test_bitstream = generate_test_bitstream(codec).ok();
+        Self::try_sw_decoder(codec)
+    }
+
+    fn new_internal(
+        codec: VideoCodec,
+        chroma: VideoChromaSampling,
+        verbose: bool,
+    ) -> Result<Self, String> {
+        ffmpeg::init().map_err(|e| format!("ffmpeg init: {e}"))?;
+        let test_bitstream = generate_test_bitstream(codec, chroma).ok();
 
         // 1. User override
         if let Some(hint) = decoder_hint(codec) {
@@ -417,69 +429,27 @@ impl VideoDecoder {
     pub fn detect_supported_codecs() -> VideoCodecSupportReport {
         let mut supported = VideoCodecSupport::empty();
         let mut hardware = VideoCodecSupport::empty();
+        let mut yuv444 = VideoCodecSupport::empty();
+        let mut hardware_yuv444 = VideoCodecSupport::empty();
 
         for codec in [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1] {
-            let test_bitstream = generate_test_bitstream(codec);
-            let mut found = false;
-
-            // Try each hardware probe step with actual decode validation.
-            for step in probe_steps(codec) {
-                if let Ok(mut decoder) = Self::try_probe_step(codec, step) {
-                    match &test_bitstream {
-                        Ok(data) => match decoder.try_test_decode(data) {
-                            Ok(()) => {
-                                eprintln!(
-                                    "[probe] {} decoder '{}' validated (hw={})",
-                                    codec_label(codec),
-                                    decoder.decoder_name,
-                                    decoder.hardware_accelerated,
-                                );
-                                supported.insert(codec);
-                                if decoder.is_hardware_accelerated() {
-                                    hardware.insert(codec);
-                                }
-                                found = true;
-                                break;
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "[probe] {} decoder '{}' failed decode test: {e}",
-                                    codec_label(codec),
-                                    decoder.decoder_name,
-                                );
-                            }
-                        },
-                        Err(_) => {
-                            // No test bitstream — trust the probe
-                            supported.insert(codec);
-                            if decoder.is_hardware_accelerated() {
-                                hardware.insert(codec);
-                            }
-                            found = true;
-                            break;
-                        }
-                    }
-                }
+            let (codec_supported, codec_hardware) =
+                detect_decode_support(codec, VideoChromaSampling::Yuv420);
+            if codec_supported {
+                supported.insert(codec);
+            }
+            if codec_hardware {
+                hardware.insert(codec);
             }
 
-            // Software fallback
-            if !found {
-                if let Ok(mut decoder) = Self::try_sw_decoder(codec) {
-                    match &test_bitstream {
-                        Ok(data) => {
-                            if decoder.try_test_decode(data).is_ok() {
-                                eprintln!(
-                                    "[probe] {} decoder '{}' validated (hw=false)",
-                                    codec_label(codec),
-                                    decoder.decoder_name,
-                                );
-                                supported.insert(codec);
-                            }
-                        }
-                        Err(_) => {
-                            supported.insert(codec);
-                        }
-                    }
+            if codec_supports_yuv444(codec) {
+                let (codec_yuv444, codec_hardware_yuv444) =
+                    detect_decode_support(codec, VideoChromaSampling::Yuv444);
+                if codec_yuv444 {
+                    yuv444.insert(codec);
+                }
+                if codec_hardware_yuv444 {
+                    hardware_yuv444.insert(codec);
                 }
             }
         }
@@ -487,6 +457,8 @@ impl VideoDecoder {
         VideoCodecSupportReport {
             supported,
             hardware,
+            yuv444,
+            hardware_yuv444,
         }
     }
 
@@ -884,6 +856,7 @@ impl VideoDecoder {
 
             match source.format() {
                 Pixel::YUV420P => copy_yuv420_frame(source, frame_out),
+                Pixel::YUV444P => copy_yuv444_frame(source, frame_out),
                 Pixel::NV12 => copy_nv12_frame(source, frame_out),
                 _ => self.copy_rgba_frame(source, frame_out)?,
             }
@@ -1024,6 +997,7 @@ impl VideoDecoder {
         let dmabuf_format = match hw_sw_format(decoded) {
             Pixel::NV12 => LinuxDmaBufFormat::Nv12,
             Pixel::YUV420P => LinuxDmaBufFormat::Yuv420p8,
+            Pixel::YUV444P => LinuxDmaBufFormat::Yuv444p8,
             fmt => {
                 return Err(format!(
                     "{} unsupported dmabuf sw format {}",
@@ -1046,6 +1020,7 @@ impl VideoDecoder {
         frame_out.height = drm_frame.height();
         frame_out.format = match dmabuf_format {
             LinuxDmaBufFormat::Yuv420p8 => VideoFormat::Yuv420p8,
+            LinuxDmaBufFormat::Yuv444p8 => VideoFormat::Yuv444p8,
             LinuxDmaBufFormat::Nv12 => VideoFormat::Nv12,
         };
         frame_out.plane0.clear();
@@ -1285,6 +1260,68 @@ fn codec_label_to_id(codec_id: ffmpeg::sys::AVCodecID) -> Option<VideoCodec> {
     }
 }
 
+fn codec_supports_yuv444(codec: VideoCodec) -> bool {
+    matches!(codec, VideoCodec::H264 | VideoCodec::Hevc)
+}
+
+fn chroma_label(chroma: VideoChromaSampling) -> &'static str {
+    match chroma {
+        VideoChromaSampling::Yuv420 => "yuv420",
+        VideoChromaSampling::Yuv444 => "yuv444",
+    }
+}
+
+fn detect_decode_support(codec: VideoCodec, chroma: VideoChromaSampling) -> (bool, bool) {
+    let test_bitstream = generate_test_bitstream(codec, chroma);
+
+    for step in probe_steps(codec) {
+        if let Ok(mut decoder) = VideoDecoder::try_probe_step(codec, step) {
+            match &test_bitstream {
+                Ok(data) => match decoder.try_test_decode(data) {
+                    Ok(()) => {
+                        eprintln!(
+                            "[probe] {} {} decoder '{}' validated (hw={})",
+                            codec_label(codec),
+                            chroma_label(chroma),
+                            decoder.decoder_name,
+                            decoder.hardware_accelerated,
+                        );
+                        return (true, decoder.is_hardware_accelerated());
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[probe] {} {} decoder '{}' failed decode test: {e}",
+                            codec_label(codec),
+                            chroma_label(chroma),
+                            decoder.decoder_name,
+                        );
+                    }
+                },
+                Err(_) => return (true, decoder.is_hardware_accelerated()),
+            }
+        }
+    }
+
+    if let Ok(mut decoder) = VideoDecoder::try_sw_decoder(codec) {
+        match &test_bitstream {
+            Ok(data) => {
+                if decoder.try_test_decode(data).is_ok() {
+                    eprintln!(
+                        "[probe] {} {} decoder '{}' validated (hw=false)",
+                        codec_label(codec),
+                        chroma_label(chroma),
+                        decoder.decoder_name,
+                    );
+                    return (true, false);
+                }
+            }
+            Err(_) => return (true, false),
+        }
+    }
+
+    (false, false)
+}
+
 fn packet_has_recovery_point(codec: VideoCodec, data: &[u8]) -> bool {
     match codec {
         VideoCodec::H264 => h264_has_recovery_nal(data),
@@ -1468,6 +1505,35 @@ fn copy_yuv420_frame(source: &VideoFrame, frame_out: &mut VideoFrameBuffer) {
     );
 }
 
+fn copy_yuv444_frame(source: &VideoFrame, frame_out: &mut VideoFrameBuffer) {
+    frame_out.width = source.width();
+    frame_out.height = source.height();
+    frame_out.format = VideoFormat::Yuv444p8;
+    frame_out.clear_native_surfaces();
+
+    copy_plane_rows(
+        &mut frame_out.plane0,
+        source.data(0),
+        source.stride(0),
+        source.plane_width(0) as usize,
+        source.plane_height(0) as usize,
+    );
+    copy_plane_rows(
+        &mut frame_out.plane1,
+        source.data(1),
+        source.stride(1),
+        source.plane_width(1) as usize,
+        source.plane_height(1) as usize,
+    );
+    copy_plane_rows(
+        &mut frame_out.plane2,
+        source.data(2),
+        source.stride(2),
+        source.plane_width(2) as usize,
+        source.plane_height(2) as usize,
+    );
+}
+
 fn copy_nv12_frame(source: &VideoFrame, frame_out: &mut VideoFrameBuffer) {
     frame_out.width = source.width();
     frame_out.height = source.height();
@@ -1576,6 +1642,37 @@ fn linux_dmabuf_planes(
                         &layer.planes[2],
                         frame.width().div_ceil(2),
                         frame.height().div_ceil(2),
+                        DRM_FORMAT_R8,
+                    )?,
+                ])
+            }
+            LinuxDmaBufFormat::Yuv444p8 => {
+                if layer.nb_planes < 3 {
+                    return Err(format!(
+                        "YUV444 drm frame missing planes: {}",
+                        layer.nb_planes
+                    ));
+                }
+                Ok(vec![
+                    build_linux_dmabuf_plane(
+                        desc,
+                        &layer.planes[0],
+                        frame.width(),
+                        frame.height(),
+                        DRM_FORMAT_R8,
+                    )?,
+                    build_linux_dmabuf_plane(
+                        desc,
+                        &layer.planes[1],
+                        frame.width(),
+                        frame.height(),
+                        DRM_FORMAT_R8,
+                    )?,
+                    build_linux_dmabuf_plane(
+                        desc,
+                        &layer.planes[2],
+                        frame.width(),
+                        frame.height(),
                         DRM_FORMAT_R8,
                     )?,
                 ])
@@ -1753,6 +1850,7 @@ fn pixel_label(pixel: Pixel) -> &'static str {
         Pixel::D3D11 | Pixel::D3D11VA_VLD => "d3d11",
         Pixel::NV12 => "nv12",
         Pixel::YUV420P => "yuv420p",
+        Pixel::YUV444P => "yuv444p",
         Pixel::RGBA => "rgba",
         _ => "other",
     }
@@ -1849,24 +1947,48 @@ unsafe fn apply_flags(ctx: *mut ffmpeg::sys::AVCodecContext, is_hw: bool) {
 /// Return a minimal single-keyframe test bitstream for the given codec.
 /// Uses embedded pre-encoded bitstreams (works on all platforms), with a
 /// runtime software-encoder fallback for freshness.
-fn generate_test_bitstream(codec: VideoCodec) -> Result<Vec<u8>, String> {
-    if let Ok(data) = generate_test_bitstream_runtime(codec) {
+fn generate_test_bitstream(
+    codec: VideoCodec,
+    chroma: VideoChromaSampling,
+) -> Result<Vec<u8>, String> {
+    if let Ok(data) = generate_test_bitstream_runtime(codec, chroma) {
         return Ok(data);
     }
-    // Fallback: embedded pre-encoded bitstreams (64x64 black frame).
-    let embedded: &[u8] = match codec {
-        VideoCodec::H264 => EMBEDDED_TEST_H264,
-        VideoCodec::Hevc => EMBEDDED_TEST_HEVC,
-        VideoCodec::Av1 => EMBEDDED_TEST_AV1,
-    };
-    Ok(embedded.to_vec())
+    match chroma {
+        VideoChromaSampling::Yuv420 => {
+            let embedded: &[u8] = match codec {
+                VideoCodec::H264 => EMBEDDED_TEST_H264,
+                VideoCodec::Hevc => EMBEDDED_TEST_HEVC,
+                VideoCodec::Av1 => EMBEDDED_TEST_AV1,
+            };
+            Ok(embedded.to_vec())
+        }
+        VideoChromaSampling::Yuv444 => {
+            let embedded: &[u8] = match codec {
+                VideoCodec::H264 => EMBEDDED_TEST_H264_YUV444,
+                VideoCodec::Hevc => EMBEDDED_TEST_HEVC_YUV444,
+                VideoCodec::Av1 => {
+                    return Err("embedded AV1 YUV444 test bitstream unavailable".into())
+                }
+            };
+            Ok(embedded.to_vec())
+        }
+    }
 }
 
-fn generate_test_bitstream_runtime(codec: VideoCodec) -> Result<Vec<u8>, String> {
+fn generate_test_bitstream_runtime(
+    codec: VideoCodec,
+    chroma: VideoChromaSampling,
+) -> Result<Vec<u8>, String> {
     let encoder_name: &CStr = match codec {
         VideoCodec::H264 => c"libx264",
         VideoCodec::Hevc => c"libx265",
-        VideoCodec::Av1 => c"libsvtav1",
+        VideoCodec::Av1 => {
+            if chroma == VideoChromaSampling::Yuv444 {
+                return Err("AV1 YUV444 probe generation is not implemented".into());
+            }
+            c"libsvtav1"
+        }
     };
 
     unsafe {
@@ -1883,7 +2005,10 @@ fn generate_test_bitstream_runtime(codec: VideoCodec) -> Result<Vec<u8>, String>
         // 256x256: must exceed NVDEC minimum (128x128 for AV1/HEVC CUVID)
         (*ctx).width = 256;
         (*ctx).height = 256;
-        (*ctx).pix_fmt = ffmpeg::sys::AVPixelFormat::AV_PIX_FMT_YUV420P;
+        (*ctx).pix_fmt = match chroma {
+            VideoChromaSampling::Yuv420 => ffmpeg::sys::AVPixelFormat::AV_PIX_FMT_YUV420P,
+            VideoChromaSampling::Yuv444 => ffmpeg::sys::AVPixelFormat::AV_PIX_FMT_YUV444P,
+        };
         (*ctx).time_base = ffmpeg::sys::AVRational { num: 1, den: 30 };
         (*ctx).max_b_frames = 0;
 
@@ -1899,6 +2024,15 @@ fn generate_test_bitstream_runtime(codec: VideoCodec) -> Result<Vec<u8>, String>
             (*ctx).gop_size = 1;
             (*ctx).bit_rate = 200_000;
         }
+        match (codec, chroma) {
+            (VideoCodec::H264, VideoChromaSampling::Yuv444) => {
+                (*ctx).profile = ffmpeg::sys::FF_PROFILE_H264_HIGH_444_PREDICTIVE;
+            }
+            (VideoCodec::Hevc, VideoChromaSampling::Yuv444) => {
+                (*ctx).profile = ffmpeg::sys::FF_PROFILE_HEVC_REXT;
+            }
+            _ => {}
+        }
 
         if ffmpeg::sys::avcodec_open2(ctx, enc, ptr::null_mut()) < 0 {
             ffmpeg::sys::avcodec_free_context(&mut ctx);
@@ -1912,7 +2046,10 @@ fn generate_test_bitstream_runtime(codec: VideoCodec) -> Result<Vec<u8>, String>
         }
         (*frame).width = 256;
         (*frame).height = 256;
-        (*frame).format = ffmpeg::sys::AVPixelFormat::AV_PIX_FMT_YUV420P as c_int;
+        (*frame).format = match chroma {
+            VideoChromaSampling::Yuv420 => ffmpeg::sys::AVPixelFormat::AV_PIX_FMT_YUV420P as c_int,
+            VideoChromaSampling::Yuv444 => ffmpeg::sys::AVPixelFormat::AV_PIX_FMT_YUV444P as c_int,
+        };
         (*frame).pts = 0;
 
         if ffmpeg::sys::av_frame_get_buffer(frame, 0) < 0 {
@@ -1921,10 +2058,13 @@ fn generate_test_bitstream_runtime(codec: VideoCodec) -> Result<Vec<u8>, String>
             return Err("av_frame_get_buffer failed".into());
         }
 
-        // Fill U/V planes with 128 (neutral chroma) — Y=0 is black
+        // Fill U/V planes with 128 (neutral chroma) — Y=0 is black.
         for plane in 1..3 {
             let linesize = (*frame).linesize[plane] as usize;
-            let height = 128usize; // chroma height for 256x256 YUV420P
+            let height = match chroma {
+                VideoChromaSampling::Yuv420 => 128usize,
+                VideoChromaSampling::Yuv444 => 256usize,
+            };
             let plane_ptr = (*frame).data[plane];
             if !plane_ptr.is_null() && linesize > 0 {
                 for row in 0..height {
@@ -2027,6 +2167,34 @@ const EMBEDDED_TEST_H264: &[u8] = &[
     0xe1, 0x97, 0x24, 0xc9, 0xae, 0xb6, 0x22, 0xe2, 0x6d, 0x00, 0xf5, 0x0b, 0x06, 0x2a, 0x5d,
     0xe1, 0xc5, 0x92, 0x70, 0x8b, 0xee, 0x00, 0x00, 0x07, 0x00, 0x10, 0xea, 0x64, 0xb8, 0xb4,
     0xae, 0xcb, 0x99, 0x71, 0xd0, 0xf1,
+];
+
+const EMBEDDED_TEST_H264_YUV444: &[u8] = &[
+    0x00, 0x00, 0x00, 0x01, 0x09, 0x10, 0x00, 0x00, 0x00, 0x01, 0x67, 0xf4, 0x00, 0x0d,
+    0x91, 0x96, 0x81, 0x00, 0x86, 0xc0, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00,
+    0x03, 0x00, 0xca, 0x3c, 0x50, 0xaa, 0x80, 0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x0f,
+    0x19, 0x20, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x3a, 0x24, 0x50, 0x00, 0x12, 0x05,
+    0xe4, 0xf2, 0x79, 0x3c, 0x9e, 0x4f, 0x27, 0x93, 0xc9, 0xe4, 0xf2, 0x79, 0x3c, 0x9e,
+    0x4f, 0x27, 0x93, 0xd7, 0xaf, 0x5e, 0xbd, 0x7a, 0xf5, 0xeb, 0xd7, 0xaf, 0x5e, 0xbd,
+    0x7a, 0xf5, 0xeb, 0xd7, 0xaf, 0x5e, 0xbd, 0x7a, 0xf5, 0xeb, 0xd7, 0xaf, 0x5e, 0xbd,
+    0x7a, 0xf5, 0xeb, 0xd7, 0xaf, 0x5e, 0xbd, 0x7a, 0xf5, 0xeb, 0xd7, 0xaf, 0x5e, 0xbd,
+    0x7a, 0xf5, 0xeb, 0xe0, 0x00, 0x00, 0x01, 0x65, 0x02, 0x08, 0x88, 0x43, 0xa2, 0x45,
+    0x00, 0x01, 0x20, 0x5e, 0x4f, 0x27, 0x93, 0xc9, 0xe4, 0xf2, 0x79, 0x3c, 0x9e, 0x4f,
+    0x27, 0x93, 0xc9, 0xe4, 0xf2, 0x79, 0x3d, 0x7a, 0xf5, 0xeb, 0xd7, 0xaf, 0x5e, 0xbd,
+    0x7a, 0xf5, 0xeb, 0xd7, 0xaf, 0x5e, 0xbd, 0x7a, 0xf5, 0xeb, 0xd7, 0xaf, 0x5e, 0xbd,
+    0x7a, 0xf5, 0xeb, 0xd7, 0xaf, 0x5e, 0xbd, 0x7a, 0xf5, 0xeb, 0xd7, 0xaf, 0x5e, 0xbd,
+    0x7a, 0xf5, 0xeb, 0xd7, 0xaf, 0x5e, 0xbe, 0x00, 0x00, 0x01, 0x65, 0x01, 0x02, 0x22,
+    0x10, 0xe8, 0x91, 0x40, 0x00, 0x48, 0x17, 0x93, 0xc9, 0xe4, 0xf2, 0x79, 0x3c, 0x9e,
+    0x4f, 0x27, 0x93, 0xc9, 0xe4, 0xf2, 0x79, 0x3c, 0x9e, 0x4f, 0x5e, 0xbd, 0x7a, 0xf5,
+    0xeb, 0xd7, 0xaf, 0x5e, 0xbd, 0x7a, 0xf5, 0xeb, 0xd7, 0xaf, 0x5e, 0xbd, 0x7a, 0xf5,
+    0xeb, 0xd7, 0xaf, 0x5e, 0xbd, 0x7a, 0xf5, 0xeb, 0xd7, 0xaf, 0x5e, 0xbd, 0x7a, 0xf5,
+    0xeb, 0xd7, 0xaf, 0x5e, 0xbd, 0x7a, 0xf5, 0xeb, 0xd7, 0xaf, 0x80, 0x00, 0x00, 0x01,
+    0x65, 0x01, 0x82, 0x22, 0x10, 0xe8, 0x91, 0x40, 0x00, 0x48, 0x17, 0x93, 0xc9, 0xe4,
+    0xf2, 0x79, 0x3c, 0x9e, 0x4f, 0x27, 0x93, 0xc9, 0xe4, 0xf2, 0x79, 0x3c, 0x9e, 0x4f,
+    0x5e, 0xbd, 0x7a, 0xf5, 0xeb, 0xd7, 0xaf, 0x5e, 0xbd, 0x7a, 0xf5, 0xeb, 0xd7, 0xaf,
+    0x5e, 0xbd, 0x7a, 0xf5, 0xeb, 0xd7, 0xaf, 0x5e, 0xbd, 0x7a, 0xf5, 0xeb, 0xd7, 0xaf,
+    0x5e, 0xbd, 0x7a, 0xf5, 0xeb, 0xd7, 0xaf, 0x5e, 0xbd, 0x7a, 0xf5, 0xeb, 0xd7, 0xaf,
+    0x80,
 ];
 
 const EMBEDDED_TEST_HEVC: &[u8] = &[
@@ -2193,6 +2361,20 @@ const EMBEDDED_TEST_HEVC: &[u8] = &[
     0x29, 0xe3, 0xff, 0xec, 0xb5, 0x95, 0x7f, 0xd0, 0xd4, 0xd6, 0x11, 0x90, 0x54, 0xc0, 0xa9,
     0x0d, 0xc8, 0x06, 0xe8, 0xe7, 0x87, 0x80, 0x93, 0x0f, 0x34, 0xe0, 0x05, 0xc4, 0x87, 0x00,
     0x00, 0x03, 0x02, 0x02,
+];
+
+const EMBEDDED_TEST_HEVC_YUV444: &[u8] = &[
+    0x00, 0x00, 0x00, 0x01, 0x46, 0x01, 0x10, 0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0c,
+    0x01, 0xff, 0xff, 0x04, 0x08, 0x00, 0x00, 0x03, 0x00, 0x9e, 0x08, 0x00, 0x00, 0x03,
+    0x00, 0x00, 0x3c, 0x95, 0x94, 0x09, 0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0x01, 0x04,
+    0x08, 0x00, 0x00, 0x03, 0x00, 0x9e, 0x08, 0x00, 0x00, 0x03, 0x00, 0x00, 0x3c, 0x90,
+    0x01, 0x01, 0x00, 0x80, 0xb2, 0xca, 0xca, 0x94, 0x98, 0x5e, 0x02, 0xd0, 0x10, 0x00,
+    0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x01, 0x90, 0x80, 0x00, 0x00, 0x00, 0x01,
+    0x44, 0x01, 0xc0, 0x73, 0x18, 0x30, 0x18, 0x90, 0x00, 0x00, 0x01, 0x28, 0x01, 0xac,
+    0x74, 0x41, 0x21, 0x51, 0x11, 0x0e, 0x0d, 0x9f, 0xfe, 0xef, 0x55, 0xa5, 0x60, 0xd6,
+    0x8f, 0x12, 0x16, 0x0d, 0x4c, 0xbf, 0x20, 0x16, 0x35, 0x32, 0x10, 0x9a, 0x19, 0xe4,
+    0x1c, 0x18, 0x50, 0x1a, 0x9c, 0x00, 0x8d, 0x80, 0x00, 0x00, 0x03, 0x02, 0x72, 0x00,
+    0x00, 0x08, 0xf8, 0x00, 0x00, 0x16, 0x70,
 ];
 
 const EMBEDDED_TEST_AV1: &[u8] = &[

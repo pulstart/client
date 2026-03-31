@@ -14,6 +14,7 @@ use std::sync::{
 pub enum VideoFormat {
     Rgba8,
     Yuv420p8,
+    Yuv444p8,
     Nv12,
 }
 
@@ -131,6 +132,7 @@ impl Drop for FfmpegVideoFrameRef {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LinuxDmaBufFormat {
     Yuv420p8,
+    Yuv444p8,
     Nv12,
 }
 
@@ -402,11 +404,17 @@ impl VideoFrameBuffer {
     }
 
     pub fn chroma_width(&self) -> u32 {
-        self.width.div_ceil(2)
+        match self.format {
+            VideoFormat::Yuv444p8 => self.width,
+            VideoFormat::Rgba8 | VideoFormat::Yuv420p8 | VideoFormat::Nv12 => self.width.div_ceil(2),
+        }
     }
 
     pub fn chroma_height(&self) -> u32 {
-        self.height.div_ceil(2)
+        match self.format {
+            VideoFormat::Yuv444p8 => self.height,
+            VideoFormat::Rgba8 | VideoFormat::Yuv420p8 | VideoFormat::Nv12 => self.height.div_ceil(2),
+        }
     }
 }
 

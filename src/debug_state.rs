@@ -279,6 +279,7 @@ fn format_label(format: VideoFormat) -> &'static str {
     match format {
         VideoFormat::Rgba8 => "rgba8",
         VideoFormat::Yuv420p8 => "yuv420p",
+        VideoFormat::Yuv444p8 => "yuv444p",
         VideoFormat::Nv12 => "nv12",
     }
 }

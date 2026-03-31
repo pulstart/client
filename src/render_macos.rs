@@ -188,6 +188,9 @@ impl MacosVideoToolboxImporter {
                 )?;
                 u_size
             }
+            VideoFormat::Yuv444p8 => {
+                return Err("unsupported YUV444 VideoToolbox rectangle layout".into());
+            }
             VideoFormat::Rgba8 => return Err("unexpected RGBA VideoToolbox frame".into()),
         };
 
@@ -299,7 +302,7 @@ impl RectYuvPipeline {
             gl.uniform_1_i32(
                 Some(&self.mode_uniform),
                 match format {
-                    VideoFormat::Yuv420p8 => 0,
+                    VideoFormat::Yuv420p8 | VideoFormat::Yuv444p8 => 0,
                     VideoFormat::Nv12 => 1,
                     VideoFormat::Rgba8 => 0,
                 },
@@ -323,7 +326,7 @@ impl RectYuvPipeline {
             gl.bind_texture(
                 GL_TEXTURE_RECTANGLE_ARB,
                 match format {
-                    VideoFormat::Yuv420p8 => Some(chroma_v_tex),
+                    VideoFormat::Yuv420p8 | VideoFormat::Yuv444p8 => Some(chroma_v_tex),
                     VideoFormat::Nv12 | VideoFormat::Rgba8 => Some(chroma_tex),
                 },
             );
@@ -357,7 +360,7 @@ impl RectYuvPipeline {
             gl.uniform_1_i32(
                 Some(&self.mode_uniform),
                 match format {
-                    VideoFormat::Yuv420p8 => 0,
+                    VideoFormat::Yuv420p8 | VideoFormat::Yuv444p8 => 0,
                     VideoFormat::Nv12 => 1,
                     VideoFormat::Rgba8 => 0,
                 },
@@ -381,7 +384,7 @@ impl RectYuvPipeline {
             gl.bind_texture(
                 GL_TEXTURE_RECTANGLE_ARB,
                 match format {
-                    VideoFormat::Yuv420p8 => Some(chroma_v_tex),
+                    VideoFormat::Yuv420p8 | VideoFormat::Yuv444p8 => Some(chroma_v_tex),
                     VideoFormat::Nv12 | VideoFormat::Rgba8 => Some(chroma_tex),
                 },
             );

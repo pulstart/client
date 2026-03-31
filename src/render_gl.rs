@@ -681,7 +681,7 @@ impl NativeVideoTexture {
                 video.height,
                 &video.plane0,
             )?,
-            VideoFormat::Yuv420p8 | VideoFormat::Nv12 => {
+            VideoFormat::Yuv420p8 | VideoFormat::Yuv444p8 | VideoFormat::Nv12 => {
                 let pipeline = self.ensure_yuv_pipeline(gl.as_ref())?;
                 pipeline.upload_and_render(gl.as_ref(), output_texture, video)?;
             }
@@ -868,6 +868,28 @@ impl YuvPipeline {
                     reallocate,
                 )?;
             }
+            VideoFormat::Yuv444p8 => {
+                upload_plane_texture(
+                    gl,
+                    self.chroma_tex,
+                    glow::R8 as i32,
+                    glow::RED,
+                    chroma_size.0,
+                    chroma_size.1,
+                    &video.plane1,
+                    reallocate,
+                )?;
+                upload_plane_texture(
+                    gl,
+                    self.chroma_v_tex,
+                    glow::R8 as i32,
+                    glow::RED,
+                    chroma_size.0,
+                    chroma_size.1,
+                    &video.plane2,
+                    reallocate,
+                )?;
+            }
             VideoFormat::Nv12 => {
                 upload_plane_texture(
                     gl,
@@ -935,7 +957,7 @@ impl YuvPipeline {
             gl.uniform_1_i32(
                 Some(&self.mode_uniform),
                 match format {
-                    VideoFormat::Yuv420p8 => 0,
+                    VideoFormat::Yuv420p8 | VideoFormat::Yuv444p8 => 0,
                     VideoFormat::Nv12 => 1,
                     VideoFormat::Rgba8 => 0,
                 },
@@ -949,7 +971,7 @@ impl YuvPipeline {
             gl.bind_texture(
                 glow::TEXTURE_2D,
                 match format {
-                    VideoFormat::Yuv420p8 => Some(chroma_v_tex),
+                    VideoFormat::Yuv420p8 | VideoFormat::Yuv444p8 => Some(chroma_v_tex),
                     VideoFormat::Nv12 | VideoFormat::Rgba8 => Some(chroma_tex),
                 },
             );
@@ -982,7 +1004,7 @@ impl YuvPipeline {
             gl.uniform_1_i32(
                 Some(&self.mode_uniform),
                 match format {
-                    VideoFormat::Yuv420p8 => 0,
+                    VideoFormat::Yuv420p8 | VideoFormat::Yuv444p8 => 0,
                     VideoFormat::Nv12 => 1,
                     VideoFormat::Rgba8 => 0,
                 },
@@ -996,7 +1018,7 @@ impl YuvPipeline {
             gl.bind_texture(
                 glow::TEXTURE_2D,
                 match format {
-                    VideoFormat::Yuv420p8 => Some(chroma_v_tex),
+                    VideoFormat::Yuv420p8 | VideoFormat::Yuv444p8 => Some(chroma_v_tex),
                     VideoFormat::Nv12 | VideoFormat::Rgba8 => Some(chroma_tex),
                 },
             );
@@ -1049,7 +1071,7 @@ impl LinuxDmabufImporter {
         let render_result = (|| {
             bind_egl_image(gl, self.image_target_texture_2d, self.luma_tex, images[0])?;
             bind_egl_image(gl, self.image_target_texture_2d, self.chroma_tex, images[1])?;
-            if matches!(frame.format, LinuxDmaBufFormat::Yuv420p8) {
+            if !matches!(frame.format, LinuxDmaBufFormat::Nv12) {
                 bind_egl_image(
                     gl,
                     self.image_target_texture_2d,
@@ -1096,7 +1118,7 @@ impl LinuxDmabufImporter {
         let render_result = (|| {
             bind_egl_image(gl, self.image_target_texture_2d, self.luma_tex, images[0])?;
             bind_egl_image(gl, self.image_target_texture_2d, self.chroma_tex, images[1])?;
-            if matches!(frame.format, LinuxDmaBufFormat::Yuv420p8) {
+            if !matches!(frame.format, LinuxDmaBufFormat::Nv12) {
                 bind_egl_image(
                     gl,
                     self.image_target_texture_2d,
@@ -1128,7 +1150,7 @@ impl LinuxDmabufImporter {
     ) -> Result<Vec<egl::Image>, String> {
         let expected = match frame.format {
             LinuxDmaBufFormat::Nv12 => 2,
-            LinuxDmaBufFormat::Yuv420p8 => 3,
+            LinuxDmaBufFormat::Yuv420p8 | LinuxDmaBufFormat::Yuv444p8 => 3,
         };
         if frame.planes.len() < expected {
             return Err(format!(
@@ -1428,6 +1450,7 @@ fn bind_egl_image(
 fn dmabuf_video_format(format: LinuxDmaBufFormat) -> VideoFormat {
     match format {
         LinuxDmaBufFormat::Yuv420p8 => VideoFormat::Yuv420p8,
+        LinuxDmaBufFormat::Yuv444p8 => VideoFormat::Yuv444p8,
         LinuxDmaBufFormat::Nv12 => VideoFormat::Nv12,
     }
 }

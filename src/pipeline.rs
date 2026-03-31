@@ -250,8 +250,9 @@ pub fn run_receive_pipeline(
     let trace = std::env::var_os("ST_TRACE").is_some();
     let mut trace_completed_logged = 0usize;
     let mut last_recovery_keyframe_request = Instant::now() - Duration::from_secs(2);
+    let mut attempted_software_fallback = false;
 
-    let mut decoder = match VideoDecoder::new(stream_config.codec) {
+    let mut decoder = match VideoDecoder::new(stream_config.codec, stream_config.chroma) {
         Ok(d) => {
             eprintln!("[pipeline] decoder ready: {}", d.name());
             debug_state.set_decoder_name(d.name());
@@ -262,7 +263,7 @@ pub fn run_receive_pipeline(
             return;
         }
     };
-    decoder.set_native_surface_control(native_surfaces);
+    decoder.set_native_surface_control(Arc::clone(&native_surfaces));
     let mut decoded_frame = VideoFrameBuffer::default();
     let mut playout = VideoPlayoutBuffer::new(stream_config.framerate);
     let mut recycled_frames = Vec::new();
@@ -359,6 +360,36 @@ pub fn run_receive_pipeline(
                         Ok(frame) => frame,
                         Err(e) => {
                             eprintln!("decode error: {e}");
+                            if !attempted_software_fallback && decoder.is_hardware_accelerated() {
+                                match VideoDecoder::new_software(stream_config.codec) {
+                                    Ok(mut software_decoder) => {
+                                        attempted_software_fallback = true;
+                                        software_decoder
+                                            .set_native_surface_control(Arc::clone(
+                                                &native_surfaces,
+                                            ));
+                                        software_decoder
+                                            .enter_recovery_mode("hardware decoder failure");
+                                        decoder = software_decoder;
+                                        debug_state.set_decoder_name(decoder.name());
+                                        eprintln!(
+                                            "[pipeline] switched to software decoder after hardware decode failure: {}",
+                                            decoder.name()
+                                        );
+                                        request_recovery_keyframe(
+                                            &control_tx,
+                                            &mut last_recovery_keyframe_request,
+                                            trace,
+                                            "hardware decoder fallback",
+                                        );
+                                    }
+                                    Err(fallback_err) => {
+                                        eprintln!(
+                                            "[pipeline] software decoder fallback failed: {fallback_err}"
+                                        );
+                                    }
+                                }
+                            }
                             continue;
                         }
                     };

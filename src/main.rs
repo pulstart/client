@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use st_protocol::{
     ClientDisplayInfo, ClockSyncPing, ControlMessage, ControllerState, InputPacket, KeyboardKey,
     KeyboardStateInput, MouseAbsoluteInput, MouseButtonsInput, MouseRelativeInput, MouseWheelInput,
-    StreamConfig, TransportFeedback, VideoCodec, VideoCodecSupport, MOUSE_BUTTON_EXTRA1,
+    StreamConfig, TransportFeedback, VideoChromaSampling, VideoCodec, VideoCodecSupport, MOUSE_BUTTON_EXTRA1,
     MOUSE_BUTTON_EXTRA2, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY,
     MOUSE_WHEEL_STEP_UNITS,
 };
@@ -135,6 +135,7 @@ struct StreamApp {
     home_tab: HomeTab,
     audio_enabled: bool,
     debug_enabled: bool,
+    yuv444_enabled: bool,
     display_refresh_millihz: Option<u32>,
     video_codec_support: decode::VideoCodecSupportReport,
     audio_enabled_flag: Arc<AtomicBool>,
@@ -300,6 +301,19 @@ fn save_debug_enabled(enabled: bool) {
     let dir = state_dir();
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join("debug_enabled"), if enabled { "1" } else { "0" });
+}
+
+fn load_yuv444_enabled() -> bool {
+    std::fs::read_to_string(state_dir().join("yuv444_enabled"))
+        .ok()
+        .map(|s| s.trim() != "0")
+        .unwrap_or(true)
+}
+
+fn save_yuv444_enabled(enabled: bool) {
+    let dir = state_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("yuv444_enabled"), if enabled { "1" } else { "0" });
 }
 
 fn load_token() -> String {
@@ -572,6 +586,7 @@ impl StreamApp {
         let token = load_token();
         let audio = load_audio_enabled();
         let debug_enabled = load_debug_enabled();
+        let yuv444_enabled = load_yuv444_enabled();
         let menu_button_pos = load_menu_button_pos().unwrap_or_else(default_menu_button_pos);
         let display_refresh_millihz = display::detect_max_refresh_millihz();
         let video_codec_support = decode::VideoDecoder::detect_supported_codecs();
@@ -610,6 +625,7 @@ impl StreamApp {
             home_tab: HomeTab::Servers,
             audio_enabled: audio,
             debug_enabled,
+            yuv444_enabled,
             display_refresh_millihz,
             video_codec_support,
             audio_enabled_flag: Arc::new(AtomicBool::new(audio)),
@@ -708,7 +724,8 @@ impl StreamApp {
         let debug_state = Arc::clone(&self.debug_state);
         let native_surfaces = Arc::clone(&self.native_surfaces);
         let display_refresh_millihz = self.display_refresh_millihz;
-        let video_codec_support = self.video_codec_support;
+        let video_codec_support =
+            advertised_video_codec_support(self.video_codec_support, self.yuv444_enabled);
         let excluded_video_codecs = Arc::clone(&self.excluded_video_codecs);
         let shared_input = Arc::clone(&self.shared_input);
         let token = self.token.clone();
@@ -2463,6 +2480,19 @@ impl StreamApp {
             save_debug_enabled(self.debug_enabled);
             self.debug_enabled_flag.store(self.debug_enabled, Ordering::SeqCst);
         }
+        ui.add_space(8.0);
+
+        let yuv444_clicked = render_parsec_toggle(
+            ui,
+            "YUV 4:4:4",
+            "Advertise 4:4:4 decode support and prefer 4:4:4 streams when both sides support it. Applies on the next connection.",
+            self.yuv444_enabled,
+            BG_ROW,
+        );
+        if yuv444_clicked {
+            self.yuv444_enabled = !self.yuv444_enabled;
+            save_yuv444_enabled(self.yuv444_enabled);
+        }
 
         ui.add_space(16.0);
         ui.label(
@@ -2531,6 +2561,11 @@ impl StreamApp {
 
         let caps = self.native_surfaces.snapshot();
         let codec_support = self.video_codec_support;
+        let yuv444_pref = if self.yuv444_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        };
 
         let rows: &[(&str, String)] = &[
             ("Version", format!("v{}", updater::current_version())),
@@ -2538,6 +2573,7 @@ impl StreamApp {
             ("Display", about_format_refresh(self.display_refresh_millihz)),
             ("Present", about_native_surface(caps).to_string()),
             ("Codecs", about_codec_summary(codec_support)),
+            ("YUV 4:4:4", yuv444_pref.to_string()),
             ("Audio", "opus stereo / 48 kHz".to_string()),
         ];
 
@@ -3022,6 +3058,21 @@ fn stop_media_threads(media_threads: MediaThreads) {
 
 const STARTUP_DECODE_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn advertised_video_codec_support(
+    report: decode::VideoCodecSupportReport,
+    yuv444_enabled: bool,
+) -> decode::VideoCodecSupportReport {
+    if yuv444_enabled {
+        report
+    } else {
+        decode::VideoCodecSupportReport {
+            yuv444: VideoCodecSupport::empty(),
+            hardware_yuv444: VideoCodecSupport::empty(),
+            ..report
+        }
+    }
+}
+
 fn run_connection(
     addr: String,
     token: String,
@@ -3257,10 +3308,12 @@ fn run_connection(
         .unwrap_or(0);
     if trace_enabled() {
         eprintln!(
-            "[trace][client] sending ClientDisplayInfo: refresh_millihz={} udp_port={local_udp_port} codecs={} hw_codecs={}",
+            "[trace][client] sending ClientDisplayInfo: refresh_millihz={} udp_port={local_udp_port} codecs={} hw_codecs={} yuv444={} yuv444_hw={}",
             display_refresh_millihz.unwrap_or(0),
             codec_support_summary(video_codec_support.supported),
-            codec_support_summary(video_codec_support.hardware)
+            codec_support_summary(video_codec_support.hardware),
+            codec_support_summary(video_codec_support.yuv444),
+            codec_support_summary(video_codec_support.hardware_yuv444),
         );
     }
     let mut excluded = *excluded_video_codecs.lock().unwrap();
@@ -3273,12 +3326,16 @@ fn run_connection(
         effective_supported = video_codec_support.supported;
     }
     let effective_hardware = video_codec_support.hardware.subtract(excluded);
+    let effective_yuv444 = video_codec_support.yuv444.subtract(excluded);
+    let effective_hardware_yuv444 = video_codec_support.hardware_yuv444.subtract(excluded);
     if !excluded.is_empty() {
         eprintln!(
-            "[codec] excluding previously failed codecs: {} (effective: supported={} hw={})",
+            "[codec] excluding previously failed codecs: {} (effective: supported={} hw={} yuv444={} yuv444_hw={})",
             codec_support_summary(excluded),
             codec_support_summary(effective_supported),
             codec_support_summary(effective_hardware),
+            codec_support_summary(effective_yuv444),
+            codec_support_summary(effective_hardware_yuv444),
         );
     }
     let _ = tcp.write_all(
@@ -3287,6 +3344,8 @@ fn run_connection(
             udp_port: local_udp_port,
             supported_video_codecs: effective_supported,
             hardware_video_codecs: effective_hardware,
+            supported_yuv444_video_codecs: effective_yuv444,
+            hardware_yuv444_video_codecs: effective_hardware_yuv444,
         })
         .serialize(),
     );
@@ -3334,8 +3393,9 @@ fn run_connection(
                         ControlMessage::StreamConfig(cfg) => {
                             if trace_enabled() {
                                 eprintln!(
-                                    "[trace][client] received StreamConfig: {:?} {}x{} {}fps audio={}ch/{}Hz hdr={}",
+                                    "[trace][client] received StreamConfig: {:?} {} {}x{} {}fps audio={}ch/{}Hz hdr={}",
                                     cfg.codec,
+                                    stream_chroma_label(cfg.chroma),
                                     cfg.width,
                                     cfg.height,
                                     cfg.framerate,
@@ -3851,11 +3911,15 @@ fn run_punched_session(
         effective_supported = video_codec_support.supported;
     }
     let effective_hardware = video_codec_support.hardware.subtract(excluded);
+    let effective_yuv444 = video_codec_support.yuv444.subtract(excluded);
+    let effective_hardware_yuv444 = video_codec_support.hardware_yuv444.subtract(excluded);
     let display_info = st_protocol::ClientDisplayInfo {
         max_refresh_millihz: display_refresh_millihz.unwrap_or(0),
         udp_port: 0, // Not used for punched connections.
         supported_video_codecs: effective_supported,
         hardware_video_codecs: effective_hardware,
+        supported_yuv444_video_codecs: effective_yuv444,
+        hardware_yuv444_video_codecs: effective_hardware_yuv444,
     };
     let _ = punched.send_control(&ControlMessage::ClientDisplayInfo(display_info).serialize());
 
@@ -5017,18 +5081,32 @@ fn about_codec_summary(report: decode::VideoCodecSupportReport) -> String {
         (VideoCodec::Av1, "av1"),
     ] {
         if report.supported.supports(codec) {
-            let suffix = if report.hardware.supports(codec) {
+            let mut tags = vec![if report.hardware.supports(codec) {
                 "hw"
             } else {
                 "sw"
-            };
-            entries.push(format!("{name}({suffix})"));
+            }];
+            if report.yuv444.supports(codec) {
+                tags.push(if report.hardware_yuv444.supports(codec) {
+                    "444hw"
+                } else {
+                    "444sw"
+                });
+            }
+            entries.push(format!("{name}({})", tags.join(",")));
         }
     }
     if entries.is_empty() {
         "-".to_string()
     } else {
         entries.join(" / ")
+    }
+}
+
+fn stream_chroma_label(chroma: VideoChromaSampling) -> &'static str {
+    match chroma {
+        VideoChromaSampling::Yuv420 => "yuv420",
+        VideoChromaSampling::Yuv444 => "yuv444",
     }
 }
 
@@ -5049,8 +5127,9 @@ fn render_debug_overlay(
         .as_ref()
         .map(|cfg| {
             format!(
-                "{} {}x{} {} fps hdr={} audio={}ch/{}Hz",
+                "{} {} {}x{} {} fps hdr={} audio={}ch/{}Hz",
                 codec_label(cfg),
+                stream_chroma_label(cfg.chroma),
                 cfg.width,
                 cfg.height,
                 cfg.framerate,
