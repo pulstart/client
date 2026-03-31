@@ -2,6 +2,7 @@
 
 mod api_client;
 mod audio;
+mod clipboard;
 mod debug_state;
 mod decode;
 mod graph_overlay;
@@ -3557,6 +3558,7 @@ fn run_connection(
                         | ControlMessage::AcquireControl
                         | ControlMessage::ReleaseControl
                         | ControlMessage::RequestKeyframe
+                        | ControlMessage::ClipboardText(_)
                         | ControlMessage::Authenticate(_)
                         | ControlMessage::AuthResult(_) => {}
                     }
@@ -3586,6 +3588,17 @@ fn run_connection(
     let media_threads = media_threads.expect("media threads not started");
     let feedback_rx = media_threads.feedback_rx.clone();
     let decode_started_rx = media_threads.decode_started_rx.clone();
+    let (clipboard_control_tx, clipboard_control_rx) =
+        crossbeam_channel::bounded::<ControlMessage>(8);
+    let mut clipboard_sync = clipboard::ClipboardSync::start(
+        "client",
+        true,
+        {
+            let shared_input = Arc::clone(&shared_input);
+            move || shared_input.snapshot().controller_state == ControllerState::OwnedByYou
+        },
+        clipboard_control_tx,
+    );
 
     // Connected!
     {
@@ -3641,6 +3654,9 @@ fn run_connection(
         while let Ok(msg) = control_rx.try_recv() {
             let _ = tcp.write_all(&msg.serialize());
         }
+        while let Ok(msg) = clipboard_control_rx.try_recv() {
+            let _ = tcp.write_all(&msg.serialize());
+        }
         while let Ok(msg) = pipeline_control_rx.try_recv() {
             let _ = tcp.write_all(&msg.serialize());
         }
@@ -3666,6 +3682,7 @@ fn run_connection(
             // Trigger reconnect by disconnecting cleanly
             *state.lock().unwrap() = ConnectionState::Disconnected;
             ctx.request_repaint();
+            clipboard_sync.stop();
             stop_media_threads(media_threads);
             return;
         }
@@ -3729,6 +3746,9 @@ fn run_connection(
                             shared_input.set_cursor_state(cursor_state);
                             ctx.request_repaint();
                         }
+                        ControlMessage::ClipboardText(text) => {
+                            clipboard_sync.set_remote_text(text);
+                        }
                         ControlMessage::Error(err) => {
                             set_error(
                                 &state,
@@ -3774,6 +3794,7 @@ fn run_connection(
     }
 
     // Cleanup
+    clipboard_sync.stop();
     stop_media_threads(media_threads);
 
     if !session_is_current(connection_epoch.as_ref(), session_epoch) {
@@ -4021,6 +4042,17 @@ fn run_punched_session(
     let mut input_seq: u16 = 0;
     let mut mouse_heartbeat = MouseInputHeartbeat::default();
     let mut keyboard_heartbeat = KeyboardInputHeartbeat::default();
+    let (clipboard_control_tx, clipboard_control_rx) =
+        crossbeam_channel::bounded::<ControlMessage>(8);
+    let mut clipboard_sync = clipboard::ClipboardSync::start(
+        "client-punched",
+        true,
+        {
+            let shared_input = Arc::clone(&shared_input);
+            move || shared_input.snapshot().controller_state == ControllerState::OwnedByYou
+        },
+        clipboard_control_tx,
+    );
     loop {
         if session_cancelled(disconnect.as_ref(), connection_epoch.as_ref(), session_epoch) {
             break;
@@ -4066,6 +4098,10 @@ fn run_punched_session(
 
         // Forward outgoing control messages to punched socket.
         while let Ok(ctrl) = control_rx.try_recv() {
+            did_work = true;
+            let _ = punched.send_control(&ctrl.serialize());
+        }
+        while let Ok(ctrl) = clipboard_control_rx.try_recv() {
             did_work = true;
             let _ = punched.send_control(&ctrl.serialize());
         }
@@ -4140,6 +4176,9 @@ fn run_punched_session(
                                     shared_input.set_cursor_state(cs);
                                     ctx.request_repaint();
                                 }
+                                ControlMessage::ClipboardText(text) => {
+                                    clipboard_sync.set_remote_text(text);
+                                }
                                 ControlMessage::Error(err) => {
                                     set_error(
                                         &state,
@@ -4213,6 +4252,7 @@ fn run_punched_session(
     }
 
     // Cleanup.
+    clipboard_sync.stop();
     stop_media_threads(media);
 
     {

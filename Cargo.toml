@@ -10,6 +10,7 @@ ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", 
 crossbeam-channel = "0.5"
 cpal = "0.15"
 opus = "0.3"
+arboard = "3"
 khronos-egl = { version = "6", features = ["dynamic"] }
 libc = "0.2"
 flate2 = "1"
