@@ -30,6 +30,7 @@ use st_protocol::{
     KeyboardStateInput, MouseAbsoluteInput, MouseButtonsInput, MouseRelativeInput, MouseWheelInput,
     StreamConfig, TransportFeedback, VideoCodec, VideoCodecSupport, MOUSE_BUTTON_EXTRA1,
     MOUSE_BUTTON_EXTRA2, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY,
+    MOUSE_WHEEL_STEP_UNITS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -174,7 +175,7 @@ struct StreamApp {
     await_pointer_exit_after_auto_release: bool,
     applied_cursor_visible: Option<bool>,
     applied_cursor_grab: Option<egui::CursorGrab>,
-    pending_wheel_delta: egui::Vec2,
+    pending_wheel_units: egui::Vec2,
     suppress_mouse_delta: bool,
     suppress_pointer_pos_frames: u8,
     excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
@@ -649,7 +650,7 @@ impl StreamApp {
             await_pointer_exit_after_auto_release: false,
             applied_cursor_visible: None,
             applied_cursor_grab: None,
-            pending_wheel_delta: egui::Vec2::ZERO,
+            pending_wheel_units: egui::Vec2::ZERO,
             suppress_mouse_delta: false,
             suppress_pointer_pos_frames: 0,
             excluded_video_codecs: Arc::new(Mutex::new(st_protocol::VideoCodecSupport::empty())),
@@ -676,7 +677,7 @@ impl StreamApp {
         self.last_video_rect = None;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
-        self.pending_wheel_delta = egui::Vec2::ZERO;
+        self.pending_wheel_units = egui::Vec2::ZERO;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
         self.hover_drag_edge_mismatch_updates = 0;
@@ -756,7 +757,7 @@ impl StreamApp {
         self.last_video_rect = None;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
-        self.pending_wheel_delta = egui::Vec2::ZERO;
+        self.pending_wheel_units = egui::Vec2::ZERO;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
         self.hover_drag_edge_mismatch_updates = 0;
@@ -778,7 +779,7 @@ impl StreamApp {
         self.pending_capture_click = false;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
-        self.pending_wheel_delta = egui::Vec2::ZERO;
+        self.pending_wheel_units = egui::Vec2::ZERO;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
         self.hover_drag_edge_mismatch_updates = 0;
@@ -797,7 +798,7 @@ impl StreamApp {
         self.last_video_rect = None;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
-        self.pending_wheel_delta = egui::Vec2::ZERO;
+        self.pending_wheel_units = egui::Vec2::ZERO;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
         self.hover_drag_edge_mismatch_updates = 0;
@@ -869,9 +870,9 @@ impl StreamApp {
         delta: egui::Vec2,
         unit: egui::MouseWheelUnit,
     ) {
-        self.pending_wheel_delta += delta * wheel_unit_scale(unit);
-        let delta_x = take_wheel_steps(&mut self.pending_wheel_delta.x);
-        let delta_y = take_wheel_steps(&mut self.pending_wheel_delta.y);
+        self.pending_wheel_units += delta * wheel_unit_scale(unit);
+        let delta_x = take_wheel_units(&mut self.pending_wheel_units.x);
+        let delta_y = take_wheel_units(&mut self.pending_wheel_units.y);
         if delta_x != 0 || delta_y != 0 {
             self.send_input_packet(InputPacket::MouseWheel(MouseWheelInput {
                 client_id,
@@ -4733,14 +4734,14 @@ fn should_return_to_hover_after_relative_button_drag(
 fn wheel_unit_scale(unit: egui::MouseWheelUnit) -> f32 {
     match unit {
         // Trackpads often deliver small point deltas; keep them and convert
-        // more aggressively so remote scrolling does not feel sticky.
-        egui::MouseWheelUnit::Point => 1.0 / 24.0,
-        egui::MouseWheelUnit::Line => 1.0,
-        egui::MouseWheelUnit::Page => 6.0,
+        // to high-resolution wheel units so remote scrolling does not feel sticky.
+        egui::MouseWheelUnit::Point => f32::from(MOUSE_WHEEL_STEP_UNITS) / 24.0,
+        egui::MouseWheelUnit::Line => f32::from(MOUSE_WHEEL_STEP_UNITS),
+        egui::MouseWheelUnit::Page => f32::from(MOUSE_WHEEL_STEP_UNITS) * 6.0,
     }
 }
 
-fn take_wheel_steps(accum: &mut f32) -> i16 {
+fn take_wheel_units(accum: &mut f32) -> i16 {
     let whole = accum
         .trunc()
         .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
