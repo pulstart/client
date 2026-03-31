@@ -185,6 +185,17 @@ fn configured_video_jitter_delay(stream_fps: u16) -> Duration {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        // Keep the Windows client biased toward low-delay
+        // presentation instead of buffering a full extra frame by default.
+        if stream_fps == 0 {
+            return Duration::from_millis(6);
+        }
+
+        return Duration::from_secs_f64((0.5 / f64::from(stream_fps)).clamp(0.003, 0.008));
+    }
+
     if stream_fps == 0 {
         return Duration::from_millis(18);
     }

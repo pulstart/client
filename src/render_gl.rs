@@ -4,6 +4,8 @@ use crate::render_macos::{MacosDirectVideoPresenter, MacosVideoToolboxImporter, 
 use crate::render_macos_metal::MacosMetalVideoPresenter;
 #[cfg(target_os = "windows")]
 use crate::render_windows::{WindowsD3d11Importer, WindowsDirectVideoPresenter};
+#[cfg(target_os = "windows")]
+use crate::render_windows_native::WindowsNativeVideoPresenter;
 #[cfg(target_os = "linux")]
 use crate::video_frame::{LinuxDmaBufFormat, LinuxDmaBufFrame, LinuxDmaBufPlane};
 #[cfg(target_os = "macos")]
@@ -66,6 +68,10 @@ pub struct NativeVideoTexture {
     windows_d3d11_importer: Option<WindowsD3d11Importer>,
     #[cfg(target_os = "windows")]
     windows_direct_presenter: Option<WindowsDirectVideoPresenter>,
+    #[cfg(target_os = "windows")]
+    windows_native_presenter: Option<WindowsNativeVideoPresenter>,
+    #[cfg(target_os = "windows")]
+    windows_overlayless_preferred: bool,
 }
 
 struct YuvPipeline {
@@ -278,6 +284,10 @@ impl NativeVideoTexture {
             windows_d3d11_importer: None,
             #[cfg(target_os = "windows")]
             windows_direct_presenter: direct_present.then(WindowsDirectVideoPresenter::new),
+            #[cfg(target_os = "windows")]
+            windows_native_presenter: direct_present.then(WindowsNativeVideoPresenter::new),
+            #[cfg(target_os = "windows")]
+            windows_overlayless_preferred: false,
         }
     }
 
@@ -318,6 +328,16 @@ impl NativeVideoTexture {
 
         #[cfg(target_os = "windows")]
         if self
+            .windows_native_presenter
+            .as_ref()
+            .map(|presenter| presenter.has_frame())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+
+        #[cfg(target_os = "windows")]
+        if self
             .windows_direct_presenter
             .as_ref()
             .map(|presenter| presenter.has_frame())
@@ -346,9 +366,42 @@ impl NativeVideoTexture {
     }
 
     #[allow(dead_code)]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    pub fn current_native_video_rect(&self) -> Option<egui::Rect> {
+        self.windows_native_presenter
+            .as_ref()
+            .and_then(WindowsNativeVideoPresenter::current_rect)
+    }
+
+    #[allow(dead_code)]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     pub fn current_native_video_rect(&self) -> Option<egui::Rect> {
         None
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn set_windows_overlayless_preferred(&mut self, preferred: bool) {
+        self.windows_overlayless_preferred = preferred;
+        if let Some(presenter) = self.windows_native_presenter.as_mut() {
+            presenter.set_preferred(preferred);
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn set_windows_overlayless_preferred(&mut self, _preferred: bool) {}
+
+    pub fn occludes_egui_overlay(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            return self
+                .windows_native_presenter
+                .as_ref()
+                .map(|presenter| presenter.occludes_egui_overlay())
+                .unwrap_or(false);
+        }
+
+        #[allow(unreachable_code)]
+        false
     }
 
     pub fn clear_frame(&mut self) {
@@ -369,6 +422,10 @@ impl NativeVideoTexture {
         #[cfg(target_os = "macos")]
         {
             self.macos_recent_frames.clear();
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(presenter) = self.windows_native_presenter.as_mut() {
+            presenter.clear();
         }
         #[cfg(target_os = "windows")]
         if let Some(presenter) = self.windows_direct_presenter.as_ref() {
@@ -438,6 +495,15 @@ impl NativeVideoTexture {
             let Some(frame) = video.d3d11.as_ref() else {
                 return false;
             };
+            if self.windows_overlayless_preferred {
+                if let Some(presenter) = self.windows_native_presenter.as_mut() {
+                    if presenter.is_enabled() && presenter.stage_frame(frame) {
+                        self.width = video.width;
+                        self.height = video.height;
+                        return true;
+                    }
+                }
+            }
             let Some(presenter) = self.windows_direct_presenter.as_ref() else {
                 return false;
             };
@@ -457,7 +523,7 @@ impl NativeVideoTexture {
 
     pub fn paint_direct_if_available(
         &mut self,
-        _frame: &eframe::Frame,
+        frame: &eframe::Frame,
         ui: &egui::Ui,
         rect: egui::Rect,
     ) -> bool {
@@ -478,7 +544,7 @@ impl NativeVideoTexture {
         {
             if let Some(presenter) = self.macos_metal_presenter.as_mut() {
                 if presenter.has_frame()
-                    && presenter.present(_frame, rect, ui.ctx().pixels_per_point())
+                    && presenter.present(frame, rect, ui.ctx().pixels_per_point())
                 {
                     return true;
                 }
@@ -497,6 +563,14 @@ impl NativeVideoTexture {
 
         #[cfg(target_os = "windows")]
         {
+            if let Some(presenter) = self.windows_native_presenter.as_mut() {
+                if presenter.has_frame()
+                    && presenter.present(frame, rect, ui.ctx().pixels_per_point())
+                {
+                    return true;
+                }
+            }
+
             let Some(presenter) = self.windows_direct_presenter.as_ref() else {
                 return false;
             };

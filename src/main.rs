@@ -17,6 +17,8 @@ mod render_macos;
 mod render_macos_metal;
 #[cfg(target_os = "windows")]
 mod render_windows;
+#[cfg(target_os = "windows")]
+mod render_windows_native;
 mod transport;
 mod updater;
 mod video_frame;
@@ -963,12 +965,26 @@ impl StreamApp {
     }
 
     fn current_video_rect(&self, ctx: &egui::Context) -> Option<egui::Rect> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         if let Some(rect) = self.video_texture.current_native_video_rect() {
             return Some(rect);
         }
 
         self.video_rect_for_container(ctx.content_rect())
+    }
+
+    fn prefers_windows_overlayless_present(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            self.capture_mode == LocalCaptureMode::CapturedRelative
+                && !self.menu_open
+                && !self.debug_enabled
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            false
+        }
     }
 
     fn server_cursor_stream_top_left(
@@ -1734,6 +1750,10 @@ impl StreamApp {
     }
 
     fn draw_remote_cursor_overlay(&self, ctx: &egui::Context) {
+        if self.video_texture.occludes_egui_overlay() {
+            return;
+        }
+
         let snapshot = self.shared_input.snapshot();
         if let Some(geometry) = self.compute_cursor_overlay_geometry(ctx, &snapshot) {
             egui::Area::new(egui::Id::new("remote_cursor_overlay"))
@@ -5351,6 +5371,9 @@ impl eframe::App for StreamApp {
         self.suppress_pointer_pos_frames = self.suppress_pointer_pos_frames.saturating_sub(1);
         self.apply_pointer_capture_mode(ctx);
         self.sync_remote_cursor_texture(ctx);
+        self.video_texture.set_windows_overlayless_preferred(
+            state == ConnectionState::Connected && self.prefers_windows_overlayless_present(),
+        );
         let recent_pointer_activity = self
             .last_pointer_move
             .map(|t| t.elapsed() < Duration::from_secs(3))
@@ -5419,9 +5442,10 @@ impl eframe::App for StreamApp {
             ctx.request_repaint();
         }
 
-        let debug_top = if state == ConnectionState::Connected {
+        let debug_top = if state == ConnectionState::Connected && !self.video_texture.occludes_egui_overlay() {
             self.render_floating_menu(ctx)
         } else {
+            self.local_overlay_hit_rects.clear();
             0.0
         };
 

@@ -1921,7 +1921,7 @@ fn decoder_hint(codec: VideoCodec) -> Option<String> {
     std::env::var(key).ok().filter(|hint| !hint.is_empty())
 }
 
-/// Apply low-latency codec flags (moonlight-qt style).
+/// Apply low-latency codec flags.
 /// Must be called BEFORE the codec is opened.
 unsafe fn apply_flags(ctx: *mut ffmpeg::sys::AVCodecContext, is_hw: bool) {
     // Decode and output frames immediately
