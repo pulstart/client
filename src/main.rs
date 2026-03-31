@@ -2474,10 +2474,15 @@ impl StreamApp {
         }
         ui.add_space(8.0);
 
+        let yuv444_description = if cfg!(target_os = "macos") {
+            "Advertise 4:4:4 decode support on the next connection, but keep macOS out of the hardware/low-latency 4:4:4 preference path until a fast present path exists."
+        } else {
+            "Advertise 4:4:4 decode support and prefer 4:4:4 streams when both sides support it. Applies on the next connection."
+        };
         let yuv444_clicked = render_parsec_toggle(
             ui,
             "YUV 4:4:4",
-            "Advertise 4:4:4 decode support and prefer 4:4:4 streams when both sides support it. Applies on the next connection.",
+            yuv444_description,
             self.yuv444_enabled,
             BG_ROW,
         );
@@ -3050,19 +3055,36 @@ fn stop_media_threads(media_threads: MediaThreads) {
 
 const STARTUP_DECODE_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn filter_advertised_video_codec_support(
+    report: decode::VideoCodecSupportReport,
+    yuv444_enabled: bool,
+    allow_yuv444_advertising: bool,
+    allow_hardware_yuv444_advertising: bool,
+) -> decode::VideoCodecSupportReport {
+    let mut filtered = report;
+    if !(yuv444_enabled && allow_yuv444_advertising) {
+        filtered.yuv444 = VideoCodecSupport::empty();
+    }
+    if !(yuv444_enabled && allow_hardware_yuv444_advertising) {
+        filtered.hardware_yuv444 = VideoCodecSupport::empty();
+    }
+    filtered
+}
+
 fn advertised_video_codec_support(
     report: decode::VideoCodecSupportReport,
     yuv444_enabled: bool,
 ) -> decode::VideoCodecSupportReport {
-    if yuv444_enabled {
-        report
-    } else {
-        decode::VideoCodecSupportReport {
-            yuv444: VideoCodecSupport::empty(),
-            hardware_yuv444: VideoCodecSupport::empty(),
-            ..report
-        }
-    }
+    // macOS can probe some YUV444 decode paths, but it does not yet have a
+    // low-latency native presentation path for them. Keep advertising decode
+    // support when the user enables it, but suppress the hardware YUV444 flag
+    // so Linux servers do not auto-prefer 4:4:4 for low-latency sessions.
+    filter_advertised_video_codec_support(
+        report,
+        yuv444_enabled,
+        true,
+        !cfg!(target_os = "macos"),
+    )
 }
 
 fn run_connection(
@@ -5957,6 +5979,40 @@ fn is_force_release_shortcut(modifiers: &egui::Modifiers) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advertised_video_codec_support_disables_yuv444_when_toggle_is_off() {
+        let report = decode::VideoCodecSupportReport {
+            supported: VideoCodecSupport::all(),
+            hardware: VideoCodecSupport::all(),
+            yuv444: VideoCodecSupport::h264_only(),
+            hardware_yuv444: VideoCodecSupport::h264_only(),
+        };
+
+        let filtered = filter_advertised_video_codec_support(report, false, true, true);
+
+        assert_eq!(filtered.supported, report.supported);
+        assert_eq!(filtered.hardware, report.hardware);
+        assert!(filtered.yuv444.is_empty());
+        assert!(filtered.hardware_yuv444.is_empty());
+    }
+
+    #[test]
+    fn advertised_video_codec_support_disables_yuv444_when_platform_policy_blocks_it() {
+        let report = decode::VideoCodecSupportReport {
+            supported: VideoCodecSupport::all(),
+            hardware: VideoCodecSupport::all(),
+            yuv444: VideoCodecSupport::h264_only(),
+            hardware_yuv444: VideoCodecSupport::h264_only(),
+        };
+
+        let filtered = filter_advertised_video_codec_support(report, true, true, false);
+
+        assert_eq!(filtered.supported, report.supported);
+        assert_eq!(filtered.hardware, report.hardware);
+        assert_eq!(filtered.yuv444, report.yuv444);
+        assert!(filtered.hardware_yuv444.is_empty());
+    }
 
     #[test]
     fn mouse_heartbeat_uses_safe_packets() {
