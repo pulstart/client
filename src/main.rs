@@ -2961,7 +2961,7 @@ impl StreamApp {
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
-                                .button(egui::RichText::new("Paste").color(accent_color).size(12.0))
+                                .button(egui::RichText::new("Transfer").color(accent_color).size(12.0))
                                 .clicked()
                             {
                                 let mut guard = self.file_transfer_state.lock().unwrap();
