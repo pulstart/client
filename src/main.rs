@@ -859,7 +859,7 @@ impl StreamApp {
     }
 
     fn keyboard_forward_active(&self, snapshot: &input::SharedInputSnapshot) -> bool {
-        snapshot.controller_state == ControllerState::OwnedByYou
+        controller_state_allows_input(snapshot.controller_state)
             && snapshot.capabilities.keyboard
             && matches!(
                 self.capture_mode,
@@ -1012,7 +1012,7 @@ impl StreamApp {
 
     fn uses_virtual_hover_cursor(&self, snapshot: &input::SharedInputSnapshot) -> bool {
         cfg!(target_os = "macos")
-            && snapshot.controller_state == ControllerState::OwnedByYou
+            && controller_state_allows_input(snapshot.controller_state)
             && snapshot.capabilities.hover_capture
             && !snapshot.capabilities.separate_cursor
     }
@@ -1029,7 +1029,7 @@ impl StreamApp {
 
     fn overlay_cursor_active(&self, ctx: &egui::Context) -> bool {
         let snapshot = self.shared_input.snapshot();
-        if snapshot.controller_state != ControllerState::OwnedByYou {
+        if !controller_state_has_separate_cursor(snapshot.controller_state) {
             return false;
         }
 
@@ -1067,7 +1067,7 @@ impl StreamApp {
     fn native_cursor_fallback_active(&self) -> bool {
         let snapshot = self.shared_input.snapshot();
         self.capture_mode == LocalCaptureMode::CapturedRelative
-            && snapshot.controller_state == ControllerState::OwnedByYou
+            && controller_state_has_separate_cursor(snapshot.controller_state)
             && snapshot.capabilities.separate_cursor
             && self
                 .remote_cursor_texture_for_serial(snapshot.cursor_state.serial)
@@ -1079,7 +1079,7 @@ impl StreamApp {
         let snapshot = self.shared_input.snapshot();
         let overlay_cursor_active = self.overlay_cursor_active(ctx);
         let hover_drag_active = self.capture_mode == LocalCaptureMode::HoverAbsolute
-            && snapshot.controller_state == ControllerState::OwnedByYou
+            && controller_state_allows_input(snapshot.controller_state)
             && self.pointer_buttons != 0;
         let (cursor_visible, cursor_grab) =
             if self.capture_mode == LocalCaptureMode::CapturedRelative {
@@ -1118,12 +1118,6 @@ impl StreamApp {
         if cursor_visible && self.applied_cursor_visible != Some(true) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
             self.applied_cursor_visible = Some(true);
-        }
-    }
-
-    fn send_control_message(&self, message: ControlMessage) {
-        if let Some(tx) = &self.control_tx {
-            let _ = tx.try_send(message);
         }
     }
 
@@ -1288,7 +1282,7 @@ impl StreamApp {
         ) {
             return None;
         }
-        if input_snapshot.controller_state != ControllerState::OwnedByYou
+        if !controller_state_has_separate_cursor(input_snapshot.controller_state)
             || !input_snapshot.capabilities.separate_cursor
             || !input_snapshot.cursor_state.visible
         {
@@ -1482,7 +1476,7 @@ impl StreamApp {
         let hover_supported = snapshot.capabilities.hover_capture;
         let prefer_hover_absolute = snapshot.capabilities.hover_capture;
         let hover_drag_active = previous_capture_mode == LocalCaptureMode::HoverAbsolute
-            && snapshot.controller_state == ControllerState::OwnedByYou
+            && controller_state_allows_input(snapshot.controller_state)
             && self.pointer_buttons != 0;
         let virtual_hover = self.uses_virtual_hover_cursor(&snapshot);
         let actual_pointer_pos = if self.suppress_pointer_pos_frames > 0 {
@@ -1498,7 +1492,7 @@ impl StreamApp {
         };
         if virtual_hover
             && previous_capture_mode == LocalCaptureMode::HoverAbsolute
-            && snapshot.controller_state == ControllerState::OwnedByYou
+            && controller_state_allows_input(snapshot.controller_state)
             && hover_supported
         {
             let base_pos = if previous_video_rect != Some(video_rect) {
@@ -1535,7 +1529,7 @@ impl StreamApp {
         if self.await_pointer_exit_after_auto_release && !pointer_inside_video_rect {
             self.await_pointer_exit_after_auto_release = false;
         }
-        if snapshot.controller_state != ControllerState::OwnedByYou
+        if !controller_state_allows_input(snapshot.controller_state)
             && matches!(
                 self.capture_mode,
                 LocalCaptureMode::HoverAbsolute | LocalCaptureMode::CapturedRelative
@@ -1566,13 +1560,13 @@ impl StreamApp {
             && self.capture_mode != LocalCaptureMode::ForceReleased
             && !self.await_pointer_exit_after_auto_release
             && pointer_over_video
-            && snapshot.controller_state == ControllerState::OwnedByYou
+            && controller_state_allows_input(snapshot.controller_state)
         {
             self.capture_mode = LocalCaptureMode::HoverAbsolute;
         }
 
         if clicked_video {
-            if snapshot.controller_state == ControllerState::OwnedByYou {
+            if controller_state_allows_input(snapshot.controller_state) {
                 if hover_supported && prefer_hover_absolute {
                     self.capture_mode = LocalCaptureMode::HoverAbsolute;
                 } else if snapshot.capabilities.mouse_relative {
@@ -1582,14 +1576,11 @@ impl StreamApp {
                 }
                 self.await_pointer_exit_after_auto_release = false;
                 self.pending_capture_click = false;
-            } else {
-                self.send_control_message(ControlMessage::AcquireControl);
-                self.pending_capture_click = true;
             }
             ctx.request_repaint();
         }
 
-        if self.pending_capture_click && snapshot.controller_state == ControllerState::OwnedByYou {
+        if self.pending_capture_click && controller_state_allows_input(snapshot.controller_state) {
             if hover_supported && prefer_hover_absolute {
                 self.capture_mode = LocalCaptureMode::HoverAbsolute;
             } else if snapshot.capabilities.mouse_relative {
@@ -1604,7 +1595,7 @@ impl StreamApp {
         if pointer_over_video
             && self.capture_mode == LocalCaptureMode::ForceReleased
             && clicked_video
-            && snapshot.controller_state == ControllerState::OwnedByYou
+            && controller_state_allows_input(snapshot.controller_state)
         {
             if hover_supported && prefer_hover_absolute {
                 self.capture_mode = LocalCaptureMode::HoverAbsolute;
@@ -1618,7 +1609,7 @@ impl StreamApp {
             && snapshot.capabilities.mouse_relative
             && !snapshot.cursor_state.visible;
         let edge_mismatch_relative_drag = if self.capture_mode == LocalCaptureMode::HoverAbsolute
-            && snapshot.controller_state == ControllerState::OwnedByYou
+            && controller_state_allows_input(snapshot.controller_state)
             && self.pointer_buttons & drag_buttons != 0
             && snapshot.capabilities.separate_cursor
             && snapshot.capabilities.mouse_relative
@@ -1653,7 +1644,7 @@ impl StreamApp {
             self.hover_drag_edge_mismatch_cursor_state_version = snapshot.cursor_state_version;
         }
         if self.capture_mode == LocalCaptureMode::HoverAbsolute
-            && snapshot.controller_state == ControllerState::OwnedByYou
+            && controller_state_allows_input(snapshot.controller_state)
             && self.pointer_buttons & drag_buttons != 0
             && (hidden_cursor_relative_drag
                 || self.hover_drag_edge_mismatch_updates
@@ -1686,7 +1677,7 @@ impl StreamApp {
         }
 
         if self.capture_mode == LocalCaptureMode::HoverAbsolute
-            && snapshot.controller_state == ControllerState::OwnedByYou
+            && controller_state_allows_input(snapshot.controller_state)
             && self.capture_mode != LocalCaptureMode::ForceReleased
         {
             if virtual_hover {
@@ -1763,7 +1754,7 @@ impl StreamApp {
             return;
         };
         if self.capture_mode != LocalCaptureMode::HoverAbsolute
-            || snapshot.controller_state != ControllerState::OwnedByYou
+            || !controller_state_has_separate_cursor(snapshot.controller_state)
             || !snapshot.capabilities.hover_capture
             || !video_rect.contains(pos)
             || !snapshot.cursor_state.visible
@@ -4802,6 +4793,17 @@ fn drag_capture_button_mask(button: egui::PointerButton) -> u8 {
     }
 }
 
+fn controller_state_allows_input(controller_state: ControllerState) -> bool {
+    controller_state != ControllerState::Unavailable
+}
+
+fn controller_state_has_separate_cursor(controller_state: ControllerState) -> bool {
+    matches!(
+        controller_state,
+        ControllerState::OwnedByYou | ControllerState::OwnedByOther
+    )
+}
+
 fn should_enter_relative_button_drag_capture(
     capture_mode: LocalCaptureMode,
     controller_state: ControllerState,
@@ -4812,7 +4814,7 @@ fn should_enter_relative_button_drag_capture(
     over_local_overlay: bool,
 ) -> bool {
     capture_mode == LocalCaptureMode::HoverAbsolute
-        && controller_state == ControllerState::OwnedByYou
+        && controller_state_allows_input(controller_state)
         && hidden_cursor_relative_drag
         && drag_capture_button_mask(button) != 0
         && pressed
@@ -5679,7 +5681,7 @@ impl eframe::App for StreamApp {
                         continue;
                     }
                     if self.capture_mode == LocalCaptureMode::CapturedRelative
-                        && snapshot.controller_state == ControllerState::OwnedByYou
+                        && controller_state_allows_input(snapshot.controller_state)
                     {
                         let dx = delta.x.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                         let dy = delta.y.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
@@ -5708,9 +5710,7 @@ impl eframe::App for StreamApp {
                             }
                             ctx.request_repaint();
                         }
-                    } else if virtual_hover
-                        && snapshot.controller_state == ControllerState::OwnedByYou
-                    {
+                    } else if virtual_hover && controller_state_allows_input(snapshot.controller_state) {
                         if let Some(rect) = video_rect {
                             let hover_drag_active = self.capture_mode == LocalCaptureMode::HoverAbsolute
                                 && self.pointer_buttons != 0;
@@ -5843,7 +5843,7 @@ impl eframe::App for StreamApp {
                         self.await_pointer_exit_after_auto_release = false;
                         ctx.request_repaint();
                     }
-                    if snapshot.controller_state == ControllerState::OwnedByYou
+                    if controller_state_allows_input(snapshot.controller_state)
                         && !sent_button_state
                         && !over_local_overlay
                         && (self.capture_mode == LocalCaptureMode::CapturedRelative
@@ -5889,7 +5889,7 @@ impl eframe::App for StreamApp {
                     }
                 }
                 egui::Event::MouseWheel { delta, unit, .. } => {
-                    if snapshot.controller_state != ControllerState::OwnedByYou {
+                    if !controller_state_allows_input(snapshot.controller_state) {
                         continue;
                     }
                     let wheel_pos = if virtual_hover {
