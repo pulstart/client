@@ -174,6 +174,7 @@ struct StreamApp {
     await_pointer_exit_after_auto_release: bool,
     applied_cursor_visible: Option<bool>,
     applied_cursor_grab: Option<egui::CursorGrab>,
+    pending_wheel_delta: egui::Vec2,
     suppress_mouse_delta: bool,
     suppress_pointer_pos_frames: u8,
     excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
@@ -648,6 +649,7 @@ impl StreamApp {
             await_pointer_exit_after_auto_release: false,
             applied_cursor_visible: None,
             applied_cursor_grab: None,
+            pending_wheel_delta: egui::Vec2::ZERO,
             suppress_mouse_delta: false,
             suppress_pointer_pos_frames: 0,
             excluded_video_codecs: Arc::new(Mutex::new(st_protocol::VideoCodecSupport::empty())),
@@ -674,6 +676,7 @@ impl StreamApp {
         self.last_video_rect = None;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
+        self.pending_wheel_delta = egui::Vec2::ZERO;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
         self.hover_drag_edge_mismatch_updates = 0;
@@ -753,6 +756,7 @@ impl StreamApp {
         self.last_video_rect = None;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
+        self.pending_wheel_delta = egui::Vec2::ZERO;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
         self.hover_drag_edge_mismatch_updates = 0;
@@ -774,6 +778,7 @@ impl StreamApp {
         self.pending_capture_click = false;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
+        self.pending_wheel_delta = egui::Vec2::ZERO;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
         self.hover_drag_edge_mismatch_updates = 0;
@@ -792,6 +797,7 @@ impl StreamApp {
         self.last_video_rect = None;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
+        self.pending_wheel_delta = egui::Vec2::ZERO;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
         self.hover_drag_edge_mismatch_updates = 0;
@@ -854,6 +860,25 @@ impl StreamApp {
             if let Some(client_id) = self.shared_input.snapshot().client_id {
                 self.send_keyboard_snapshot(client_id);
             }
+        }
+    }
+
+    fn send_remote_wheel(
+        &mut self,
+        client_id: u32,
+        delta: egui::Vec2,
+        unit: egui::MouseWheelUnit,
+    ) {
+        self.pending_wheel_delta += delta * wheel_unit_scale(unit);
+        let delta_x = take_wheel_steps(&mut self.pending_wheel_delta.x);
+        let delta_y = take_wheel_steps(&mut self.pending_wheel_delta.y);
+        if delta_x != 0 || delta_y != 0 {
+            self.send_input_packet(InputPacket::MouseWheel(MouseWheelInput {
+                client_id,
+                delta_x,
+                delta_y,
+                buttons: self.pointer_buttons,
+            }));
         }
     }
 
@@ -1746,7 +1771,7 @@ impl StreamApp {
     #[cfg(not(target_os = "macos"))]
     fn paint_connected_background(&self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        let painter = ui.painter();
+        let painter = ui.painter().clone();
         painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(7, 10, 14));
         painter.circle_filled(
             egui::pos2(rect.left() + rect.width() * 0.18, rect.top() + rect.height() * 0.22),
@@ -1932,6 +1957,7 @@ impl StreamApp {
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
+            .wheel_scroll_multiplier(egui::vec2(1.0, 1.35))
             .show(&mut main_ui, |ui| {
                 let margin = egui::Margin {
                     left: 32,
@@ -1943,7 +1969,7 @@ impl StreamApp {
                     .inner_margin(margin)
                     .show(ui, |ui| {
                         match self.home_tab {
-                            HomeTab::Servers => self.render_servers_tab(ui, ctx, &painter),
+                            HomeTab::Servers => self.render_servers_tab(ui, ctx),
                             HomeTab::Settings => self.render_settings_tab(ui),
                             HomeTab::Update => self.render_update_tab(ui, ctx),
                             HomeTab::About => self.render_about_tab(ui),
@@ -1952,12 +1978,7 @@ impl StreamApp {
             });
     }
 
-    fn render_servers_tab(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        painter: &egui::Painter,
-    ) {
+    fn render_servers_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         const TEXT_WHITE: egui::Color32 = egui::Color32::from_rgb(230, 233, 240);
         const TEXT_GRAY: egui::Color32 = egui::Color32::from_rgb(138, 142, 150);
         const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(90, 95, 108);
@@ -1968,6 +1989,9 @@ impl StreamApp {
         const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(58, 62, 72);
         const CARD_W: f32 = 180.0;
         const CARD_H: f32 = 210.0;
+        const CARD_ROW_SPACING: f32 = 12.0;
+
+        let painter = ui.painter().clone();
 
         ui.label(
             egui::RichText::new("Computers")
@@ -2040,7 +2064,7 @@ impl StreamApp {
             .filter(|d| d.token == self.token && !self.token.is_empty())
             .filter(|d| d.last_seen.elapsed() < DISCOVERY_EXPIRY)
             .collect();
-        let lan_addrs: Vec<String> = lan_servers.iter().map(|d| d.address.clone()).collect();
+        let lan_addrs: BTreeSet<String> = lan_servers.iter().map(|d| d.address.clone()).collect();
         let lan_peer_ids: BTreeSet<String> = lan_servers
             .iter()
             .filter_map(|d| d.peer_id.clone())
@@ -2081,7 +2105,7 @@ impl StreamApp {
         }
 
         let mut merged: Vec<MergedServer> = Vec::new();
-        let mut seen_addrs: Vec<String> = Vec::new();
+        let mut seen_addrs: BTreeSet<String> = BTreeSet::new();
         let mut seen_peer_ids: BTreeSet<String> = BTreeSet::new();
 
         // 1) Saved servers (preserve order: most recently connected first).
@@ -2111,7 +2135,7 @@ impl StreamApp {
             } else {
                 format_last_connected(entry.last_connected)
             };
-            seen_addrs.push(entry.address.clone());
+            seen_addrs.insert(entry.address.clone());
             if let Some(peer_id) = entry.peer_id.as_ref() {
                 seen_peer_ids.insert(peer_id.clone());
             }
@@ -2138,7 +2162,7 @@ impl StreamApp {
                 continue;
             }
             if !seen_addrs.contains(&srv.address) {
-                seen_addrs.push(srv.address.clone());
+                seen_addrs.insert(srv.address.clone());
                 if let Some(peer_id) = srv.peer_id.as_ref() {
                     seen_peer_ids.insert(peer_id.clone());
                 }
@@ -2162,7 +2186,7 @@ impl StreamApp {
                 .map(|peer_id| seen_peer_ids.contains(peer_id))
                 .unwrap_or(false);
             if !peer_seen && !seen_addrs.contains(addr) {
-                seen_addrs.push(addr.clone());
+                seen_addrs.insert(addr.clone());
                 if let Some(peer_id) = peer_id.as_ref() {
                     seen_peer_ids.insert(peer_id.clone());
                 }
@@ -2213,19 +2237,34 @@ impl StreamApp {
         } else {
             let avail_w = ui.available_width();
             let cols = ((avail_w + 12.0) / (CARD_W + 12.0)).floor().max(1.0) as usize;
+            let total_rows = (merged.len() + cols - 1) / cols;
+            let row_height = CARD_H + CARD_ROW_SPACING;
+            let content_top = ui.max_rect().top();
+            let viewport_min_y = (ui.clip_rect().top() - content_top).max(0.0);
+            let viewport_max_y = (ui.clip_rect().bottom() - content_top).max(viewport_min_y);
+            let list_start_y = ui.next_widget_position().y - content_top;
+            let start_row = (((viewport_min_y - list_start_y) / row_height).floor().max(0.0)
+                as usize)
+                .min(total_rows);
+            let end_row = (((viewport_max_y - list_start_y) / row_height).ceil().max(0.0)
+                as usize
+                + 1)
+                .min(total_rows);
 
-            let mut card_i = 0;
-            while card_i < merged.len() {
+            if start_row > 0 {
+                ui.add_space(start_row as f32 * row_height);
+            }
+
+            for row in start_row..end_row {
                 ui.horizontal(|ui| {
-                    for _ in 0..cols {
+                    for col in 0..cols {
+                        let card_i = row * cols + col;
                         if card_i >= merged.len() {
                             break;
                         }
                         let srv = &merged[card_i];
-                        card_i += 1;
-
-                        let (card_id, card_rect) =
-                            ui.allocate_space(egui::vec2(CARD_W, CARD_H));
+                        let (_, card_rect) = ui.allocate_space(egui::vec2(CARD_W, CARD_H));
+                        let card_id = ui.make_persistent_id(("server-card", srv.address.as_str()));
                         let hover = ui
                             .interact(card_rect, card_id, egui::Sense::hover())
                             .hovered();
@@ -2243,7 +2282,7 @@ impl StreamApp {
                         let icon_cx = card_rect.center().x;
                         let icon_top = card_rect.top() + 20.0;
                         paint_monitor_icon(
-                            painter,
+                            &painter,
                             egui::pos2(icon_cx, icon_top),
                             srv.icon_active,
                         );
@@ -2292,7 +2331,11 @@ impl StreamApp {
                             ),
                             egui::vec2(btn_w, btn_h),
                         );
-                        let btn_resp = ui.allocate_rect(btn_rect, egui::Sense::click());
+                        let btn_resp = ui.interact(
+                            btn_rect,
+                            ui.make_persistent_id(("server-connect", srv.address.as_str())),
+                            egui::Sense::click(),
+                        );
                         let btn_fill = if btn_resp.hovered() {
                             egui::Color32::from_rgb(62, 66, 76)
                         } else {
@@ -2339,7 +2382,11 @@ impl StreamApp {
                                 egui::pos2(card_rect.right() - 22.0, card_rect.top() + 4.0),
                                 egui::vec2(18.0, 18.0),
                             );
-                            let x_resp = ui.allocate_rect(x_rect, egui::Sense::click());
+                            let x_resp = ui.interact(
+                                x_rect,
+                                ui.make_persistent_id(("server-delete", srv.address.as_str())),
+                                egui::Sense::click(),
+                            );
                             if hover {
                                 let x_color = if x_resp.hovered() {
                                     egui::Color32::from_rgb(220, 100, 100)
@@ -2359,10 +2406,14 @@ impl StreamApp {
                             }
                         }
 
-                        ui.add_space(12.0);
+                        ui.add_space(CARD_ROW_SPACING);
                     }
                 });
-                ui.add_space(12.0);
+                ui.add_space(CARD_ROW_SPACING);
+            }
+
+            if end_row < total_rows {
+                ui.add_space((total_rows - end_row) as f32 * row_height);
             }
         }
 
@@ -4679,19 +4730,22 @@ fn should_return_to_hover_after_relative_button_drag(
         && pointer_buttons & drag_buttons == 0
 }
 
-fn quantize_wheel(delta: egui::Vec2, unit: egui::MouseWheelUnit) -> (i16, i16) {
-    let scale = match unit {
-        egui::MouseWheelUnit::Point => 1.0 / 40.0,
+fn wheel_unit_scale(unit: egui::MouseWheelUnit) -> f32 {
+    match unit {
+        // Trackpads often deliver small point deltas; keep them and convert
+        // more aggressively so remote scrolling does not feel sticky.
+        egui::MouseWheelUnit::Point => 1.0 / 24.0,
         egui::MouseWheelUnit::Line => 1.0,
         egui::MouseWheelUnit::Page => 6.0,
-    };
-    let dx = (delta.x * scale)
-        .round()
+    }
+}
+
+fn take_wheel_steps(accum: &mut f32) -> i16 {
+    let whole = accum
+        .trunc()
         .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-    let dy = (delta.y * scale)
-        .round()
-        .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-    (dx, dy)
+    *accum -= whole as f32;
+    whole
 }
 
 fn egui_key_to_remote_key(key: egui::Key) -> Option<KeyboardKey> {
@@ -5741,15 +5795,7 @@ impl eframe::App for StreamApp {
                     {
                         continue;
                     }
-                    let (delta_x, delta_y) = quantize_wheel(delta, unit);
-                    if delta_x != 0 || delta_y != 0 {
-                        self.send_input_packet(InputPacket::MouseWheel(MouseWheelInput {
-                            client_id,
-                            delta_x,
-                            delta_y,
-                            buttons: self.pointer_buttons,
-                        }));
-                    }
+                    self.send_remote_wheel(client_id, delta, unit);
                 }
                 _ => {}
             }
