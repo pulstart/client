@@ -861,10 +861,25 @@ impl StreamApp {
     }
 
     fn auto_release_capture(&mut self, await_pointer_exit_before_recapture: bool) {
+        let snapshot = self.shared_input.snapshot();
+        let preserved_cursor_pos = if self.capture_mode == LocalCaptureMode::CapturedRelative
+            && snapshot.capabilities.separate_cursor
+            && snapshot.cursor_state.visible
+        {
+            self.hover_cursor_pos.or_else(|| {
+                self.last_video_rect
+                    .and_then(|rect| self.mapped_server_cursor_video_pos(&snapshot, rect))
+            })
+        } else {
+            None
+        };
         self.release_pointer_capture();
+        if let Some(pos) = preserved_cursor_pos {
+            self.hover_cursor_pos = Some(pos);
+        }
         self.await_pointer_exit_after_auto_release = await_pointer_exit_before_recapture;
         self.clear_remote_keyboard();
-        if let Some(client_id) = self.shared_input.snapshot().client_id {
+        if let Some(client_id) = snapshot.client_id {
             self.send_input_packet(InputPacket::MouseButtons(MouseButtonsInput {
                 client_id,
                 buttons: 0,
@@ -1776,6 +1791,25 @@ impl StreamApp {
         } else if !self.resume_hover_after_relative_drag {
             self.hover_cursor_pos = None;
             self.last_sent_absolute_cursor = None;
+        }
+
+        if previous_capture_mode != LocalCaptureMode::CapturedRelative
+            && self.capture_mode == LocalCaptureMode::CapturedRelative
+            && !self.resume_hover_after_relative_drag
+            && snapshot.capabilities.separate_cursor
+            && snapshot.cursor_state.visible
+        {
+            let sync_pos = self
+                .hover_cursor_pos
+                .or_else(|| self.mapped_server_cursor_video_pos(&snapshot, video_rect))
+                .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()));
+            if let Some(pos) = sync_pos {
+                self.hover_cursor_pos = Some(pos);
+                ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(pos));
+                self.suppress_mouse_delta = true;
+                self.suppress_pointer_pos_frames = self.suppress_pointer_pos_frames.max(2);
+                ctx.request_repaint();
+            }
         }
 
         self.draw_remote_cursor_overlay(ctx);
