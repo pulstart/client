@@ -1396,10 +1396,7 @@ impl StreamApp {
         );
 
         let use_local_cursor_pos = self.capture_mode == LocalCaptureMode::HoverAbsolute
-            || self.resume_hover_after_relative_drag
-            || (self.capture_mode == LocalCaptureMode::CapturedRelative
-                && input_snapshot.cursor_state.visible
-                && self.hover_cursor_pos.is_some());
+            || self.resume_hover_after_relative_drag;
         let (top_left, cursor_pos, using_pointer_pos) = if use_local_cursor_pos {
             let pointer_pos = self
                 .hover_cursor_pos
@@ -1795,9 +1792,7 @@ impl StreamApp {
             {
                 if let (Some(client_id), Some(remote_pos)) = (
                     snapshot.client_id,
-                    self.hover_cursor_pos.or_else(|| {
-                        self.mapped_server_cursor_video_pos(&snapshot, video_rect)
-                    }),
+                    self.mapped_server_cursor_video_pos(&snapshot, video_rect),
                 ) {
                     self.send_relative_cursor_sync(client_id, remote_pos, local_pos, video_rect);
                 }
@@ -6113,9 +6108,8 @@ impl eframe::App for StreamApp {
                                     rect,
                                     ctx.pixels_per_point(),
                                 );
-                                if let Some(remote_pos) = self
-                                    .hover_cursor_pos
-                                    .or_else(|| self.mapped_server_cursor_video_pos(&snapshot, rect))
+                                if let Some(remote_pos) =
+                                    self.mapped_server_cursor_video_pos(&snapshot, rect)
                                 {
                                     self.send_relative_cursor_sync(
                                         client_id,
@@ -6176,14 +6170,36 @@ impl eframe::App for StreamApp {
                     if self.capture_mode == LocalCaptureMode::CapturedRelative
                         && controller_state_allows_input(snapshot.controller_state)
                     {
-                        let dx = delta.x.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-                        let dy = delta.y.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                        let mut input_delta = delta;
+                        if snapshot.capabilities.separate_cursor
+                            && snapshot.cursor_state.visible
+                            && !self.resume_hover_after_relative_drag
+                        {
+                            if let (Some(rect), Some(stream_size)) =
+                                (video_rect, self.cursor_space_size())
+                            {
+                                if rect.width() > 0.0 && rect.height() > 0.0 {
+                                    input_delta.x *= stream_size.x / rect.width();
+                                    input_delta.y *= stream_size.y / rect.height();
+                                }
+                            }
+                        }
+                        let dx = input_delta
+                            .x
+                            .round()
+                            .clamp(i16::MIN as f32, i16::MAX as f32)
+                            as i16;
+                        let dy = input_delta
+                            .y
+                            .round()
+                            .clamp(i16::MIN as f32, i16::MAX as f32)
+                            as i16;
                         let mut predicted_cursor_pos = None;
                         if snapshot.capabilities.separate_cursor && snapshot.cursor_state.visible {
                             if let Some(rect) = video_rect {
                                 let base_pos = self
-                                    .hover_cursor_pos
-                                    .or_else(|| self.mapped_server_cursor_video_pos(&snapshot, rect))
+                                    .mapped_server_cursor_video_pos(&snapshot, rect)
+                                    .or(self.hover_cursor_pos)
                                     .or(last_pointer_pos)
                                     .unwrap_or_else(|| rect.center());
                                 let attempted_pos =
@@ -6341,8 +6357,13 @@ impl eframe::App for StreamApp {
                         == LocalCaptureMode::CapturedRelative
                         && snapshot.capabilities.separate_cursor
                         && snapshot.cursor_state.visible;
-                    let route_pos = if virtual_hover || relative_overlay_cursor {
+                    let route_pos = if virtual_hover {
                         self.hover_cursor_pos.or(Some(pos))
+                    } else if relative_overlay_cursor {
+                        video_rect
+                            .and_then(|rect| self.mapped_server_cursor_video_pos(&snapshot, rect))
+                            .or(self.hover_cursor_pos)
+                            .or(Some(pos))
                     } else {
                         Some(pos)
                     };
@@ -6453,8 +6474,13 @@ impl eframe::App for StreamApp {
                         == LocalCaptureMode::CapturedRelative
                         && snapshot.capabilities.separate_cursor
                         && snapshot.cursor_state.visible;
-                    let wheel_pos = if virtual_hover || relative_overlay_cursor {
+                    let wheel_pos = if virtual_hover {
                         self.hover_cursor_pos.or(last_pointer_pos)
+                    } else if relative_overlay_cursor {
+                        video_rect
+                            .and_then(|rect| self.mapped_server_cursor_video_pos(&snapshot, rect))
+                            .or(self.hover_cursor_pos)
+                            .or(last_pointer_pos)
                     } else {
                         last_pointer_pos
                     };
