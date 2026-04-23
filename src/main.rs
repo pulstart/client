@@ -1123,7 +1123,7 @@ impl StreamApp {
             } else if hover_drag_active {
                 (false, egui::CursorGrab::Confined)
             } else if overlay_cursor_active {
-                (false, egui::CursorGrab::Confined)
+                (false, egui::CursorGrab::None)
             } else {
                 (true, egui::CursorGrab::None)
             };
@@ -1771,6 +1771,7 @@ impl StreamApp {
         if let Some(geometry) = self.compute_cursor_overlay_geometry(ctx, &snapshot) {
             egui::Area::new(egui::Id::new("remote_cursor_overlay"))
                 .order(egui::Order::Tooltip)
+                .interactable(false)
                 .fixed_pos(geometry.rect.min)
                 .show(ctx, |ui| {
                     let sized =
@@ -1797,6 +1798,7 @@ impl StreamApp {
 
         egui::Area::new(egui::Id::new("remote_cursor_fallback_overlay"))
             .order(egui::Order::Tooltip)
+            .interactable(false)
             .fixed_pos(video_rect.min)
             .show(ctx, |ui| {
                 let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, video_rect.size());
@@ -6073,6 +6075,28 @@ impl eframe::App for StreamApp {
                             self.hover_cursor_pos = Some(next_pos);
                             last_pointer_pos = Some(next_pos);
                             self.send_absolute_cursor_if_needed(client_id, next_pos, rect);
+                            ctx.request_repaint();
+                        }
+                    } else if self.capture_mode == LocalCaptureMode::HoverAbsolute
+                        && controller_state_allows_input(snapshot.controller_state)
+                    {
+                        if let Some(rect) = video_rect {
+                            let base_pos = self
+                                .hover_cursor_pos
+                                .or(last_pointer_pos)
+                                .unwrap_or_else(|| rect.center());
+                            let next_pos = clamp_pos_to_video_rect(
+                                egui::pos2(base_pos.x + delta.x, base_pos.y + delta.y),
+                                rect,
+                                ctx.pixels_per_point(),
+                            );
+                            self.hover_cursor_pos = Some(next_pos);
+                            last_pointer_pos = Some(next_pos);
+                            self.suppress_pointer_pos_frames =
+                                self.suppress_pointer_pos_frames.max(2);
+                            if !self.pointer_over_local_overlay(next_pos) {
+                                self.send_absolute_cursor_if_needed(client_id, next_pos, rect);
+                            }
                             ctx.request_repaint();
                         }
                     }
