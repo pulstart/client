@@ -1277,6 +1277,40 @@ impl StreamApp {
         let _ = self.send_absolute_cursor(client_id, pos, video_rect, false);
     }
 
+    fn send_relative_cursor_sync(
+        &self,
+        client_id: u32,
+        from_pos: egui::Pos2,
+        to_pos: egui::Pos2,
+        video_rect: egui::Rect,
+    ) -> bool {
+        if !video_rect.contains(from_pos) || !video_rect.contains(to_pos) {
+            return false;
+        }
+        let stream_size = self.cursor_space_size().unwrap_or_else(|| video_rect.size());
+        let scale_x = stream_size.x / video_rect.width().max(1.0);
+        let scale_y = stream_size.y / video_rect.height().max(1.0);
+        let mut dx = ((to_pos.x - from_pos.x) * scale_x).round() as i32;
+        let mut dy = ((to_pos.y - from_pos.y) * scale_y).round() as i32;
+        if dx == 0 && dy == 0 {
+            return false;
+        }
+
+        while dx != 0 || dy != 0 {
+            let step_x = dx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            let step_y = dy.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            self.send_input_packet(InputPacket::MouseRelative(MouseRelativeInput {
+                client_id,
+                dx: step_x,
+                dy: step_y,
+                buttons: self.pointer_buttons,
+            }));
+            dx -= i32::from(step_x);
+            dy -= i32::from(step_y);
+        }
+        true
+    }
+
     fn sync_remote_cursor_texture(&mut self, ctx: &egui::Context) {
         let snapshot = self.shared_input.snapshot();
         if snapshot.cursor_shape_version == self.seen_cursor_shape_version {
@@ -1745,6 +1779,31 @@ impl StreamApp {
         if previous_capture_mode != self.capture_mode && self.capture_mode == LocalCaptureMode::Idle
         {
             self.clear_remote_keyboard();
+        }
+
+        if previous_capture_mode != LocalCaptureMode::CapturedRelative
+            && self.capture_mode == LocalCaptureMode::CapturedRelative
+            && !self.resume_hover_after_relative_drag
+            && snapshot.capabilities.separate_cursor
+            && snapshot.cursor_state.visible
+        {
+            if let Some(local_pos) = pointer_pos
+                .filter(|pos| {
+                    video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
+                })
+                .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()))
+            {
+                if let (Some(client_id), Some(remote_pos)) = (
+                    snapshot.client_id,
+                    self.hover_cursor_pos.or_else(|| {
+                        self.mapped_server_cursor_video_pos(&snapshot, video_rect)
+                    }),
+                ) {
+                    self.send_relative_cursor_sync(client_id, remote_pos, local_pos, video_rect);
+                }
+                self.hover_cursor_pos = Some(local_pos);
+                ctx.request_repaint();
+            }
         }
 
         if self.capture_mode == LocalCaptureMode::HoverAbsolute
@@ -6032,6 +6091,47 @@ impl eframe::App for StreamApp {
                 egui::Event::PointerMoved(pos) => {
                     if !virtual_hover {
                         last_pointer_pos = Some(pos);
+                    }
+                    if self.await_pointer_exit_after_auto_release {
+                        if video_rect.map(|rect| !rect.contains(pos)).unwrap_or(true) {
+                            self.await_pointer_exit_after_auto_release = false;
+                        }
+                    }
+                    if !snapshot.capabilities.hover_capture
+                        && snapshot.capabilities.mouse_relative
+                        && snapshot.capabilities.separate_cursor
+                        && snapshot.cursor_state.visible
+                        && controller_state_allows_input(snapshot.controller_state)
+                        && self.capture_mode != LocalCaptureMode::CapturedRelative
+                        && self.capture_mode != LocalCaptureMode::ForceReleased
+                        && !self.await_pointer_exit_after_auto_release
+                    {
+                        if let Some(rect) = video_rect {
+                            if rect.contains(pos) && !self.pointer_over_local_overlay(pos) {
+                                let local_pos = clamp_pos_to_video_rect(
+                                    pos,
+                                    rect,
+                                    ctx.pixels_per_point(),
+                                );
+                                if let Some(remote_pos) = self
+                                    .hover_cursor_pos
+                                    .or_else(|| self.mapped_server_cursor_video_pos(&snapshot, rect))
+                                {
+                                    self.send_relative_cursor_sync(
+                                        client_id,
+                                        remote_pos,
+                                        local_pos,
+                                        rect,
+                                    );
+                                }
+                                self.capture_mode = LocalCaptureMode::CapturedRelative;
+                                self.resume_hover_after_relative_drag = false;
+                                self.hover_cursor_resync_pending = false;
+                                self.hover_cursor_pos = Some(local_pos);
+                                self.suppress_mouse_delta = true;
+                                ctx.request_repaint();
+                            }
+                        }
                     }
                     if self.capture_mode == LocalCaptureMode::HoverAbsolute
                         && self.hover_cursor_resync_pending
