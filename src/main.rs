@@ -1123,7 +1123,7 @@ impl StreamApp {
             } else if hover_drag_active {
                 (false, egui::CursorGrab::Confined)
             } else if overlay_cursor_active {
-                (false, egui::CursorGrab::None)
+                (false, egui::CursorGrab::Confined)
             } else {
                 (true, egui::CursorGrab::None)
             };
@@ -1554,6 +1554,7 @@ impl StreamApp {
             .unwrap_or(false);
         let pointer_over_video = pointer_inside_video_rect && !pointer_over_local_overlay;
         let clicked_video = response.clicked_by(egui::PointerButton::Primary) && pointer_over_video;
+        let hover_drag_active = hover_drag_active && pointer_over_video;
         if self.await_pointer_exit_after_auto_release && !pointer_inside_video_rect {
             self.await_pointer_exit_after_auto_release = false;
         }
@@ -6091,10 +6092,8 @@ impl eframe::App for StreamApp {
                     } else {
                         self.pointer_buttons &= !mask;
                     }
-                    let route_pos = if self.capture_mode == LocalCaptureMode::HoverAbsolute {
+                    let route_pos = if virtual_hover {
                         self.hover_cursor_pos.or(Some(pos))
-                    } else if virtual_hover {
-                        self.hover_cursor_pos
                     } else {
                         Some(pos)
                     };
