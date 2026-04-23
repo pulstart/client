@@ -1610,6 +1610,31 @@ impl StreamApp {
         {
             self.capture_mode = LocalCaptureMode::HoverAbsolute;
         }
+        let relative_hover_supported = !hover_supported
+            && snapshot.capabilities.mouse_relative
+            && snapshot.capabilities.separate_cursor
+            && snapshot.cursor_state.visible;
+        if relative_hover_supported
+            && self.capture_mode != LocalCaptureMode::CapturedRelative
+            && self.capture_mode != LocalCaptureMode::ForceReleased
+            && !self.await_pointer_exit_after_auto_release
+            && pointer_over_video
+            && controller_state_allows_input(snapshot.controller_state)
+        {
+            self.capture_mode = LocalCaptureMode::CapturedRelative;
+            self.resume_hover_after_relative_drag = false;
+            self.hover_cursor_resync_pending = false;
+            if let Some(pos) = pointer_pos.filter(|pos| {
+                video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
+            }) {
+                self.hover_cursor_pos = Some(clamp_pos_to_video_rect(
+                    pos,
+                    video_rect,
+                    ctx.pixels_per_point(),
+                ));
+            }
+            ctx.request_repaint();
+        }
 
         if clicked_video {
             if controller_state_allows_input(snapshot.controller_state) {
@@ -1775,15 +1800,25 @@ impl StreamApp {
             && snapshot.capabilities.separate_cursor
             && snapshot.cursor_state.visible
         {
-            let predicted_pos = self
-                .hover_cursor_pos
-                .map(|pos| {
-                    previous_video_rect
-                        .filter(|previous_rect| *previous_rect != video_rect)
-                        .map(|previous_rect| {
-                            remap_pos_between_video_rects(pos, previous_rect, video_rect)
-                        })
-                        .unwrap_or(pos)
+            let local_entry_pos = if previous_capture_mode != LocalCaptureMode::CapturedRelative
+                && !self.resume_hover_after_relative_drag
+            {
+                pointer_pos.filter(|pos| {
+                    video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
+                })
+            } else {
+                None
+            };
+            let predicted_pos = local_entry_pos
+                .or_else(|| {
+                    self.hover_cursor_pos.map(|pos| {
+                        previous_video_rect
+                            .filter(|previous_rect| *previous_rect != video_rect)
+                            .map(|previous_rect| {
+                                remap_pos_between_video_rects(pos, previous_rect, video_rect)
+                            })
+                            .unwrap_or(pos)
+                    })
                 })
                 .or_else(|| self.mapped_server_cursor_video_pos(&snapshot, video_rect));
             self.hover_cursor_pos = predicted_pos
@@ -1791,25 +1826,6 @@ impl StreamApp {
         } else if !self.resume_hover_after_relative_drag {
             self.hover_cursor_pos = None;
             self.last_sent_absolute_cursor = None;
-        }
-
-        if previous_capture_mode != LocalCaptureMode::CapturedRelative
-            && self.capture_mode == LocalCaptureMode::CapturedRelative
-            && !self.resume_hover_after_relative_drag
-            && snapshot.capabilities.separate_cursor
-            && snapshot.cursor_state.visible
-        {
-            let sync_pos = self
-                .hover_cursor_pos
-                .or_else(|| self.mapped_server_cursor_video_pos(&snapshot, video_rect))
-                .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()));
-            if let Some(pos) = sync_pos {
-                self.hover_cursor_pos = Some(pos);
-                ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(pos));
-                self.suppress_mouse_delta = true;
-                self.suppress_pointer_pos_frames = self.suppress_pointer_pos_frames.max(2);
-                ctx.request_repaint();
-            }
         }
 
         self.draw_remote_cursor_overlay(ctx);
