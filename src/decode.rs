@@ -1034,6 +1034,11 @@ impl VideoDecoder {
             format: dmabuf_format,
             planes,
             decoder_frame_ref: decoder_frame_ref.clone(),
+            // FFmpeg's DRM_PRIME hwframe API does not currently surface a
+            // per-frame acquire fence; leave None so the renderer takes the
+            // implicit-sync path until a producer that can supply a fence is
+            // wired in.
+            acquire_fence_fd: None,
         });
         frame_out.decoder_frame_ref = decoder_frame_ref;
         self.note_hw_frame_access(HwFrameAccess::DmaBuf, Pixel::DRM_PRIME);

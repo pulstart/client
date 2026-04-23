@@ -86,6 +86,95 @@ struct YuvPipeline {
     last_format: Option<VideoFormat>,
     last_luma_size: (u32, u32),
     last_chroma_size: (u32, u32),
+    luma_pbo: PboRing,
+    chroma_pbo: PboRing,
+    chroma_v_pbo: PboRing,
+    pbo_enabled: bool,
+}
+
+/// Triple-buffered pixel buffer object ring. Lets glTexSubImage2D pull from
+/// previously-written GPU memory instead of blocking on a fresh client-mem
+/// upload each frame. When the mapped write is unsynchronized and each buffer
+/// is orphaned before the map, the driver can trivially avoid GPU/CPU fencing.
+const PBO_RING_SIZE: usize = 3;
+
+struct PboRing {
+    buffers: [Option<glow::Buffer>; PBO_RING_SIZE],
+    capacities: [usize; PBO_RING_SIZE],
+    current: usize,
+}
+
+impl PboRing {
+    fn new() -> Self {
+        Self {
+            buffers: [None, None, None],
+            capacities: [0; PBO_RING_SIZE],
+            current: 0,
+        }
+    }
+
+    /// Upload `data` through the next ring slot and return Ok(true) when the
+    /// data landed in a PBO (caller should then issue tex_sub_image_2d with
+    /// BufferOffset(0)). Returns Ok(false) when PBO path isn't usable and the
+    /// caller must fall back to a direct slice upload.
+    unsafe fn upload(&mut self, gl: &glow::Context, data: &[u8]) -> Result<bool, String> {
+        let idx = self.current;
+        let buffer = match self.buffers[idx] {
+            Some(b) => b,
+            None => {
+                let b = gl
+                    .create_buffer()
+                    .map_err(|e| format!("create_buffer (pbo): {e}"))?;
+                self.buffers[idx] = Some(b);
+                b
+            }
+        };
+        gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(buffer));
+        if self.capacities[idx] < data.len() {
+            gl.buffer_data_size(
+                glow::PIXEL_UNPACK_BUFFER,
+                data.len() as i32,
+                glow::STREAM_DRAW,
+            );
+            self.capacities[idx] = data.len();
+        } else {
+            // Orphan the previous contents to avoid an implicit GPU fence.
+            gl.buffer_data_size(
+                glow::PIXEL_UNPACK_BUFFER,
+                self.capacities[idx] as i32,
+                glow::STREAM_DRAW,
+            );
+        }
+        let ptr = gl.map_buffer_range(
+            glow::PIXEL_UNPACK_BUFFER,
+            0,
+            data.len() as i32,
+            glow::MAP_WRITE_BIT | glow::MAP_INVALIDATE_BUFFER_BIT | glow::MAP_UNSYNCHRONIZED_BIT,
+        );
+        if ptr.is_null() {
+            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+            return Ok(false);
+        }
+        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        gl.unmap_buffer(glow::PIXEL_UNPACK_BUFFER);
+        self.current = (idx + 1) % PBO_RING_SIZE;
+        Ok(true)
+    }
+
+    unsafe fn unbind(gl: &glow::Context) {
+        gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+    }
+
+    #[allow(dead_code)]
+    unsafe fn destroy(&mut self, gl: &glow::Context) {
+        for slot in &mut self.buffers {
+            if let Some(b) = slot.take() {
+                gl.delete_buffer(b);
+            }
+        }
+        self.capacities = [0; PBO_RING_SIZE];
+        self.current = 0;
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -95,6 +184,11 @@ struct LinuxDmabufImporter {
     luma_tex: glow::Texture,
     chroma_tex: glow::Texture,
     chroma_v_tex: glow::Texture,
+    /// Whether the EGL display advertises `EGL_ANDROID_native_fence_sync`.
+    /// When true and a DMA-BUF frame carries an acquire fence fd, the import
+    /// path inserts a GPU-side wait via `eglCreateSyncKHR` +
+    /// `EGL_SYNC_NATIVE_FENCE_ANDROID` + `eglWaitSyncKHR` before sampling.
+    native_fence_sync_supported: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -523,6 +617,7 @@ impl NativeVideoTexture {
 
     pub fn paint_direct_if_available(
         &mut self,
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
         frame: &eframe::Frame,
         ui: &egui::Ui,
         rect: egui::Rect,
@@ -878,6 +973,7 @@ impl YuvPipeline {
             gl.use_program(None);
         }
 
+        let pbo_enabled = pbo_upload_supported(gl);
         Ok(Self {
             program,
             framebuffer,
@@ -890,6 +986,10 @@ impl YuvPipeline {
             last_format: None,
             last_luma_size: (0, 0),
             last_chroma_size: (0, 0),
+            luma_pbo: PboRing::new(),
+            chroma_pbo: PboRing::new(),
+            chroma_v_pbo: PboRing::new(),
+            pbo_enabled,
         })
     }
 
@@ -908,6 +1008,8 @@ impl YuvPipeline {
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
         }
 
+        let pbo_enabled = self.pbo_enabled;
+
         upload_plane_texture(
             gl,
             self.luma_tex,
@@ -917,6 +1019,7 @@ impl YuvPipeline {
             video.height,
             &video.plane0,
             reallocate,
+            pbo_enabled.then_some(&mut self.luma_pbo),
         )?;
 
         match video.format {
@@ -930,6 +1033,7 @@ impl YuvPipeline {
                     chroma_size.1,
                     &video.plane1,
                     reallocate,
+                    pbo_enabled.then_some(&mut self.chroma_pbo),
                 )?;
                 upload_plane_texture(
                     gl,
@@ -940,6 +1044,7 @@ impl YuvPipeline {
                     chroma_size.1,
                     &video.plane2,
                     reallocate,
+                    pbo_enabled.then_some(&mut self.chroma_v_pbo),
                 )?;
             }
             VideoFormat::Yuv444p8 => {
@@ -952,6 +1057,7 @@ impl YuvPipeline {
                     chroma_size.1,
                     &video.plane1,
                     reallocate,
+                    pbo_enabled.then_some(&mut self.chroma_pbo),
                 )?;
                 upload_plane_texture(
                     gl,
@@ -962,6 +1068,7 @@ impl YuvPipeline {
                     chroma_size.1,
                     &video.plane2,
                     reallocate,
+                    pbo_enabled.then_some(&mut self.chroma_v_pbo),
                 )?;
             }
             VideoFormat::Nv12 => {
@@ -974,6 +1081,7 @@ impl YuvPipeline {
                     chroma_size.1,
                     &video.plane1,
                     reallocate,
+                    pbo_enabled.then_some(&mut self.chroma_pbo),
                 )?;
             }
             VideoFormat::Rgba8 => return Err("unexpected RGBA frame in YUV pipeline".into()),
@@ -1115,13 +1223,14 @@ impl LinuxDmabufImporter {
     }
 
     fn new(gl: &glow::Context) -> Result<Self, String> {
-        let (egl, image_target_texture_2d) = linux_dmabuf_support(gl)?;
+        let support = linux_dmabuf_support(gl)?;
         Ok(Self {
-            egl,
-            image_target_texture_2d,
+            egl: support.egl,
+            image_target_texture_2d: support.image_target_texture_2d,
             luma_tex: unsafe { create_input_texture(gl)? },
             chroma_tex: unsafe { create_input_texture(gl)? },
             chroma_v_tex: unsafe { create_input_texture(gl)? },
+            native_fence_sync_supported: support.native_fence_sync,
         })
     }
 
@@ -1141,6 +1250,7 @@ impl LinuxDmabufImporter {
             .get_current_context()
             .ok_or_else(|| "EGL current context unavailable".to_string())?;
 
+        self.wait_acquire_fence(display, frame);
         let images = self.import_images(display, frame)?;
         let render_result = (|| {
             bind_egl_image(gl, self.image_target_texture_2d, self.luma_tex, images[0])?;
@@ -1188,6 +1298,7 @@ impl LinuxDmabufImporter {
             .get_current_context()
             .ok_or_else(|| "EGL current context unavailable".to_string())?;
 
+        self.wait_acquire_fence(display, frame);
         let images = self.import_images(display, frame)?;
         let render_result = (|| {
             bind_egl_image(gl, self.image_target_texture_2d, self.luma_tex, images[0])?;
@@ -1239,6 +1350,54 @@ impl LinuxDmabufImporter {
         }
         Ok(images)
     }
+
+    /// If the frame carries an acquire fence and the EGL context supports
+    /// `EGL_ANDROID_native_fence_sync`, import the fence and queue a GPU-side
+    /// wait before we sample the dmabuf. Ownership of the fd transfers to EGL
+    /// on successful `eglCreateSync`; on any failure we leave the fence fd
+    /// owned by the frame so its `Drop` closes it (implicit-sync fallback).
+    fn wait_acquire_fence(&self, display: egl::Display, frame: &LinuxDmaBufFrame) {
+        if !self.native_fence_sync_supported {
+            return;
+        }
+        let Some(fence_fd) = frame.acquire_fence_fd.as_ref() else {
+            return;
+        };
+        let dup_fd = match fence_fd.try_clone() {
+            Ok(f) => f,
+            Err(err) => {
+                eprintln!(
+                    "[render] dup fence fd failed ({err}); falling back to implicit sync"
+                );
+                return;
+            }
+        };
+        let raw = dup_fd.as_raw_fd();
+        let attribs: [egl::Attrib; 3] = [
+            EGL_SYNC_NATIVE_FENCE_FD_ANDROID as egl::Attrib,
+            raw as egl::Attrib,
+            egl::ATTRIB_NONE,
+        ];
+        let sync = match unsafe {
+            self.egl.create_sync(display, EGL_SYNC_NATIVE_FENCE_ANDROID, &attribs)
+        } {
+            Ok(sync) => {
+                // EGL owns the fd on success — must not also close it.
+                std::mem::forget(dup_fd);
+                sync
+            }
+            Err(err) => {
+                eprintln!(
+                    "[render] eglCreateSync(native_fence) failed ({err:?}); implicit sync"
+                );
+                return;
+            }
+        };
+        if let Err(err) = self.egl.wait_sync(display, sync, 0) {
+            eprintln!("[render] eglWaitSync failed ({err:?}); continuing");
+        }
+        let _ = unsafe { self.egl.destroy_sync(display, sync) };
+    }
 }
 
 fn upload_rgba(
@@ -1286,9 +1445,35 @@ fn upload_plane_texture(
     height: u32,
     data: &[u8],
     reallocate: bool,
+    pbo: Option<&mut PboRing>,
 ) -> Result<(), String> {
     unsafe {
         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+
+        // Reallocations need glTexImage2D to resize the texture, so always use
+        // the direct slice path there. Steady-state updates take the PBO path
+        // when available so the driver can DMA from previously-written GPU
+        // memory instead of blocking on a fresh client-mem upload.
+        let pbo_used = if !reallocate {
+            if let Some(ring) = pbo {
+                match ring.upload(gl, data) {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        PboRing::unbind(gl);
+                        false
+                    }
+                    Err(_) => {
+                        PboRing::unbind(gl);
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         if reallocate {
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
@@ -1301,6 +1486,19 @@ fn upload_plane_texture(
                 glow::UNSIGNED_BYTE,
                 PixelUnpackData::Slice(Some(data)),
             );
+        } else if pbo_used {
+            gl.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                format,
+                glow::UNSIGNED_BYTE,
+                PixelUnpackData::BufferOffset(0),
+            );
+            PboRing::unbind(gl);
         } else {
             gl.tex_sub_image_2d(
                 glow::TEXTURE_2D,
@@ -1318,6 +1516,21 @@ fn upload_plane_texture(
     }
 
     Ok(())
+}
+
+/// PBO-based uploads require GL 2.1+ / GLES 3.0+ and the `map_buffer_range`
+/// entrypoint. `YuvPipeline::new` already ensures the GL version, but probe
+/// again here so the caller can cleanly disable the path on weird drivers.
+fn pbo_upload_supported(gl: &glow::Context) -> bool {
+    if std::env::var_os("ST_DISABLE_PBO").is_some() {
+        return false;
+    }
+    let v = gl.version();
+    if v.is_embedded {
+        v.major >= 3
+    } else {
+        v.major > 2 || (v.major == 2 && v.minor >= 1)
+    }
 }
 
 fn ensure_yuv_gl_support(gl: &glow::Context) -> Result<(), String> {
@@ -1427,15 +1640,14 @@ unsafe fn create_yuv_program(gl: &glow::Context) -> Result<glow::Program, String
 }
 
 #[cfg(target_os = "linux")]
-fn linux_dmabuf_support(
-    gl: &glow::Context,
-) -> Result<
-    (
-        egl::DynamicInstance<egl::EGL1_5>,
-        GlEglImageTargetTexture2DOes,
-    ),
-    String,
-> {
+struct LinuxDmabufSupport {
+    egl: egl::DynamicInstance<egl::EGL1_5>,
+    image_target_texture_2d: GlEglImageTargetTexture2DOes,
+    native_fence_sync: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_dmabuf_support(gl: &glow::Context) -> Result<LinuxDmabufSupport, String> {
     if !gl.supported_extensions().contains("GL_OES_EGL_image") {
         return Err("GL_OES_EGL_image not available".into());
     }
@@ -1456,15 +1668,27 @@ fn linux_dmabuf_support(
         return Err("EGL_EXT_image_dma_buf_import not available".into());
     }
 
+    // Explicit-sync acquire waits need BOTH the base fence-sync machinery and
+    // the native-fence-fd extension. Both live in the same EGL extension
+    // string; checking both keeps older drivers that only ship one on the
+    // implicit-sync path.
+    let native_fence_sync = (extensions.contains("EGL_KHR_fence_sync")
+        || extensions.contains("EGL_KHR_reusable_sync"))
+        && extensions.contains("EGL_ANDROID_native_fence_sync");
+
     let image_target_texture_2d = egl
         .get_proc_address("glEGLImageTargetTexture2DOES")
         .ok_or_else(|| "glEGLImageTargetTexture2DOES unavailable".to_string())?;
 
-    Ok((egl, unsafe {
-        std::mem::transmute::<extern "system" fn(), GlEglImageTargetTexture2DOes>(
-            image_target_texture_2d,
-        )
-    }))
+    Ok(LinuxDmabufSupport {
+        egl,
+        image_target_texture_2d: unsafe {
+            std::mem::transmute::<extern "system" fn(), GlEglImageTargetTexture2DOes>(
+                image_target_texture_2d,
+            )
+        },
+        native_fence_sync,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1549,5 +1773,9 @@ const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: u32 = 0x3443;
 const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: u32 = 0x3444;
 #[cfg(target_os = "linux")]
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+#[cfg(target_os = "linux")]
+const EGL_SYNC_NATIVE_FENCE_ANDROID: egl::Enum = 0x3144;
+#[cfg(target_os = "linux")]
+const EGL_SYNC_NATIVE_FENCE_FD_ANDROID: u32 = 0x3145;
 #[cfg(target_os = "linux")]
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;

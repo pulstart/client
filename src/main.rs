@@ -10,7 +10,10 @@ mod graph_overlay;
 mod display;
 mod input;
 mod keep_awake;
+#[cfg(target_os = "linux")]
+mod linux_uring;
 mod pipeline;
+mod render;
 mod render_gl;
 #[cfg(target_os = "macos")]
 mod render_macos;
@@ -20,6 +23,9 @@ mod render_macos_metal;
 mod render_windows;
 #[cfg(target_os = "windows")]
 mod render_windows_native;
+mod render_wgpu;
+#[cfg(target_os = "linux")]
+mod render_wgpu_linux_dmabuf;
 mod transport;
 mod updater;
 mod video_frame;
@@ -27,7 +33,7 @@ mod video_frame;
 use eframe::egui;
 use input::{LocalCaptureMode, LocalKeyboardState, RemoteCursorTexture, SharedInputState};
 use keep_awake::KeepAwakeController;
-use render_gl::NativeVideoTexture;
+use render::VideoTexture;
 use serde::{Deserialize, Serialize};
 use st_protocol::{
     ClientDisplayInfo, ClockSyncPing, ControlMessage, ControllerState, InputPacket, KeyboardKey,
@@ -148,7 +154,7 @@ struct StreamApp {
     frame: Arc<Mutex<VideoFrameBuffer>>,
     upload_frame: VideoFrameBuffer,
     debug_state: Arc<ConnectionDebugState>,
-    video_texture: NativeVideoTexture,
+    video_texture: VideoTexture,
     keep_awake: KeepAwakeController,
     native_surfaces: Arc<NativeSurfaceControl>,
     disconnect_flag: Arc<AtomicBool>,
@@ -606,7 +612,7 @@ impl StreamApp {
                 rate as f32 / 1000.0
             );
         }
-        let video_texture = NativeVideoTexture::new(cc.gl.as_ref());
+        let video_texture = VideoTexture::new(cc);
         let native_surfaces = Arc::new(NativeSurfaceControl::new(
             video_texture.native_surface_capabilities(),
         ));
@@ -2938,7 +2944,7 @@ impl StreamApp {
         let resp = area.show(ctx, |ui| {
             let frame = egui::Frame::NONE
                 .fill(egui::Color32::from_rgba_unmultiplied(12, 12, 12, 220))
-                .rounding(egui::Rounding::same(6))
+                .corner_radius(egui::CornerRadius::same(6))
                 .inner_margin(egui::Margin::same(8));
 
             frame.show(ui, |ui| {
@@ -3431,8 +3437,7 @@ fn run_connection(
                         pending.drain(..consumed);
                     }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => continue,
+                Err(ref e) if is_timeout(e) => continue,
                 Err(e) => {
                     set_error(
                         &state,
@@ -3674,15 +3679,17 @@ fn run_connection(
                             shared_input.set_capabilities(capabilities);
                         }
                         ControlMessage::CursorShape(shape) => {
-                            eprintln!(
-                                "[cursor] shape: serial={} {}x{} hotspot=({},{}) rgba_len={}",
-                                shape.serial,
-                                shape.width,
-                                shape.height,
-                                shape.hotspot_x,
-                                shape.hotspot_y,
-                                shape.rgba.len()
-                            );
+                            if trace_enabled() {
+                                eprintln!(
+                                    "[cursor] shape: serial={} {}x{} hotspot=({},{}) rgba_len={}",
+                                    shape.serial,
+                                    shape.width,
+                                    shape.height,
+                                    shape.hotspot_x,
+                                    shape.hotspot_y,
+                                    shape.rgba.len()
+                                );
+                            }
                             shared_input.set_cursor_shape(shape);
                             ctx.request_repaint();
                         }
@@ -3935,15 +3942,17 @@ fn run_connection(
                             shared_input.set_capabilities(capabilities);
                         }
                         ControlMessage::CursorShape(shape) => {
-                            eprintln!(
-                                "[cursor] shape: serial={} {}x{} hotspot=({},{}) rgba_len={}",
-                                shape.serial,
-                                shape.width,
-                                shape.height,
-                                shape.hotspot_x,
-                                shape.hotspot_y,
-                                shape.rgba.len()
-                            );
+                            if trace_enabled() {
+                                eprintln!(
+                                    "[cursor] shape: serial={} {}x{} hotspot=({},{}) rgba_len={}",
+                                    shape.serial,
+                                    shape.width,
+                                    shape.height,
+                                    shape.hotspot_x,
+                                    shape.hotspot_y,
+                                    shape.rgba.len()
+                                );
+                            }
                             shared_input.set_cursor_shape(shape);
                             ctx.request_repaint();
                         }
@@ -4563,7 +4572,16 @@ fn session_cancelled(
 }
 
 fn is_timeout(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut
+    // `Interrupted` (EINTR) is not a timeout but must be retried the same way.
+    // io_uring's kernel-side worker threads deliver signals that interrupt
+    // blocking syscalls on the same process; if we let EINTR tear down the
+    // TCP control loop, the whole session collapses ~12 frames in. Before
+    // this fix, ST_IO_URING=1 reproducibly disconnected after one decoded
+    // frame with `Err kind=Interrupted` from `tcp.read`, even though the
+    // decoder was producing frames correctly.
+    e.kind() == std::io::ErrorKind::WouldBlock
+        || e.kind() == std::io::ErrorKind::TimedOut
+        || e.kind() == std::io::ErrorKind::Interrupted
 }
 
 fn drain_control_messages(buf: &mut Vec<u8>) -> Vec<ControlMessage> {
@@ -6445,11 +6463,54 @@ fn main() {
         .with_title("Stream Client")
         .with_inner_size([1280.0, 720.0]);
 
-    let options = eframe::NativeOptions {
-        viewport,
-        renderer: eframe::Renderer::Glow,
-        vsync: display::vsync_enabled(),
-        ..Default::default()
+    // Renderer default: on Linux we default to wgpu because DMA-BUF zero-copy
+    // import is validated end-to-end and wgpu additionally gets us
+    // PresentMode::Mailbox + desired_maximum_frame_latency=1 for lower
+    // compositor latency. On macOS and Windows we stay on Glow because the
+    // VideoToolbox/IOSurface and D3D11 interop zero-copy paths are still
+    // Glow-only — flipping to wgpu there would be a silent perf regression
+    // until those platform-specific `wgpu_hal` external-memory imports land.
+    // `ST_RENDERER=glow` forces the old default on any platform.
+    let renderer_pref = std::env::var("ST_RENDERER")
+        .unwrap_or_default()
+        .to_lowercase();
+    let default_to_wgpu = cfg!(target_os = "linux");
+    let use_wgpu = match renderer_pref.as_str() {
+        "wgpu" | "wgpu-min-latency" => true,
+        "glow" => false,
+        "" => default_to_wgpu,
+        other => {
+            eprintln!("[main] unknown ST_RENDERER={other:?}; falling back to default");
+            default_to_wgpu
+        }
+    };
+    if use_wgpu {
+        eprintln!(
+            "[main] wgpu renderer active (PresentMode::Mailbox + max_frame_latency=1). \
+             On Linux, DMA-BUF zero-copy import auto-enables when the Vulkan adapter \
+             advertises VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf. \
+             Force Glow with ST_RENDERER=glow."
+        );
+    }
+
+    let options = if use_wgpu {
+        let mut wgpu_cfg = eframe::egui_wgpu::WgpuConfiguration::default();
+        wgpu_cfg.desired_maximum_frame_latency = Some(1);
+        wgpu_cfg.present_mode = eframe::wgpu::PresentMode::Mailbox;
+        eframe::NativeOptions {
+            viewport,
+            renderer: eframe::Renderer::Wgpu,
+            wgpu_options: wgpu_cfg,
+            vsync: display::vsync_enabled(),
+            ..Default::default()
+        }
+    } else {
+        eframe::NativeOptions {
+            viewport,
+            renderer: eframe::Renderer::Glow,
+            vsync: display::vsync_enabled(),
+            ..Default::default()
+        }
     };
 
     eframe::run_native(

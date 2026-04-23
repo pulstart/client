@@ -321,7 +321,10 @@ pub fn run_receive_pipeline(
                     &ctx,
                     &mut repaint_pacer,
                 );
-                std::thread::sleep(Duration::from_micros(500));
+                // Block briefly on the socket instead of spinning: wakes as soon
+                // as a datagram arrives (Linux poll) or after a 2ms timeout so
+                // stats/recovery/shutdown checks still get a turn.
+                receiver.wait_for_data(Duration::from_millis(2));
                 continue;
             }
             Some(ReceivedData::Audio(opus)) => {

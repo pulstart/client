@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eframe = "0.33"
+eframe = { version = "0.33", features = ["wgpu"] }
 st-protocol = { path = "protocol", features = ["tunnel"] }
 ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "software-scaling"] }
 crossbeam-channel = "0.5"
@@ -25,6 +25,9 @@ tempfile = "3"
 ureq = { version = "2", default-features = true }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+[dev-dependencies]
+pollster = "0.4"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 core-graphics-types = "0.2"
@@ -34,6 +37,8 @@ raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5.14"
+io-uring = "0.7"
+ash = "0.38"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6"

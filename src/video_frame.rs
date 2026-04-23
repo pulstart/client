@@ -154,6 +154,15 @@ pub struct LinuxDmaBufFrame {
     pub format: LinuxDmaBufFormat,
     pub planes: Vec<LinuxDmaBufPlane>,
     pub decoder_frame_ref: Option<FfmpegVideoFrameHold>,
+    /// Optional native-fence fd signalling when the producer (typically the
+    /// hardware decoder) is done writing these planes. When present and the
+    /// EGL context advertises `EGL_ANDROID_native_fence_sync`, the renderer
+    /// will import the fd via `eglCreateSyncKHR(EGL_SYNC_NATIVE_FENCE_ANDROID)`
+    /// and `eglWaitSyncKHR` instead of relying on the driver's implicit stall
+    /// when the DMA-BUF is first sampled. Ownership transfers to EGL on import;
+    /// today no decoder in the pipeline produces this, so it stays `None` and
+    /// the implicit-sync path is preserved.
+    pub acquire_fence_fd: Option<OwnedFd>,
 }
 
 #[cfg(target_os = "linux")]
@@ -179,12 +188,20 @@ impl LinuxDmaBufFrame {
             planes.push(plane.try_clone()?);
         }
 
+        let acquire_fence_fd = match self.acquire_fence_fd.as_ref() {
+            Some(fd) => {
+                Some(dup_owned_fd(fd).map_err(|err| format!("dup fence fd: {err}"))?)
+            }
+            None => None,
+        };
+
         Ok(Self {
             width: self.width,
             height: self.height,
             format: self.format,
             planes,
             decoder_frame_ref: self.decoder_frame_ref.clone(),
+            acquire_fence_fd,
         })
     }
 }
