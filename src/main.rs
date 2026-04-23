@@ -6441,6 +6441,37 @@ mod tests {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Choose the best present mode we can *safely* request at surface config
+/// time. `Mailbox` is a wgpu validation error on surfaces that only support
+/// `Fifo`, which in practice covers software fallbacks (Mesa llvmpipe,
+/// Microsoft Basic Render Driver). We probe the adapter list cheaply and
+/// downgrade to `Fifo` if we only see software adapters.
+fn pick_wgpu_present_mode() -> eframe::wgpu::PresentMode {
+    use eframe::wgpu;
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..Default::default()
+    });
+    let adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all());
+    if adapters.is_empty() {
+        return wgpu::PresentMode::Fifo;
+    }
+    let has_hw = adapters.iter().any(|a| {
+        let info = a.get_info();
+        !matches!(info.device_type, wgpu::DeviceType::Cpu)
+    });
+    if has_hw {
+        wgpu::PresentMode::Mailbox
+    } else {
+        eprintln!(
+            "[main] No hardware wgpu adapter available (Mesa software fallback?); \
+             using PresentMode::Fifo. Likely fix: add your user to the 'render' group \
+             so /dev/dri/renderD* is accessible: sudo usermod -aG render $USER"
+        );
+        wgpu::PresentMode::Fifo
+    }
+}
+
 fn main() {
     match updater::maybe_run_apply_update_from_args() {
         Ok(true) => return,
@@ -6484,19 +6515,33 @@ fn main() {
             default_to_wgpu
         }
     };
+    // Mailbox gives us lower-latency compositor handoff than Fifo, but it's
+    // not guaranteed to be supported — llvmpipe / software Vulkan surfaces
+    // only expose Fifo, which makes `Surface::configure(Mailbox)` panic.
+    // Probe the adapter type before committing and fall back to Fifo when
+    // we're clearly on software rendering. Common failure mode: the user
+    // isn't in the `render` group, so mesa can't open /dev/dri/renderD*
+    // and silently falls back to llvmpipe.
+    let wgpu_present_mode = if use_wgpu {
+        pick_wgpu_present_mode()
+    } else {
+        eframe::wgpu::PresentMode::Fifo
+    };
+
     if use_wgpu {
         eprintln!(
-            "[main] wgpu renderer active (PresentMode::Mailbox + max_frame_latency=1). \
+            "[main] wgpu renderer active ({:?} + max_frame_latency=1). \
              On Linux, DMA-BUF zero-copy import auto-enables when the Vulkan adapter \
              advertises VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf. \
-             Force Glow with ST_RENDERER=glow."
+             Force Glow with ST_RENDERER=glow.",
+            wgpu_present_mode,
         );
     }
 
     let options = if use_wgpu {
         let mut wgpu_cfg = eframe::egui_wgpu::WgpuConfiguration::default();
         wgpu_cfg.desired_maximum_frame_latency = Some(1);
-        wgpu_cfg.present_mode = eframe::wgpu::PresentMode::Mailbox;
+        wgpu_cfg.present_mode = wgpu_present_mode;
         eframe::NativeOptions {
             viewport,
             renderer: eframe::Renderer::Wgpu,
