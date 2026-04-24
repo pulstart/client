@@ -189,9 +189,7 @@ impl LinuxDmaBufFrame {
         }
 
         let acquire_fence_fd = match self.acquire_fence_fd.as_ref() {
-            Some(fd) => {
-                Some(dup_owned_fd(fd).map_err(|err| format!("dup fence fd: {err}"))?)
-            }
+            Some(fd) => Some(dup_owned_fd(fd).map_err(|err| format!("dup fence fd: {err}"))?),
             None => None,
         };
 
@@ -423,14 +421,18 @@ impl VideoFrameBuffer {
     pub fn chroma_width(&self) -> u32 {
         match self.format {
             VideoFormat::Yuv444p8 => self.width,
-            VideoFormat::Rgba8 | VideoFormat::Yuv420p8 | VideoFormat::Nv12 => self.width.div_ceil(2),
+            VideoFormat::Rgba8 | VideoFormat::Yuv420p8 | VideoFormat::Nv12 => {
+                self.width.div_ceil(2)
+            }
         }
     }
 
     pub fn chroma_height(&self) -> u32 {
         match self.format {
             VideoFormat::Yuv444p8 => self.height,
-            VideoFormat::Rgba8 | VideoFormat::Yuv420p8 | VideoFormat::Nv12 => self.height.div_ceil(2),
+            VideoFormat::Rgba8 | VideoFormat::Yuv420p8 | VideoFormat::Nv12 => {
+                self.height.div_ceil(2)
+            }
         }
     }
 }

@@ -1,13 +1,16 @@
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 mod api_client;
 mod audio;
 mod clipboard;
 mod debug_state;
 mod decode;
+mod display;
 mod file_transfer;
 mod graph_overlay;
-mod display;
 mod input;
 mod keep_awake;
 #[cfg(target_os = "linux")]
@@ -19,13 +22,13 @@ mod render_gl;
 mod render_macos;
 #[cfg(target_os = "macos")]
 mod render_macos_metal;
+mod render_wgpu;
+#[cfg(target_os = "linux")]
+mod render_wgpu_linux_dmabuf;
 #[cfg(target_os = "windows")]
 mod render_windows;
 #[cfg(target_os = "windows")]
 mod render_windows_native;
-mod render_wgpu;
-#[cfg(target_os = "linux")]
-mod render_wgpu_linux_dmabuf;
 mod transport;
 mod updater;
 mod video_frame;
@@ -38,9 +41,9 @@ use serde::{Deserialize, Serialize};
 use st_protocol::{
     ClientDisplayInfo, ClockSyncPing, ControlMessage, ControllerState, InputPacket, KeyboardKey,
     KeyboardStateInput, MouseAbsoluteInput, MouseButtonsInput, MouseRelativeInput, MouseWheelInput,
-    StreamConfig, TransportFeedback, VideoChromaSampling, VideoCodec, VideoCodecSupport, MOUSE_BUTTON_EXTRA1,
-    MOUSE_BUTTON_EXTRA2, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY,
-    MOUSE_WHEEL_STEP_UNITS,
+    StreamConfig, TransportFeedback, VideoChromaSampling, VideoCodec, VideoCodecSupport,
+    MOUSE_BUTTON_EXTRA1, MOUSE_BUTTON_EXTRA2, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_PRIMARY,
+    MOUSE_BUTTON_SECONDARY, MOUSE_WHEEL_STEP_UNITS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -217,15 +220,16 @@ fn default_menu_button_pos() -> egui::Pos2 {
     egui::pos2(FLOATING_MENU_BUTTON_MARGIN, FLOATING_MENU_BUTTON_MARGIN)
 }
 
-
-
 fn normalize_server_addr(input: &str) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return String::new();
     }
 
-    if let Some(host) = trimmed.strip_prefix('[').and_then(|value| value.strip_suffix(']')) {
+    if let Some(host) = trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    {
         return format!("[{host}]:{DEFAULT_APP_PORT}");
     }
 
@@ -261,9 +265,7 @@ fn addr_ip(addr: &str) -> Option<std::net::IpAddr> {
 
 fn is_privateish_ip(ip: std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_private() || v4.is_loopback() || v4.is_link_local()
-        }
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
         std::net::IpAddr::V6(v6) => {
             v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
         }
@@ -271,7 +273,9 @@ fn is_privateish_ip(ip: std::net::IpAddr) -> bool {
 }
 
 fn is_public_addr(addr: &str) -> bool {
-    addr_ip(addr).map(|ip| !is_privateish_ip(ip)).unwrap_or(false)
+    addr_ip(addr)
+        .map(|ip| !is_privateish_ip(ip))
+        .unwrap_or(false)
 }
 
 fn preferred_api_display_addr(host: &api_client::ApiDiscoveredHost) -> Option<String> {
@@ -285,8 +289,6 @@ fn preferred_api_display_addr(host: &api_client::ApiDiscoveredHost) -> Option<St
 fn allow_hole_punch_fallback(socket_addr: std::net::SocketAddr) -> bool {
     !is_privateish_ip(socket_addr.ip())
 }
-
-
 
 fn load_audio_enabled() -> bool {
     std::fs::read_to_string(state_dir().join("audio_enabled"))
@@ -395,7 +397,10 @@ fn load_menu_button_pos() -> Option<egui::Pos2> {
 fn save_menu_button_pos(pos: egui::Pos2) {
     let dir = state_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join("menu_button_pos"), format!("{:.1} {:.1}", pos.x, pos.y));
+    let _ = std::fs::write(
+        dir.join("menu_button_pos"),
+        format!("{:.1} {:.1}", pos.x, pos.y),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -511,10 +516,7 @@ fn clamp_menu_button_pos(pos: egui::Pos2, content_rect: egui::Rect) -> egui::Pos
 // Discovery listener
 // ---------------------------------------------------------------------------
 
-fn start_discovery_listener(
-    discovered: Arc<Mutex<Vec<DiscoveredServer>>>,
-    ctx: egui::Context,
-) {
+fn start_discovery_listener(discovered: Arc<Mutex<Vec<DiscoveredServer>>>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let sock = match std::net::UdpSocket::bind(format!("0.0.0.0:{DISCOVERY_PORT}")) {
             Ok(s) => s,
@@ -911,12 +913,7 @@ impl StreamApp {
         }
     }
 
-    fn send_remote_wheel(
-        &mut self,
-        client_id: u32,
-        delta: egui::Vec2,
-        unit: egui::MouseWheelUnit,
-    ) {
+    fn send_remote_wheel(&mut self, client_id: u32, delta: egui::Vec2, unit: egui::MouseWheelUnit) {
         self.pending_wheel_units += delta * wheel_unit_scale(unit);
         let delta_x = take_wheel_units(&mut self.pending_wheel_units.x);
         let delta_y = take_wheel_units(&mut self.pending_wheel_units.y);
@@ -1014,10 +1011,7 @@ impl StreamApp {
         }
     }
 
-    fn server_cursor_stream_top_left(
-        &self,
-        snapshot: &input::SharedInputSnapshot,
-    ) -> egui::Pos2 {
+    fn server_cursor_stream_top_left(&self, snapshot: &input::SharedInputSnapshot) -> egui::Pos2 {
         egui::pos2(
             snapshot.cursor_state.x as f32,
             snapshot.cursor_state.y as f32,
@@ -1078,20 +1072,17 @@ impl StreamApp {
 
         match self.capture_mode {
             LocalCaptureMode::HoverAbsolute => {
-                let pointer_pos = self
-                    .hover_cursor_pos
-                    .or_else(|| {
-                        if self.uses_virtual_hover_cursor(&snapshot) {
-                            None
-                        } else {
-                            ctx.input(|i| i.pointer.latest_pos())
-                        }
-                    });
+                let pointer_pos = self.hover_cursor_pos.or_else(|| {
+                    if self.uses_virtual_hover_cursor(&snapshot) {
+                        None
+                    } else {
+                        ctx.input(|i| i.pointer.latest_pos())
+                    }
+                });
                 pointer_pos
                     .zip(self.current_video_rect(ctx).or(self.last_video_rect))
                     .map(|(pointer_pos, rect)| {
-                        rect.contains(pointer_pos)
-                            && !self.pointer_over_local_overlay(pointer_pos)
+                        rect.contains(pointer_pos) && !self.pointer_over_local_overlay(pointer_pos)
                     })
                     .unwrap_or(false)
             }
@@ -1178,10 +1169,7 @@ impl StreamApp {
                         latest_version: version,
                         html_url,
                     }) => {
-                        self.update_ui_state = UpdateUiState::UpToDate {
-                            version,
-                            html_url,
-                        };
+                        self.update_ui_state = UpdateUiState::UpToDate { version, html_url };
                     }
                     Ok(updater::CheckOutcome::UpdateAvailable(release)) => {
                         self.update_ui_state = UpdateUiState::UpdateAvailable(release);
@@ -1275,40 +1263,6 @@ impl StreamApp {
         video_rect: egui::Rect,
     ) {
         let _ = self.send_absolute_cursor(client_id, pos, video_rect, false);
-    }
-
-    fn send_relative_cursor_sync(
-        &self,
-        client_id: u32,
-        from_pos: egui::Pos2,
-        to_pos: egui::Pos2,
-        video_rect: egui::Rect,
-    ) -> bool {
-        if !video_rect.contains(from_pos) || !video_rect.contains(to_pos) {
-            return false;
-        }
-        let stream_size = self.cursor_space_size().unwrap_or_else(|| video_rect.size());
-        let scale_x = stream_size.x / video_rect.width().max(1.0);
-        let scale_y = stream_size.y / video_rect.height().max(1.0);
-        let mut dx = ((to_pos.x - from_pos.x) * scale_x).round() as i32;
-        let mut dy = ((to_pos.y - from_pos.y) * scale_y).round() as i32;
-        if dx == 0 && dy == 0 {
-            return false;
-        }
-
-        while dx != 0 || dy != 0 {
-            let step_x = dx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            let step_y = dy.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            self.send_input_packet(InputPacket::MouseRelative(MouseRelativeInput {
-                client_id,
-                dx: step_x,
-                dy: step_y,
-                buttons: self.pointer_buttons,
-            }));
-            dx -= i32::from(step_x);
-            dy -= i32::from(step_y);
-        }
-        true
     }
 
     fn sync_remote_cursor_texture(&mut self, ctx: &egui::Context) {
@@ -1456,7 +1410,8 @@ impl StreamApp {
         let over_local_overlay = pointer_pos
             .map(|pos| self.pointer_over_local_overlay(pos))
             .unwrap_or(false);
-        let active_texture = self.remote_cursor_texture_for_serial(input_snapshot.cursor_state.serial);
+        let active_texture =
+            self.remote_cursor_texture_for_serial(input_snapshot.cursor_state.serial);
         let overlay_geometry = self.compute_cursor_overlay_geometry(ctx, input_snapshot);
         let mut lines = vec![
             format!(
@@ -1538,11 +1493,7 @@ impl StreamApp {
         lines
     }
 
-    fn handle_connected_video_response(
-        &mut self,
-        ctx: &egui::Context,
-        response: &egui::Response,
-    ) {
+    fn handle_connected_video_response(&mut self, ctx: &egui::Context, response: &egui::Response) {
         let previous_video_rect = self.last_video_rect;
         let video_rect = self.current_video_rect(ctx).unwrap_or(response.rect);
         self.last_video_rect = Some(video_rect);
@@ -1556,16 +1507,17 @@ impl StreamApp {
             && self.pointer_buttons != 0;
         let virtual_hover = self.uses_virtual_hover_cursor(&snapshot);
         let actual_pointer_pos = if self.suppress_pointer_pos_frames > 0 {
-            self.hover_cursor_pos.or_else(|| ctx.input(|i| i.pointer.latest_pos()))
+            self.hover_cursor_pos
+                .or_else(|| ctx.input(|i| i.pointer.latest_pos()))
         } else {
             ctx.input(|i| i.pointer.latest_pos())
         };
-        let mut pointer_pos = if virtual_hover && previous_capture_mode == LocalCaptureMode::HoverAbsolute
-        {
-            self.hover_cursor_pos.or(actual_pointer_pos)
-        } else {
-            actual_pointer_pos
-        };
+        let mut pointer_pos =
+            if virtual_hover && previous_capture_mode == LocalCaptureMode::HoverAbsolute {
+                self.hover_cursor_pos.or(actual_pointer_pos)
+            } else {
+                actual_pointer_pos
+            };
         if virtual_hover
             && previous_capture_mode == LocalCaptureMode::HoverAbsolute
             && controller_state_allows_input(snapshot.controller_state)
@@ -1655,9 +1607,7 @@ impl StreamApp {
             self.capture_mode = LocalCaptureMode::CapturedRelative;
             self.resume_hover_after_relative_drag = false;
             self.hover_cursor_resync_pending = false;
-            if let Some(pos) = pointer_pos.filter(|pos| {
-                video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
-            }) {
+            if let Some(pos) = self.mapped_server_cursor_video_pos(&snapshot, video_rect) {
                 self.hover_cursor_pos = Some(clamp_pos_to_video_rect(
                     pos,
                     video_rect,
@@ -1718,9 +1668,7 @@ impl StreamApp {
             && snapshot.cursor_state.visible
         {
             pointer_pos
-                .filter(|pos| {
-                    video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
-                })
+                .filter(|pos| video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos))
                 .filter(|pos| pos_near_video_edge(*pos, video_rect, ctx.pixels_per_point()))
                 .and_then(|pos| {
                     self.mapped_server_cursor_video_pos(&snapshot, video_rect)
@@ -1738,8 +1686,7 @@ impl StreamApp {
             if snapshot.cursor_state_version != self.hover_drag_edge_mismatch_cursor_state_version {
                 self.hover_drag_edge_mismatch_updates =
                     self.hover_drag_edge_mismatch_updates.saturating_add(1);
-                self.hover_drag_edge_mismatch_cursor_state_version =
-                    snapshot.cursor_state_version;
+                self.hover_drag_edge_mismatch_cursor_state_version = snapshot.cursor_state_version;
             }
         } else {
             self.hover_drag_edge_mismatch_updates = 0;
@@ -1749,14 +1696,16 @@ impl StreamApp {
             && controller_state_allows_input(snapshot.controller_state)
             && self.pointer_buttons & drag_buttons != 0
             && (hidden_cursor_relative_drag
-                || self.hover_drag_edge_mismatch_updates
-                    >= HOVER_EDGE_MISMATCH_UPDATES_THRESHOLD)
+                || self.hover_drag_edge_mismatch_updates >= HOVER_EDGE_MISMATCH_UPDATES_THRESHOLD)
         {
-            if let Some(pos) = pointer_pos.filter(|pos| {
-                video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
-            }) {
-                self.hover_cursor_pos =
-                    Some(clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()));
+            if let Some(pos) = pointer_pos
+                .filter(|pos| video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos))
+            {
+                self.hover_cursor_pos = Some(clamp_pos_to_video_rect(
+                    pos,
+                    video_rect,
+                    ctx.pixels_per_point(),
+                ));
             } else if self.hover_cursor_pos.is_none() {
                 // Don't fall back to center — skip the transition until we
                 // have a real pointer position to anchor the drag.
@@ -1767,8 +1716,7 @@ impl StreamApp {
                 self.resume_hover_after_relative_drag = true;
                 self.hover_cursor_resync_pending = false;
                 self.hover_drag_edge_mismatch_updates = 0;
-                self.hover_drag_edge_mismatch_cursor_state_version =
-                    snapshot.cursor_state_version;
+                self.hover_drag_edge_mismatch_cursor_state_version = snapshot.cursor_state_version;
                 ctx.request_repaint();
             }
         }
@@ -1784,19 +1732,17 @@ impl StreamApp {
             && snapshot.capabilities.separate_cursor
             && snapshot.cursor_state.visible
         {
-            if let Some(local_pos) = pointer_pos
-                .filter(|pos| {
-                    video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
-                })
-                .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()))
-            {
-                if let (Some(client_id), Some(remote_pos)) = (
-                    snapshot.client_id,
-                    self.mapped_server_cursor_video_pos(&snapshot, video_rect),
-                ) {
-                    self.send_relative_cursor_sync(client_id, remote_pos, local_pos, video_rect);
-                }
-                self.hover_cursor_pos = Some(local_pos);
+            // In relative mode the server cursor metadata is the source of truth;
+            // the local pointer only decides when capture starts or escapes.
+            let remote_pos = self.mapped_server_cursor_video_pos(&snapshot, video_rect);
+            let local_pos = pointer_pos
+                .filter(|pos| video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos));
+            if let Some(anchor_pos) = relative_capture_entry_anchor(remote_pos, local_pos) {
+                self.hover_cursor_pos = Some(clamp_pos_to_video_rect(
+                    anchor_pos,
+                    video_rect,
+                    ctx.pixels_per_point(),
+                ));
                 ctx.request_repaint();
             }
         }
@@ -1806,10 +1752,11 @@ impl StreamApp {
             && self.capture_mode != LocalCaptureMode::ForceReleased
         {
             if virtual_hover {
-                let desired_hover_pos = if previous_capture_mode == LocalCaptureMode::HoverAbsolute {
-                    self.hover_cursor_pos.or(pointer_pos).map(|pos| {
-                        clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point())
-                    })
+                let desired_hover_pos = if previous_capture_mode == LocalCaptureMode::HoverAbsolute
+                {
+                    self.hover_cursor_pos
+                        .or(pointer_pos)
+                        .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()))
                 } else {
                     actual_pointer_pos
                         .or(pointer_pos)
@@ -1863,7 +1810,8 @@ impl StreamApp {
             } else {
                 None
             };
-            let predicted_pos = local_entry_pos
+            let predicted_pos = self
+                .mapped_server_cursor_video_pos(&snapshot, video_rect)
                 .or_else(|| {
                     self.hover_cursor_pos.map(|pos| {
                         previous_video_rect
@@ -1874,7 +1822,7 @@ impl StreamApp {
                             .unwrap_or(pos)
                     })
                 })
-                .or_else(|| self.mapped_server_cursor_video_pos(&snapshot, video_rect));
+                .or(local_entry_pos);
             self.hover_cursor_pos = predicted_pos
                 .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()));
         } else if !self.resume_hover_after_relative_drag {
@@ -1928,11 +1876,7 @@ impl StreamApp {
                 let local_pos = pos - video_rect.min.to_vec2();
                 let painter = ui.painter().with_clip_rect(rect);
                 painter.circle_filled(local_pos, 5.0, egui::Color32::WHITE);
-                painter.circle_stroke(
-                    local_pos,
-                    5.0,
-                    egui::Stroke::new(1.5, egui::Color32::BLACK),
-                );
+                painter.circle_stroke(local_pos, 5.0, egui::Stroke::new(1.5, egui::Color32::BLACK));
             });
     }
 
@@ -1942,7 +1886,10 @@ impl StreamApp {
         let painter = ui.painter().clone();
         painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(7, 10, 14));
         painter.circle_filled(
-            egui::pos2(rect.left() + rect.width() * 0.18, rect.top() + rect.height() * 0.22),
+            egui::pos2(
+                rect.left() + rect.width() * 0.18,
+                rect.top() + rect.height() * 0.22,
+            ),
             rect.width().min(rect.height()) * 0.16,
             egui::Color32::from_rgba_unmultiplied(54, 156, 255, 20),
         );
@@ -1974,10 +1921,8 @@ impl StreamApp {
 
         // Fill backgrounds
         painter.rect_filled(full_rect, 0.0, BG_MAIN);
-        let sidebar_rect = egui::Rect::from_min_size(
-            full_rect.min,
-            egui::vec2(SIDEBAR_W, full_rect.height()),
-        );
+        let sidebar_rect =
+            egui::Rect::from_min_size(full_rect.min, egui::vec2(SIDEBAR_W, full_rect.height()));
         painter.rect_filled(sidebar_rect, 0.0, BG_SIDEBAR);
 
         // --- Sidebar icons ---
@@ -2044,15 +1989,9 @@ impl StreamApp {
         let main_bottom = full_rect.bottom() - bottom_bar_h;
 
         if self.home_tab == HomeTab::Servers && bottom_bar_h > 0.0 {
-            let bottom_rect = egui::Rect::from_min_max(
-                egui::pos2(content_left, main_bottom),
-                full_rect.max,
-            );
-            painter.rect_filled(
-                bottom_rect,
-                0.0,
-                egui::Color32::from_rgb(30, 34, 42),
-            );
+            let bottom_rect =
+                egui::Rect::from_min_max(egui::pos2(content_left, main_bottom), full_rect.max);
+            painter.rect_filled(bottom_rect, 0.0, egui::Color32::from_rgb(30, 34, 42));
             painter.line_segment(
                 [
                     egui::pos2(content_left, bottom_rect.top()),
@@ -2093,14 +2032,10 @@ impl StreamApp {
             if bottom_ui
                 .add_enabled(
                     can_add,
-                    egui::Button::new(
-                        egui::RichText::new("Add")
-                            .size(12.0)
-                            .color(TEXT_WHITE),
-                    )
-                    .fill(BTN_DARK)
-                    .corner_radius(4)
-                    .min_size(egui::vec2(50.0, 28.0)),
+                    egui::Button::new(egui::RichText::new("Add").size(12.0).color(TEXT_WHITE))
+                        .fill(BTN_DARK)
+                        .corner_radius(4)
+                        .min_size(egui::vec2(50.0, 28.0)),
                 )
                 .clicked()
             {
@@ -2135,13 +2070,11 @@ impl StreamApp {
                 };
                 egui::Frame::NONE
                     .inner_margin(margin)
-                    .show(ui, |ui| {
-                        match self.home_tab {
-                            HomeTab::Servers => self.render_servers_tab(ui, ctx),
-                            HomeTab::Settings => self.render_settings_tab(ui),
-                            HomeTab::Update => self.render_update_tab(ui, ctx),
-                            HomeTab::About => self.render_about_tab(ui),
-                        }
+                    .show(ui, |ui| match self.home_tab {
+                        HomeTab::Servers => self.render_servers_tab(ui, ctx),
+                        HomeTab::Settings => self.render_settings_tab(ui),
+                        HomeTab::Update => self.render_update_tab(ui, ctx),
+                        HomeTab::About => self.render_about_tab(ui),
                     });
             });
     }
@@ -2198,27 +2131,24 @@ impl StreamApp {
                     .hint_text("Search Hosts and Computers")
                     .desired_width(search_width),
             );
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("Reload")
-                                    .size(13.0)
-                                    .color(ACCENT_BLUE),
-                            )
-                            .fill(egui::Color32::TRANSPARENT),
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Reload").size(13.0).color(ACCENT_BLUE),
                         )
-                        .clicked()
-                    {
-                        self.server_list = load_server_list();
-                        // Prune stale discovered servers so the list is fresh
-                        self.discovered_servers.lock().unwrap()
-                            .retain(|s| s.last_seen.elapsed() < DISCOVERY_EXPIRY);
-                    }
-                },
-            );
+                        .fill(egui::Color32::TRANSPARENT),
+                    )
+                    .clicked()
+                {
+                    self.server_list = load_server_list();
+                    // Prune stale discovered servers so the list is fresh
+                    self.discovered_servers
+                        .lock()
+                        .unwrap()
+                        .retain(|s| s.last_seen.elapsed() < DISCOVERY_EXPIRY);
+                }
+            });
         });
         ui.add_space(20.0);
 
@@ -2252,9 +2182,8 @@ impl StreamApp {
                 {
                     None
                 } else {
-                    preferred_api_display_addr(h).map(|addr| {
-                        (addr, h.hostname.clone(), h.peer_id.clone())
-                    })
+                    preferred_api_display_addr(h)
+                        .map(|addr| (addr, h.hostname.clone(), h.peer_id.clone()))
                 }
             });
         // For the empty-check below.
@@ -2391,16 +2320,15 @@ impl StreamApp {
         if merged.is_empty() {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
-                let msg = if self.server_list.is_empty() && lan_servers.is_empty() && api_candidates.is_empty() {
+                let msg = if self.server_list.is_empty()
+                    && lan_servers.is_empty()
+                    && api_candidates.is_empty()
+                {
                     "No computers\nAdd a server address using the bar below."
                 } else {
                     "No matches"
                 };
-                ui.label(
-                    egui::RichText::new(msg)
-                        .size(14.0)
-                        .color(TEXT_DIM),
-                );
+                ui.label(egui::RichText::new(msg).size(14.0).color(TEXT_DIM));
             });
         } else {
             let avail_w = ui.available_width();
@@ -2411,13 +2339,15 @@ impl StreamApp {
             let viewport_min_y = (ui.clip_rect().top() - content_top).max(0.0);
             let viewport_max_y = (ui.clip_rect().bottom() - content_top).max(viewport_min_y);
             let list_start_y = ui.next_widget_position().y - content_top;
-            let start_row = (((viewport_min_y - list_start_y) / row_height).floor().max(0.0)
-                as usize)
+            let start_row = (((viewport_min_y - list_start_y) / row_height)
+                .floor()
+                .max(0.0) as usize)
                 .min(total_rows);
-            let end_row = (((viewport_max_y - list_start_y) / row_height).ceil().max(0.0)
-                as usize
+            let end_row = (((viewport_max_y - list_start_y) / row_height)
+                .ceil()
+                .max(0.0) as usize
                 + 1)
-                .min(total_rows);
+            .min(total_rows);
 
             if start_row > 0 {
                 ui.add_space(start_row as f32 * row_height);
@@ -2479,7 +2409,11 @@ impl StreamApp {
 
                         // LAN badge
                         if srv.is_lan {
-                            let badge_y = if srv.subtitle.is_empty() { sub_y } else { sub_y + 14.0 };
+                            let badge_y = if srv.subtitle.is_empty() {
+                                sub_y
+                            } else {
+                                sub_y + 14.0
+                            };
                             painter.text(
                                 egui::pos2(icon_cx, badge_y),
                                 egui::Align2::CENTER_CENTER,
@@ -2493,10 +2427,7 @@ impl StreamApp {
                         let btn_w = CARD_W - 24.0;
                         let btn_h = 28.0;
                         let btn_rect = egui::Rect::from_min_size(
-                            egui::pos2(
-                                card_rect.left() + 12.0,
-                                card_rect.bottom() - 12.0 - btn_h,
-                            ),
+                            egui::pos2(card_rect.left() + 12.0, card_rect.bottom() - 12.0 - btn_h),
                             egui::vec2(btn_w, btn_h),
                         );
                         let btn_resp = ui.interact(
@@ -2526,10 +2457,15 @@ impl StreamApp {
                         if btn_resp.clicked() {
                             connect_addr = Some(srv.address.clone());
                             let mut changed = false;
-                            if let Some(entry) = self.server_list.iter_mut().find(|e| e.address == srv.address) {
+                            if let Some(entry) = self
+                                .server_list
+                                .iter_mut()
+                                .find(|e| e.address == srv.address)
+                            {
                                 // Copy hostname as nickname for LAN-discovered entries.
                                 if srv.saved_idx.is_none() {
-                                    if entry.nickname.is_empty() && srv.display_name != srv.address {
+                                    if entry.nickname.is_empty() && srv.display_name != srv.address
+                                    {
                                         entry.nickname = srv.display_name.clone();
                                         changed = true;
                                     }
@@ -2601,11 +2537,7 @@ impl StreamApp {
         const TEXT_GRAY: egui::Color32 = egui::Color32::from_rgb(138, 142, 150);
         const BG_ROW: egui::Color32 = egui::Color32::from_rgb(34, 38, 48);
 
-        ui.label(
-            egui::RichText::new("Settings")
-                .size(32.0)
-                .color(TEXT_WHITE),
-        );
+        ui.label(egui::RichText::new("Settings").size(32.0).color(TEXT_WHITE));
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new("Session defaults for the next connection.")
@@ -2615,20 +2547,34 @@ impl StreamApp {
         ui.add_space(24.0);
 
         // Audio toggle
-        let audio_clicked = render_parsec_toggle(ui, "Audio", "Start stereo playback on connect.", self.audio_enabled, BG_ROW);
+        let audio_clicked = render_parsec_toggle(
+            ui,
+            "Audio",
+            "Start stereo playback on connect.",
+            self.audio_enabled,
+            BG_ROW,
+        );
         if audio_clicked {
             self.audio_enabled = !self.audio_enabled;
             save_audio_enabled(self.audio_enabled);
-            self.audio_enabled_flag.store(self.audio_enabled, Ordering::SeqCst);
+            self.audio_enabled_flag
+                .store(self.audio_enabled, Ordering::SeqCst);
         }
         ui.add_space(8.0);
 
         // Debug overlay toggle
-        let debug_clicked = render_parsec_toggle(ui, "Debug Overlay", "Show transport, decoder, and latency telemetry.", self.debug_enabled, BG_ROW);
+        let debug_clicked = render_parsec_toggle(
+            ui,
+            "Debug Overlay",
+            "Show transport, decoder, and latency telemetry.",
+            self.debug_enabled,
+            BG_ROW,
+        );
         if debug_clicked {
             self.debug_enabled = !self.debug_enabled;
             save_debug_enabled(self.debug_enabled);
-            self.debug_enabled_flag.store(self.debug_enabled, Ordering::SeqCst);
+            self.debug_enabled_flag
+                .store(self.debug_enabled, Ordering::SeqCst);
         }
         ui.add_space(8.0);
 
@@ -2657,9 +2603,11 @@ impl StreamApp {
         );
         ui.add_space(4.0);
         ui.label(
-            egui::RichText::new("Token to authenticate with servers. Must match the server's token.")
-                .size(12.0)
-                .color(TEXT_GRAY),
+            egui::RichText::new(
+                "Token to authenticate with servers. Must match the server's token.",
+            )
+            .size(12.0)
+            .color(TEXT_GRAY),
         );
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -2681,11 +2629,7 @@ impl StreamApp {
         const TEXT_WHITE: egui::Color32 = egui::Color32::from_rgb(230, 233, 240);
         const TEXT_GRAY: egui::Color32 = egui::Color32::from_rgb(138, 142, 150);
 
-        ui.label(
-            egui::RichText::new("Update")
-                .size(32.0)
-                .color(TEXT_WHITE),
-        );
+        ui.label(egui::RichText::new("Update").size(32.0).color(TEXT_WHITE));
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new("Check for new client releases and update in place.")
@@ -2701,11 +2645,7 @@ impl StreamApp {
         const TEXT_GRAY: egui::Color32 = egui::Color32::from_rgb(138, 142, 150);
         const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(90, 95, 108);
 
-        ui.label(
-            egui::RichText::new("About")
-                .size(32.0)
-                .color(TEXT_WHITE),
-        );
+        ui.label(egui::RichText::new("About").size(32.0).color(TEXT_WHITE));
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new("Client capabilities and platform information.")
@@ -2725,7 +2665,10 @@ impl StreamApp {
         let rows: &[(&str, String)] = &[
             ("Version", format!("v{}", updater::current_version())),
             ("Platform", about_platform_label().to_string()),
-            ("Display", about_format_refresh(self.display_refresh_millihz)),
+            (
+                "Display",
+                about_format_refresh(self.display_refresh_millihz),
+            ),
             ("Present", about_native_surface(caps).to_string()),
             ("Codecs", about_codec_summary(codec_support)),
             ("YUV 4:4:4", yuv444_pref.to_string()),
@@ -2734,11 +2677,7 @@ impl StreamApp {
 
         for (label, value) in rows {
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(*label)
-                        .size(13.0)
-                        .color(TEXT_DIM),
-                );
+                ui.label(egui::RichText::new(*label).size(13.0).color(TEXT_DIM));
                 ui.add_space(12.0);
                 ui.label(
                     egui::RichText::new(value.as_str())
@@ -2829,11 +2768,9 @@ impl StreamApp {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(
-                        egui::RichText::new(format!(
-                            "Downloading and installing v{version}..."
-                        ))
-                        .size(12.0)
-                        .color(egui::Color32::from_rgb(180, 191, 203)),
+                        egui::RichText::new(format!("Downloading and installing v{version}..."))
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(180, 191, 203)),
                     );
                 });
             }
@@ -2935,9 +2872,10 @@ impl StreamApp {
             self.menu_button_drag_origin = Some(self.menu_button_pos);
         }
         if button_response.dragged() {
-            if let (Some(origin), Some(delta)) =
-                (self.menu_button_drag_origin, button_response.total_drag_delta())
-            {
+            if let (Some(origin), Some(delta)) = (
+                self.menu_button_drag_origin,
+                button_response.total_drag_delta(),
+            ) {
                 self.menu_button_pos = clamp_menu_button_pos(origin + delta, content_rect);
                 self.last_pointer_move = Some(Instant::now());
             }
@@ -2946,8 +2884,10 @@ impl StreamApp {
             self.menu_button_drag_origin = None;
             save_menu_button_pos(self.menu_button_pos);
         }
-        let button_rect =
-            egui::Rect::from_min_size(self.menu_button_pos, egui::vec2(FLOATING_MENU_BUTTON_SIZE, FLOATING_MENU_BUTTON_SIZE));
+        let button_rect = egui::Rect::from_min_size(
+            self.menu_button_pos,
+            egui::vec2(FLOATING_MENU_BUTTON_SIZE, FLOATING_MENU_BUTTON_SIZE),
+        );
         self.local_overlay_hit_rects.push(button_rect);
         if button_response.clicked() {
             self.menu_open = !self.menu_open;
@@ -2959,10 +2899,10 @@ impl StreamApp {
             let mut request_disconnect = false;
             let mut audio_toggled = false;
             let mut debug_toggled = false;
-            let menu_left =
-                button_rect
-                    .left()
-                    .clamp(content_rect.left(), (content_rect.right() - 190.0).max(content_rect.left()));
+            let menu_left = button_rect.left().clamp(
+                content_rect.left(),
+                (content_rect.right() - 190.0).max(content_rect.left()),
+            );
             let menu = egui::Area::new(egui::Id::new("floating_menu_popup"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(egui::pos2(menu_left, button_rect.bottom() + 8.0))
@@ -3086,14 +3026,14 @@ impl StreamApp {
                     };
 
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(label)
-                                .color(text_color)
-                                .size(12.0),
-                        );
+                        ui.label(egui::RichText::new(label).color(text_color).size(12.0));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
-                                .button(egui::RichText::new("Transfer").color(accent_color).size(12.0))
+                                .button(
+                                    egui::RichText::new("Transfer")
+                                        .color(accent_color)
+                                        .size(12.0),
+                                )
                                 .clicked()
                             {
                                 let mut guard = self.file_transfer_state.lock().unwrap();
@@ -3145,7 +3085,10 @@ impl StreamApp {
                             .size(12.0),
                     );
 
-                    if matches!(entry.status, TransferStatus::Active | TransferStatus::Verifying) {
+                    if matches!(
+                        entry.status,
+                        TransferStatus::Active | TransferStatus::Verifying
+                    ) {
                         let progress = if entry.total_bytes > 0 {
                             entry.transferred_bytes as f32 / entry.total_bytes as f32
                         } else {
@@ -3228,7 +3171,13 @@ fn start_media_threads(
     let receiver = MediaReceiver::from_udp_socket(udp_socket, crypto)?;
     let (input_stop_tx, input_stop_rx) = crossbeam_channel::bounded::<()>(1);
     let input_thread = std::thread::spawn(move || {
-        run_input_sender(input_socket, input_target, input_rx, input_stop_rx, input_crypto);
+        run_input_sender(
+            input_socket,
+            input_target,
+            input_rx,
+            input_stop_rx,
+            input_crypto,
+        );
     });
 
     let (audio_data_tx, audio_data_rx) = crossbeam_channel::unbounded::<AudioPacket>();
@@ -3381,12 +3330,7 @@ fn advertised_video_codec_support(
     // low-latency native presentation path for them. Keep advertising decode
     // support when the user enables it, but suppress the hardware YUV444 flag
     // so Linux servers do not auto-prefer 4:4:4 for low-latency sessions.
-    filter_advertised_video_codec_support(
-        report,
-        yuv444_enabled,
-        true,
-        !cfg!(target_os = "macos"),
-    )
+    filter_advertised_video_codec_support(report, yuv444_enabled, true, !cfg!(target_os = "macos"))
 }
 
 fn run_connection(
@@ -3525,8 +3469,7 @@ fn run_connection(
                 Ok(n) => {
                     pending.extend_from_slice(&auth_buf[..n]);
                     let mut consumed = 0;
-                    while let Some((msg, used)) =
-                        ControlMessage::deserialize(&pending[consumed..])
+                    while let Some((msg, used)) = ControlMessage::deserialize(&pending[consumed..])
                     {
                         consumed += used;
                         match msg {
@@ -3909,8 +3852,7 @@ fn run_connection(
     let decode_started_rx = media_threads.decode_started_rx.clone();
     let (clipboard_control_tx, clipboard_control_rx) =
         crossbeam_channel::bounded::<ControlMessage>(8);
-    let (file_detect_tx, file_detect_rx) =
-        crossbeam_channel::bounded::<std::path::PathBuf>(8);
+    let (file_detect_tx, file_detect_rx) = crossbeam_channel::bounded::<std::path::PathBuf>(8);
     let suppressed_paths = clipboard::new_suppressed_paths();
     let mut clipboard_sync = clipboard::ClipboardSync::start_with_file_detection(
         "client",
@@ -3987,9 +3929,9 @@ fn run_connection(
             let _ = tcp.write_all(&msg.serialize());
         }
         while let Ok(path) = file_detect_rx.try_recv() {
-            let _ = ft_manager.inbound_tx.try_send(
-                file_transfer::FtInbound::SendFile { path },
-            );
+            let _ = ft_manager
+                .inbound_tx
+                .try_send(file_transfer::FtInbound::SendFile { path });
         }
         while let Ok(msg) = ft_manager.outbound_rx.try_recv() {
             let _ = tcp.write_all(&msg.serialize());
@@ -4089,34 +4031,70 @@ fn run_connection(
                         ControlMessage::ClipboardText(text) => {
                             clipboard_sync.set_remote_text(text);
                         }
-                        ControlMessage::FileOffer { transfer_id, file_size, file_name } => {
+                        ControlMessage::FileOffer {
+                            transfer_id,
+                            file_size,
+                            file_name,
+                        } => {
                             let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::OfferReceived { transfer_id, file_size, file_name },
+                                file_transfer::FtInbound::OfferReceived {
+                                    transfer_id,
+                                    file_size,
+                                    file_name,
+                                },
                             );
                         }
-                        ControlMessage::FileAccept { transfer_id, accepted } => {
+                        ControlMessage::FileAccept {
+                            transfer_id,
+                            accepted,
+                        } => {
                             let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::AcceptReceived { transfer_id, accepted },
+                                file_transfer::FtInbound::AcceptReceived {
+                                    transfer_id,
+                                    accepted,
+                                },
                             );
                         }
-                        ControlMessage::FileChunk { transfer_id, chunk_index, data } => {
+                        ControlMessage::FileChunk {
+                            transfer_id,
+                            chunk_index,
+                            data,
+                        } => {
                             let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::ChunkReceived { transfer_id, chunk_index, data },
+                                file_transfer::FtInbound::ChunkReceived {
+                                    transfer_id,
+                                    chunk_index,
+                                    data,
+                                },
                             );
                         }
-                        ControlMessage::FileComplete { transfer_id, total_chunks, sha256 } => {
+                        ControlMessage::FileComplete {
+                            transfer_id,
+                            total_chunks,
+                            sha256,
+                        } => {
                             let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::CompleteReceived { transfer_id, total_chunks, sha256 },
+                                file_transfer::FtInbound::CompleteReceived {
+                                    transfer_id,
+                                    total_chunks,
+                                    sha256,
+                                },
                             );
                         }
                         ControlMessage::FileCancel { transfer_id } => {
-                            let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::CancelReceived { transfer_id },
-                            );
+                            let _ = ft_manager
+                                .inbound_tx
+                                .try_send(file_transfer::FtInbound::CancelReceived { transfer_id });
                         }
-                        ControlMessage::FileProgress { transfer_id, chunks_received } => {
+                        ControlMessage::FileProgress {
+                            transfer_id,
+                            chunks_received,
+                        } => {
                             let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::ProgressReceived { transfer_id, chunks_received },
+                                file_transfer::FtInbound::ProgressReceived {
+                                    transfer_id,
+                                    chunks_received,
+                                },
                             );
                         }
                         ControlMessage::Error(err) => {
@@ -4233,7 +4211,10 @@ fn run_punched_session(
     }
     ctx.request_repaint();
 
-    eprintln!("[punch] Attempting hole punch to {} candidates...", partner_candidates.len());
+    eprintln!(
+        "[punch] Attempting hole punch to {} candidates...",
+        partner_candidates.len()
+    );
     let peer = match st_protocol::tunnel::hole_punch(
         &socket,
         &partner_candidates,
@@ -4242,8 +4223,14 @@ fn run_punched_session(
     ) {
         Ok(p) => p,
         Err(e) => {
-            set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch,
-                format!("Hole punch failed: {e}"));
+            set_error(
+                &state,
+                &ctx,
+                &disconnect,
+                &connection_epoch,
+                session_epoch,
+                format!("Hole punch failed: {e}"),
+            );
             return;
         }
     };
@@ -4255,8 +4242,14 @@ fn run_punched_session(
     // --- Authentication ---
     let auth_data = ControlMessage::Authenticate(token).serialize();
     if let Err(e) = punched.send_control(&auth_data) {
-        set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch,
-            format!("Failed to send auth: {e}"));
+        set_error(
+            &state,
+            &ctx,
+            &disconnect,
+            &connection_epoch,
+            session_epoch,
+            format!("Failed to send auth: {e}"),
+        );
         return;
     }
 
@@ -4269,8 +4262,14 @@ fn run_punched_session(
                 if ok {
                     authenticated = true;
                 } else {
-                    set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch,
-                        "Authentication failed. Check your token.".into());
+                    set_error(
+                        &state,
+                        &ctx,
+                        &disconnect,
+                        &connection_epoch,
+                        session_epoch,
+                        "Authentication failed. Check your token.".into(),
+                    );
                     return;
                 }
                 break;
@@ -4278,8 +4277,14 @@ fn run_punched_session(
         }
     }
     if !authenticated {
-        set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch,
-            "Authentication timeout over punched connection".into());
+        set_error(
+            &state,
+            &ctx,
+            &disconnect,
+            &connection_epoch,
+            session_epoch,
+            "Authentication timeout over punched connection".into(),
+        );
         return;
     }
     eprintln!("[punch] Authenticated");
@@ -4343,8 +4348,14 @@ fn run_punched_session(
     let stream_config = match stream_config {
         Some(cfg) => cfg,
         None => {
-            set_error(&state, &ctx, &disconnect, &connection_epoch, session_epoch,
-                "Timeout waiting for StreamConfig from server".into());
+            set_error(
+                &state,
+                &ctx,
+                &disconnect,
+                &connection_epoch,
+                session_epoch,
+                "Timeout waiting for StreamConfig from server".into(),
+            );
             return;
         }
     };
@@ -4376,7 +4387,8 @@ fn run_punched_session(
     ctx.request_repaint();
 
     // --- Start media threads using direct bridged packets ---
-    let (pipeline_control_tx, pipeline_control_rx) = crossbeam_channel::bounded::<ControlMessage>(8);
+    let (pipeline_control_tx, pipeline_control_rx) =
+        crossbeam_channel::bounded::<ControlMessage>(8);
     let media = start_punched_media_threads(
         Arc::clone(&frame_buf),
         Arc::clone(&debug_state),
@@ -4406,8 +4418,7 @@ fn run_punched_session(
     let mut keyboard_heartbeat = KeyboardInputHeartbeat::default();
     let (clipboard_control_tx, clipboard_control_rx) =
         crossbeam_channel::bounded::<ControlMessage>(8);
-    let (file_detect_tx, file_detect_rx) =
-        crossbeam_channel::bounded::<std::path::PathBuf>(8);
+    let (file_detect_tx, file_detect_rx) = crossbeam_channel::bounded::<std::path::PathBuf>(8);
     let suppressed_paths = clipboard::new_suppressed_paths();
     let mut clipboard_sync = clipboard::ClipboardSync::start_with_file_detection(
         "client-punched",
@@ -4426,7 +4437,11 @@ fn run_punched_session(
         suppressed_paths,
     );
     loop {
-        if session_cancelled(disconnect.as_ref(), connection_epoch.as_ref(), session_epoch) {
+        if session_cancelled(
+            disconnect.as_ref(),
+            connection_epoch.as_ref(),
+            session_epoch,
+        ) {
             break;
         }
 
@@ -4479,9 +4494,9 @@ fn run_punched_session(
         }
         while let Ok(path) = file_detect_rx.try_recv() {
             did_work = true;
-            let _ = ft_manager.inbound_tx.try_send(
-                file_transfer::FtInbound::SendFile { path },
-            );
+            let _ = ft_manager
+                .inbound_tx
+                .try_send(file_transfer::FtInbound::SendFile { path });
         }
         while let Ok(ctrl) = ft_manager.outbound_rx.try_recv() {
             did_work = true;
@@ -4561,24 +4576,54 @@ fn run_punched_session(
                                 ControlMessage::ClipboardText(text) => {
                                     clipboard_sync.set_remote_text(text);
                                 }
-                                ControlMessage::FileOffer { transfer_id, file_size, file_name } => {
+                                ControlMessage::FileOffer {
+                                    transfer_id,
+                                    file_size,
+                                    file_name,
+                                } => {
                                     let _ = ft_manager.inbound_tx.try_send(
-                                        file_transfer::FtInbound::OfferReceived { transfer_id, file_size, file_name },
+                                        file_transfer::FtInbound::OfferReceived {
+                                            transfer_id,
+                                            file_size,
+                                            file_name,
+                                        },
                                     );
                                 }
-                                ControlMessage::FileAccept { transfer_id, accepted } => {
+                                ControlMessage::FileAccept {
+                                    transfer_id,
+                                    accepted,
+                                } => {
                                     let _ = ft_manager.inbound_tx.try_send(
-                                        file_transfer::FtInbound::AcceptReceived { transfer_id, accepted },
+                                        file_transfer::FtInbound::AcceptReceived {
+                                            transfer_id,
+                                            accepted,
+                                        },
                                     );
                                 }
-                                ControlMessage::FileChunk { transfer_id, chunk_index, data } => {
+                                ControlMessage::FileChunk {
+                                    transfer_id,
+                                    chunk_index,
+                                    data,
+                                } => {
                                     let _ = ft_manager.inbound_tx.try_send(
-                                        file_transfer::FtInbound::ChunkReceived { transfer_id, chunk_index, data },
+                                        file_transfer::FtInbound::ChunkReceived {
+                                            transfer_id,
+                                            chunk_index,
+                                            data,
+                                        },
                                     );
                                 }
-                                ControlMessage::FileComplete { transfer_id, total_chunks, sha256 } => {
+                                ControlMessage::FileComplete {
+                                    transfer_id,
+                                    total_chunks,
+                                    sha256,
+                                } => {
                                     let _ = ft_manager.inbound_tx.try_send(
-                                        file_transfer::FtInbound::CompleteReceived { transfer_id, total_chunks, sha256 },
+                                        file_transfer::FtInbound::CompleteReceived {
+                                            transfer_id,
+                                            total_chunks,
+                                            sha256,
+                                        },
                                     );
                                 }
                                 ControlMessage::FileCancel { transfer_id } => {
@@ -4586,9 +4631,15 @@ fn run_punched_session(
                                         file_transfer::FtInbound::CancelReceived { transfer_id },
                                     );
                                 }
-                                ControlMessage::FileProgress { transfer_id, chunks_received } => {
+                                ControlMessage::FileProgress {
+                                    transfer_id,
+                                    chunks_received,
+                                } => {
                                     let _ = ft_manager.inbound_tx.try_send(
-                                        file_transfer::FtInbound::ProgressReceived { transfer_id, chunks_received },
+                                        file_transfer::FtInbound::ProgressReceived {
+                                            transfer_id,
+                                            chunks_received,
+                                        },
                                     );
                                 }
                                 ControlMessage::Error(err) => {
@@ -4660,7 +4711,10 @@ fn run_punched_session(
 
     {
         let mut s = state.lock().unwrap();
-        if !matches!(*s, ConnectionState::Error(_) | ConnectionState::Disconnected) {
+        if !matches!(
+            *s,
+            ConnectionState::Error(_) | ConnectionState::Disconnected
+        ) {
             *s = ConnectionState::Disconnected;
         }
     }
@@ -5134,7 +5188,10 @@ fn clamp_pos_to_video_rect(pos: egui::Pos2, rect: egui::Rect, pixels_per_point: 
     let inset = 0.5 / pixels_per_point.max(1.0);
     let max_x = (rect.right() - inset).max(rect.left());
     let max_y = (rect.bottom() - inset).max(rect.top());
-    egui::pos2(pos.x.clamp(rect.left(), max_x), pos.y.clamp(rect.top(), max_y))
+    egui::pos2(
+        pos.x.clamp(rect.left(), max_x),
+        pos.y.clamp(rect.top(), max_y),
+    )
 }
 
 fn pointer_escape_position(
@@ -5194,6 +5251,13 @@ fn remap_pos_between_video_rects(
         new_rect.left() + normalized_x * new_rect.width().max(1.0),
         new_rect.top() + normalized_y * new_rect.height().max(1.0),
     )
+}
+
+fn relative_capture_entry_anchor(
+    remote_pos: Option<egui::Pos2>,
+    local_pos: Option<egui::Pos2>,
+) -> Option<egui::Pos2> {
+    remote_pos.or(local_pos)
 }
 
 fn pointer_button_mask(button: egui::PointerButton) -> u8 {
@@ -5269,9 +5333,7 @@ fn wheel_unit_scale(unit: egui::MouseWheelUnit) -> f32 {
 }
 
 fn take_wheel_units(accum: &mut f32) -> i16 {
-    let whole = accum
-        .trunc()
-        .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+    let whole = accum.trunc().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
     *accum -= whole as f32;
     whole
 }
@@ -5425,7 +5487,8 @@ fn paint_monitor_icon(painter: &egui::Painter, center_top: egui::Pos2, connected
             let mut points = Vec::with_capacity(segments + 1);
             for s in 0..=segments {
                 let t = s as f32 / segments as f32;
-                let angle = start_angle + t * (end_angle - start_angle) - std::f32::consts::FRAC_PI_2;
+                let angle =
+                    start_angle + t * (end_angle - start_angle) - std::f32::consts::FRAC_PI_2;
                 points.push(egui::pos2(
                     wave_cx + r * angle.cos(),
                     wave_top + 8.0 + r * angle.sin(),
@@ -5799,10 +5862,11 @@ impl eframe::App for StreamApp {
                 }
                 None
             } else {
-                match self
-                    .video_texture
-                    .upload(frame, &self.upload_frame, self.native_surfaces.as_ref())
-                {
+                match self.video_texture.upload(
+                    frame,
+                    &self.upload_frame,
+                    self.native_surfaces.as_ref(),
+                ) {
                     Ok(()) => {
                         if self.debug_enabled {
                             self.debug_state
@@ -5821,14 +5885,15 @@ impl eframe::App for StreamApp {
             ctx.request_repaint();
         }
 
-        let debug_top = if state == ConnectionState::Connected && !self.video_texture.occludes_egui_overlay() {
-            let menu_bottom = self.render_floating_menu(ctx);
-            self.render_file_transfer_overlay(ctx, menu_bottom);
-            menu_bottom
-        } else {
-            self.local_overlay_hit_rects.clear();
-            0.0
-        };
+        let debug_top =
+            if state == ConnectionState::Connected && !self.video_texture.occludes_egui_overlay() {
+                let menu_bottom = self.render_floating_menu(ctx);
+                self.render_file_transfer_overlay(ctx, menu_bottom);
+                menu_bottom
+            } else {
+                self.local_overlay_hit_rects.clear();
+                0.0
+            };
 
         let central_panel = if state == ConnectionState::Connected {
             #[cfg(target_os = "macos")]
@@ -5887,7 +5952,9 @@ impl eframe::App for StreamApp {
                 self.paint_connected_background(ui);
                 if self.video_texture.has_frame() {
                     let available = ui.available_size();
-                    let tex_size = self.video_space_size().unwrap_or_else(|| self.video_texture.size_vec2());
+                    let tex_size = self
+                        .video_space_size()
+                        .unwrap_or_else(|| self.video_texture.size_vec2());
                     let scale = (available.x / tex_size.x).min(available.y / tex_size.y);
                     let sized = egui::Vec2::new(tex_size.x * scale, tex_size.y * scale);
                     ui.centered_and_justified(|ui| {
@@ -6049,9 +6116,8 @@ impl eframe::App for StreamApp {
             .and_then(|rect| self.video_rect_for_container(rect))
             .or_else(|| self.current_video_rect(ctx))
             .or(self.last_video_rect);
-        let virtual_hover =
-            self.capture_mode == LocalCaptureMode::HoverAbsolute
-                && self.uses_virtual_hover_cursor(&snapshot);
+        let virtual_hover = self.capture_mode == LocalCaptureMode::HoverAbsolute
+            && self.uses_virtual_hover_cursor(&snapshot);
         let mut last_pointer_pos = raw_input
             .events
             .iter()
@@ -6060,7 +6126,11 @@ impl eframe::App for StreamApp {
                 egui::Event::PointerMoved(pos) => Some(*pos),
                 _ => None,
             })
-            .or(if virtual_hover { self.hover_cursor_pos } else { None });
+            .or(if virtual_hover {
+                self.hover_cursor_pos
+            } else {
+                None
+            });
         let mut keyboard_dirty = false;
 
         if keyboard_forward_active {
@@ -6103,25 +6173,21 @@ impl eframe::App for StreamApp {
                     {
                         if let Some(rect) = video_rect {
                             if rect.contains(pos) && !self.pointer_over_local_overlay(pos) {
-                                let local_pos = clamp_pos_to_video_rect(
-                                    pos,
-                                    rect,
-                                    ctx.pixels_per_point(),
-                                );
-                                if let Some(remote_pos) =
-                                    self.mapped_server_cursor_video_pos(&snapshot, rect)
-                                {
-                                    self.send_relative_cursor_sync(
-                                        client_id,
-                                        remote_pos,
-                                        local_pos,
-                                        rect,
-                                    );
-                                }
+                                let local_pos =
+                                    clamp_pos_to_video_rect(pos, rect, ctx.pixels_per_point());
+                                // Relative-only input cannot teleport to the local pointer.
+                                // Keep the remote cursor position authoritative on entry.
+                                let anchor_pos =
+                                    self.mapped_server_cursor_video_pos(&snapshot, rect);
                                 self.capture_mode = LocalCaptureMode::CapturedRelative;
                                 self.resume_hover_after_relative_drag = false;
                                 self.hover_cursor_resync_pending = false;
-                                self.hover_cursor_pos = Some(local_pos);
+                                self.hover_cursor_pos = Some(clamp_pos_to_video_rect(
+                                    relative_capture_entry_anchor(anchor_pos, Some(local_pos))
+                                        .unwrap_or(local_pos),
+                                    rect,
+                                    ctx.pixels_per_point(),
+                                ));
                                 self.suppress_mouse_delta = true;
                                 ctx.request_repaint();
                             }
@@ -6132,11 +6198,8 @@ impl eframe::App for StreamApp {
                         && self.suppress_pointer_pos_frames == 0
                     {
                         if let Some(rect) = video_rect {
-                            self.hover_cursor_pos = Some(clamp_pos_to_video_rect(
-                                pos,
-                                rect,
-                                ctx.pixels_per_point(),
-                            ));
+                            self.hover_cursor_pos =
+                                Some(clamp_pos_to_video_rect(pos, rect, ctx.pixels_per_point()));
                         } else {
                             self.hover_cursor_pos = Some(pos);
                         }
@@ -6259,9 +6322,10 @@ impl eframe::App for StreamApp {
                                 last_pointer_pos = Some(next_pos);
                             } else if self.resume_hover_after_relative_drag {
                                 if let Some(rect) = video_rect {
-                                    let Some(base_pos) = self
-                                        .hover_cursor_pos
-                                        .or(last_pointer_pos) else { continue };
+                                    let Some(base_pos) = self.hover_cursor_pos.or(last_pointer_pos)
+                                    else {
+                                        continue;
+                                    };
                                     let next_pos = clamp_pos_to_video_rect(
                                         egui::pos2(base_pos.x + delta.x, base_pos.y + delta.y),
                                         rect,
@@ -6273,16 +6337,18 @@ impl eframe::App for StreamApp {
                             }
                             ctx.request_repaint();
                         }
-                    } else if virtual_hover && controller_state_allows_input(snapshot.controller_state) {
+                    } else if virtual_hover
+                        && controller_state_allows_input(snapshot.controller_state)
+                    {
                         if let Some(rect) = video_rect {
-                            let hover_drag_active = self.capture_mode == LocalCaptureMode::HoverAbsolute
+                            let hover_drag_active = self.capture_mode
+                                == LocalCaptureMode::HoverAbsolute
                                 && self.pointer_buttons != 0;
                             let base_pos = self
                                 .hover_cursor_pos
                                 .or(last_pointer_pos)
                                 .unwrap_or_else(|| rect.center());
-                            let unclamped =
-                                egui::pos2(base_pos.x + delta.x, base_pos.y + delta.y);
+                            let unclamped = egui::pos2(base_pos.x + delta.x, base_pos.y + delta.y);
                             if self.pointer_over_local_overlay(unclamped) {
                                 if hover_drag_active {
                                     let next_pos = clamp_pos_to_video_rect(
@@ -6298,7 +6364,9 @@ impl eframe::App for StreamApp {
                                 }
                                 self.auto_release_capture(false);
                                 last_pointer_pos = Some(unclamped);
-                                ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(unclamped));
+                                ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(
+                                    unclamped,
+                                ));
                                 ctx.request_repaint();
                                 continue;
                             }
@@ -6319,18 +6387,21 @@ impl eframe::App for StreamApp {
                                     ctx.request_repaint();
                                     continue;
                                 }
-                                let escape_pos = pointer_escape_position(rect, unclamped, ctx.pixels_per_point());
+                                let escape_pos = pointer_escape_position(
+                                    rect,
+                                    unclamped,
+                                    ctx.pixels_per_point(),
+                                );
                                 self.auto_release_capture(true);
                                 last_pointer_pos = Some(escape_pos);
-                                ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(escape_pos));
+                                ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(
+                                    escape_pos,
+                                ));
                                 ctx.request_repaint();
                                 continue;
                             }
-                            let next_pos = clamp_pos_to_video_rect(
-                                unclamped,
-                                rect,
-                                ctx.pixels_per_point(),
-                            );
+                            let next_pos =
+                                clamp_pos_to_video_rect(unclamped, rect, ctx.pixels_per_point());
                             self.hover_cursor_pos = Some(next_pos);
                             last_pointer_pos = Some(next_pos);
                             self.send_absolute_cursor_if_needed(client_id, next_pos, rect);
@@ -6397,13 +6468,14 @@ impl eframe::App for StreamApp {
                         over_video,
                         over_local_overlay,
                     );
-                    let restore_hover_after_drag = should_return_to_hover_after_relative_button_drag(
-                        self.capture_mode,
-                        self.resume_hover_after_relative_drag,
-                        button,
-                        pressed,
-                        self.pointer_buttons,
-                    );
+                    let restore_hover_after_drag =
+                        should_return_to_hover_after_relative_button_drag(
+                            self.capture_mode,
+                            self.resume_hover_after_relative_drag,
+                            button,
+                            pressed,
+                            self.pointer_buttons,
+                        );
                     let mut sent_button_state = false;
                     if enter_relative_drag {
                         if let (Some(route_pos), Some(rect)) = (route_pos, video_rect) {
@@ -6429,8 +6501,7 @@ impl eframe::App for StreamApp {
                     {
                         if self.capture_mode == LocalCaptureMode::HoverAbsolute {
                             if let (Some(route_pos), Some(rect)) = (route_pos, video_rect) {
-                                let _ =
-                                    self.send_absolute_cursor(client_id, route_pos, rect, true);
+                                let _ = self.send_absolute_cursor(client_id, route_pos, rect, true);
                             } else {
                                 self.send_input_packet(InputPacket::MouseButtons(
                                     MouseButtonsInput {
@@ -6453,7 +6524,8 @@ impl eframe::App for StreamApp {
                             self.hover_cursor_pos = route_pos.filter(|pos| {
                                 video_rect
                                     .map(|rect| {
-                                        rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
+                                        rect.contains(*pos)
+                                            && !self.pointer_over_local_overlay(*pos)
                                     })
                                     .unwrap_or(false)
                             });
@@ -6720,6 +6792,27 @@ mod tests {
             false,
             MOUSE_BUTTON_SECONDARY,
         ));
+    }
+
+    #[test]
+    fn relative_capture_entry_prefers_remote_cursor_position() {
+        let remote = egui::pos2(100.0, 200.0);
+        let local = egui::pos2(800.0, 600.0);
+
+        assert_eq!(
+            relative_capture_entry_anchor(Some(remote), Some(local)),
+            Some(remote)
+        );
+    }
+
+    #[test]
+    fn relative_capture_entry_falls_back_without_remote_cursor_position() {
+        let local = egui::pos2(800.0, 600.0);
+
+        assert_eq!(
+            relative_capture_entry_anchor(None, Some(local)),
+            Some(local)
+        );
     }
 }
 

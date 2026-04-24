@@ -159,7 +159,8 @@ impl ApiDiscoveryShared {
 
         let mut socket_guard = self.punch_socket.lock().unwrap();
         if socket_guard.is_none() {
-            let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind punch socket: {e}"))?;
+            let socket =
+                UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind punch socket: {e}"))?;
             *socket_guard = Some(socket);
         }
 
@@ -458,8 +459,8 @@ pub fn prepare_punch_attempt(
     let cand_text = cand_resp
         .into_string()
         .map_err(|e| format!("read candidates response: {e}"))?;
-    let cand_json: serde_json::Value = serde_json::from_str(&cand_text)
-        .map_err(|e| format!("parse candidates response: {e}"))?;
+    let cand_json: serde_json::Value =
+        serde_json::from_str(&cand_text).map_err(|e| format!("parse candidates response: {e}"))?;
     let partner_candidates: Vec<SocketAddr> = cand_json["partner_candidates"]
         .as_array()
         .map(|arr| {

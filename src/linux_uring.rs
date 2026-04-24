@@ -187,8 +187,7 @@ impl UringRecv {
             slot.iov.iov_base = slot.buf.as_mut_ptr() as *mut libc::c_void;
             slot.iov.iov_len = MAX_UDP_DATAGRAM_SIZE;
             slot.hdr.msg_name = slot.addr.as_mut() as *mut _ as *mut libc::c_void;
-            slot.hdr.msg_namelen =
-                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            slot.hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
             slot.hdr.msg_iov = slot.iov.as_mut() as *mut libc::iovec;
             slot.hdr.msg_iovlen = 1;
             // Always provision a cmsg buffer. The socket may have `UDP_GRO`
@@ -207,12 +206,10 @@ impl UringRecv {
             slot.hdr.msg_controllen = CMSG_BUF_LEN as _;
             slot.hdr.msg_flags = 0;
 
-            let sqe = opcode::RecvMsg::new(
-                types::Fd(self.fd),
-                slot.hdr.as_mut() as *mut libc::msghdr,
-            )
-            .build()
-            .user_data(idx as u64);
+            let sqe =
+                opcode::RecvMsg::new(types::Fd(self.fd), slot.hdr.as_mut() as *mut libc::msghdr)
+                    .build()
+                    .user_data(idx as u64);
 
             if unsafe { sq.push(&sqe).is_err() } {
                 break;
@@ -343,7 +340,6 @@ impl UringRecv {
             },
         ))
     }
-
 }
 
 /// Walk the cmsg list on `hdr` looking for `IPPROTO_UDP` / `UDP_GRO`. Returns
@@ -737,8 +733,7 @@ mod tests {
         for (i, v) in got.iter().enumerate() {
             let v = v.as_ref().expect("every packet must be received");
             assert_eq!(
-                v,
-                &packets[i],
+                v, &packets[i],
                 "packet {i} arrived with corrupted bytes — uring recv is trampling buffers",
             );
         }
@@ -762,8 +757,7 @@ mod tests {
             (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
             let data = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
             *data = 1400;
-            hdr.msg_controllen =
-                libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) as _;
+            hdr.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) as _;
         }
         assert_eq!(extract_udp_gro_segment_size(&hdr), 1400);
 
@@ -826,4 +820,3 @@ fn sockaddr_to_socket_addr(sa: &libc::sockaddr_storage) -> Option<SocketAddr> {
         }
     }
 }
-

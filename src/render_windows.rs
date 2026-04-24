@@ -925,20 +925,11 @@ struct ID3D11VideoContextVtbl {
     decoder_end_frame: usize,
     submit_decoder_buffers: usize,
     decoder_extension: usize,
-    video_processor_set_output_target_rect: unsafe extern "system" fn(
-        *mut ID3D11VideoContext,
-        *mut c_void,
-        BOOL,
-        *const WinRect,
-    ),
+    video_processor_set_output_target_rect:
+        unsafe extern "system" fn(*mut ID3D11VideoContext, *mut c_void, BOOL, *const WinRect),
     _vp_prefix_1: [usize; 16],
-    video_processor_set_stream_source_rect: unsafe extern "system" fn(
-        *mut ID3D11VideoContext,
-        *mut c_void,
-        UINT,
-        BOOL,
-        *const WinRect,
-    ),
+    video_processor_set_stream_source_rect:
+        unsafe extern "system" fn(*mut ID3D11VideoContext, *mut c_void, UINT, BOOL, *const WinRect),
     _vp_prefix_2: [usize; 22],
     video_processor_blt: unsafe extern "system" fn(
         *mut ID3D11VideoContext,

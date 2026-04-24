@@ -75,12 +75,48 @@ impl GraphOverlay {
                     .corner_radius(4)
                     .show(ui, |ui| {
                         ui.set_width(PANEL_WIDTH);
-                        self.render_lane(ui, "Bitrate", egui::Color32::from_rgb(72, 163, 255), "kbps", |s| s.bitrate_kbps);
-                        self.render_lane(ui, "FPS", egui::Color32::from_rgb(56, 214, 118), "fps", |s| s.fps);
-                        self.render_lane(ui, "Latency", egui::Color32::from_rgb(255, 179, 71), "ms", |s| s.latency_ms);
-                        self.render_lane(ui, "Decode", egui::Color32::from_rgb(180, 142, 255), "ms", |s| s.decode_ms);
-                        self.render_lane(ui, "RTT", egui::Color32::from_rgb(78, 205, 196), "ms", |s| s.rtt_ms);
-                        self.render_lane(ui, "Loss", egui::Color32::from_rgb(255, 107, 107), "%", |s| s.loss_pct);
+                        self.render_lane(
+                            ui,
+                            "Bitrate",
+                            egui::Color32::from_rgb(72, 163, 255),
+                            "kbps",
+                            |s| s.bitrate_kbps,
+                        );
+                        self.render_lane(
+                            ui,
+                            "FPS",
+                            egui::Color32::from_rgb(56, 214, 118),
+                            "fps",
+                            |s| s.fps,
+                        );
+                        self.render_lane(
+                            ui,
+                            "Latency",
+                            egui::Color32::from_rgb(255, 179, 71),
+                            "ms",
+                            |s| s.latency_ms,
+                        );
+                        self.render_lane(
+                            ui,
+                            "Decode",
+                            egui::Color32::from_rgb(180, 142, 255),
+                            "ms",
+                            |s| s.decode_ms,
+                        );
+                        self.render_lane(
+                            ui,
+                            "RTT",
+                            egui::Color32::from_rgb(78, 205, 196),
+                            "ms",
+                            |s| s.rtt_ms,
+                        );
+                        self.render_lane(
+                            ui,
+                            "Loss",
+                            egui::Color32::from_rgb(255, 107, 107),
+                            "%",
+                            |s| s.loss_pct,
+                        );
                     });
             });
     }
@@ -135,10 +171,7 @@ impl GraphOverlay {
                     egui::pos2(graph_left, mid_y),
                     egui::pos2(graph_right, mid_y),
                 ],
-                egui::Stroke::new(
-                    0.5,
-                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 80),
-                ),
+                egui::Stroke::new(0.5, egui::Color32::from_rgba_unmultiplied(80, 80, 80, 80)),
             );
 
             // Data line
@@ -206,10 +239,7 @@ impl GraphOverlay {
                 egui::pos2(rect.left() + 4.0, rect.bottom()),
                 egui::pos2(rect.right() - 4.0, rect.bottom()),
             ],
-            egui::Stroke::new(
-                0.5,
-                egui::Color32::from_rgba_unmultiplied(50, 50, 50, 120),
-            ),
+            egui::Stroke::new(0.5, egui::Color32::from_rgba_unmultiplied(50, 50, 50, 120)),
         );
     }
 }

@@ -1,6 +1,6 @@
 use crossbeam_channel::{Receiver as PacketChannel, TryRecvError};
 use st_protocol::packet::{
-    AudioRedundancyMeta, AUDIO_REDUNDANCY_HEADER_SIZE, PacketHeader, PayloadType, HEADER_SIZE,
+    AudioRedundancyMeta, PacketHeader, PayloadType, AUDIO_REDUNDANCY_HEADER_SIZE, HEADER_SIZE,
 };
 use st_protocol::tunnel::CryptoContext;
 use st_protocol::{CompletedFrame, FrameAssembler, TransportFeedback};
@@ -58,7 +58,7 @@ fn tune_udp_recv_buffer(_socket: &UdpSocket, _target_bytes: i32) {}
 
 #[cfg(target_os = "linux")]
 mod linux_batch {
-    use super::{RECVMMSG_BATCH, MAX_UDP_DATAGRAM_SIZE};
+    use super::{MAX_UDP_DATAGRAM_SIZE, RECVMMSG_BATCH};
     use std::io;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
     use std::os::fd::RawFd;
@@ -95,15 +95,21 @@ mod linux_batch {
 
     impl RecvBatch {
         pub fn new() -> Self {
-            let storage: Box<[[u8; MAX_UDP_DATAGRAM_SIZE]]> =
-                (0..RECVMMSG_BATCH).map(|_| [0u8; MAX_UDP_DATAGRAM_SIZE]).collect();
-            let addrs: Box<[libc::sockaddr_storage]> =
-                (0..RECVMMSG_BATCH).map(|_| unsafe { std::mem::zeroed() }).collect();
-            let iovecs: Box<[libc::iovec]> = (0..RECVMMSG_BATCH)
-                .map(|_| libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 })
+            let storage: Box<[[u8; MAX_UDP_DATAGRAM_SIZE]]> = (0..RECVMMSG_BATCH)
+                .map(|_| [0u8; MAX_UDP_DATAGRAM_SIZE])
                 .collect();
-            let msgs: Box<[libc::mmsghdr]> =
-                (0..RECVMMSG_BATCH).map(|_| unsafe { std::mem::zeroed() }).collect();
+            let addrs: Box<[libc::sockaddr_storage]> = (0..RECVMMSG_BATCH)
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect();
+            let iovecs: Box<[libc::iovec]> = (0..RECVMMSG_BATCH)
+                .map(|_| libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                })
+                .collect();
+            let msgs: Box<[libc::mmsghdr]> = (0..RECVMMSG_BATCH)
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect();
             let cmsg_bufs: Box<[[u8; CMSG_BUF_LEN]]> =
                 (0..RECVMMSG_BATCH).map(|_| [0u8; CMSG_BUF_LEN]).collect();
             Self {
@@ -226,7 +232,10 @@ mod linux_batch {
         0
     }
 
-    fn sockaddr_to_socket_addr(storage: &libc::sockaddr_storage, namelen: usize) -> Option<SocketAddr> {
+    fn sockaddr_to_socket_addr(
+        storage: &libc::sockaddr_storage,
+        namelen: usize,
+    ) -> Option<SocketAddr> {
         if namelen == 0 {
             return None;
         }
@@ -243,7 +252,9 @@ mod linux_batch {
                 let port = u16::from_be(sin6.sin6_port);
                 let flowinfo = sin6.sin6_flowinfo;
                 let scope_id = sin6.sin6_scope_id;
-                Some(SocketAddr::V6(SocketAddrV6::new(ip, port, flowinfo, scope_id)))
+                Some(SocketAddr::V6(SocketAddrV6::new(
+                    ip, port, flowinfo, scope_id,
+                )))
             }
             _ => None,
         }
@@ -322,7 +333,10 @@ impl TransportWindowStats {
 }
 
 impl UdpReceiver {
-    pub fn from_socket(socket: UdpSocket, crypto: Option<Arc<CryptoContext>>) -> Result<Self, String> {
+    pub fn from_socket(
+        socket: UdpSocket,
+        crypto: Option<Arc<CryptoContext>>,
+    ) -> Result<Self, String> {
         socket
             .set_nonblocking(true)
             .map_err(|e| format!("set_nonblocking: {e}"))?;
@@ -333,7 +347,10 @@ impl UdpReceiver {
             let mut batch = linux_batch::RecvBatch::new();
             let gro = batch.try_enable_gro(socket.as_raw_fd());
             if std::env::var_os("ST_TRACE").is_some() {
-                eprintln!("[transport] UDP_GRO {}", if gro { "enabled" } else { "unavailable" });
+                eprintln!(
+                    "[transport] UDP_GRO {}",
+                    if gro { "enabled" } else { "unavailable" }
+                );
             }
             batch
         };
@@ -699,8 +716,10 @@ impl PacketProcessor {
                     };
                     self.feedback.received_bytes =
                         self.feedback.received_bytes.saturating_add(raw_len as u64);
-                    self.feedback.received_audio_bytes =
-                        self.feedback.received_audio_bytes.saturating_add(raw_len as u64);
+                    self.feedback.received_audio_bytes = self
+                        .feedback
+                        .received_audio_bytes
+                        .saturating_add(raw_len as u64);
                     return Some(ReceivedData::Audio(AudioPacket {
                         seq: header.seq,
                         data,
@@ -712,10 +731,11 @@ impl PacketProcessor {
         }
 
         self.feedback.received_packets = self.feedback.received_packets.saturating_add(1);
-        self.feedback.received_bytes =
-            self.feedback.received_bytes.saturating_add(raw_len as u64);
-        self.feedback.received_video_bytes =
-            self.feedback.received_video_bytes.saturating_add(raw_len as u64);
+        self.feedback.received_bytes = self.feedback.received_bytes.saturating_add(raw_len as u64);
+        self.feedback.received_video_bytes = self
+            .feedback
+            .received_video_bytes
+            .saturating_add(raw_len as u64);
         let outcome = self.assembler.ingest_with_feedback(raw);
         self.feedback.lost_packets = self
             .feedback

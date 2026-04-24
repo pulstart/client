@@ -381,10 +381,9 @@ pub fn run_receive_pipeline(
                                 match VideoDecoder::new_software(stream_config.codec) {
                                     Ok(mut software_decoder) => {
                                         attempted_software_fallback = true;
-                                        software_decoder
-                                            .set_native_surface_control(Arc::clone(
-                                                &native_surfaces,
-                                            ));
+                                        software_decoder.set_native_surface_control(Arc::clone(
+                                            &native_surfaces,
+                                        ));
                                         software_decoder
                                             .enter_recovery_mode("hardware decoder failure");
                                         decoder = software_decoder;
@@ -410,8 +409,7 @@ pub fn run_receive_pipeline(
                             continue;
                         }
                     };
-                    if decoder.waiting_for_recovery()
-                    {
+                    if decoder.waiting_for_recovery() {
                         request_recovery_keyframe(
                             &control_tx,
                             &mut last_recovery_keyframe_request,
@@ -484,8 +482,7 @@ fn maybe_request_transport_recovery_keyframe(
     last_recovery_keyframe_request: &mut Instant,
     trace: bool,
 ) {
-    if !stats.needs_recovery_keyframe()
-    {
+    if !stats.needs_recovery_keyframe() {
         return;
     }
 
@@ -550,13 +547,11 @@ mod tests {
         playout.max_queued_frames = 8;
 
         assert!(playout.enqueue(frame_with_id(11)).is_none());
-        let dropped = playout.enqueue(frame_with_id(10)).expect("stale frame dropped");
+        let dropped = playout
+            .enqueue(frame_with_id(10))
+            .expect("stale frame dropped");
         assert_eq!(
-            dropped
-                .debug_timing
-                .as_ref()
-                .expect("frame id")
-                .frame_id,
+            dropped.debug_timing.as_ref().expect("frame id").frame_id,
             10
         );
         assert_eq!(playout.queued.len(), 1);
@@ -573,23 +568,14 @@ mod tests {
         let due = playout.take_due_frames();
         let presented = due.present.expect("presented frame");
         assert_eq!(
-            presented
-                .debug_timing
-                .as_ref()
-                .expect("frame id")
-                .frame_id,
+            presented.debug_timing.as_ref().expect("frame id").frame_id,
             10
         );
 
-        let dropped = playout.enqueue(frame_with_id(9)).expect("stale frame dropped");
-        assert_eq!(
-            dropped
-                .debug_timing
-                .as_ref()
-                .expect("frame id")
-                .frame_id,
-            9
-        );
+        let dropped = playout
+            .enqueue(frame_with_id(9))
+            .expect("stale frame dropped");
+        assert_eq!(dropped.debug_timing.as_ref().expect("frame id").frame_id, 9);
         assert!(playout.queued.is_empty());
     }
 }

@@ -49,8 +49,9 @@ mod platform {
     impl Inhibitor {
         pub fn acquire() -> Result<Self, String> {
             acquire_screensaver().or_else(|screen_err| {
-                acquire_login1()
-                    .map_err(|login_err| format!("{screen_err}; fallback login1 failed: {login_err}"))
+                acquire_login1().map_err(|login_err| {
+                    format!("{screen_err}; fallback login1 failed: {login_err}")
+                })
             })
         }
     }
@@ -71,8 +72,8 @@ mod platform {
     }
 
     fn acquire_screensaver() -> Result<Inhibitor, String> {
-        let connection = Connection::session()
-            .map_err(|err| format!("session bus unavailable: {err}"))?;
+        let connection =
+            Connection::session().map_err(|err| format!("session bus unavailable: {err}"))?;
         let proxy = Proxy::new(
             &connection,
             "org.freedesktop.ScreenSaver",
@@ -97,7 +98,10 @@ mod platform {
         )
         .map_err(|err| format!("login1 proxy unavailable: {err}"))?;
         let fd: ZbusOwnedFd = proxy
-            .call("Inhibit", &("idle", "st-client", "Streaming active", "block"))
+            .call(
+                "Inhibit",
+                &("idle", "st-client", "Streaming active", "block"),
+            )
             .map_err(|err| format!("login1 inhibit failed: {err}"))?;
         let fd = OwnedFd::from(fd);
         Ok(Inhibitor::Login1 {
@@ -166,7 +170,7 @@ mod platform {
 #[cfg(target_os = "windows")]
 mod platform {
     use windows_sys::Win32::System::Power::{
-        ES_CONTINUOUS, ES_DISPLAY_REQUIRED, EXECUTION_STATE, SetThreadExecutionState,
+        SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, EXECUTION_STATE,
     };
 
     pub struct Inhibitor;
@@ -174,9 +178,7 @@ mod platform {
     impl Inhibitor {
         pub fn acquire() -> Result<Self, String> {
             let previous = unsafe {
-                SetThreadExecutionState(
-                    (ES_CONTINUOUS | ES_DISPLAY_REQUIRED) as EXECUTION_STATE,
-                )
+                SetThreadExecutionState((ES_CONTINUOUS | ES_DISPLAY_REQUIRED) as EXECUTION_STATE)
             };
             if previous == 0 {
                 Err("SetThreadExecutionState failed".to_string())

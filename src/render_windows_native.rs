@@ -18,9 +18,9 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
-    DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
-    IDXGIFactory1, IDXGIFactory2, IDXGIOutput, IDXGISwapChain1,
+    CreateDXGIFactory1, IDXGIFactory1, IDXGIFactory2, IDXGIOutput, IDXGISwapChain1, DXGI_PRESENT,
+    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, GetWindowLongW, SetWindowLongW, SetWindowPos, ShowWindow,
@@ -199,8 +199,9 @@ impl WindowsSwapchainRenderer {
             let _ = ShowWindow(video_hwnd, SHOW_WINDOW_CMD(SW_HIDE.0));
         }
 
-        let factory1: IDXGIFactory1 =
-            unsafe { CreateDXGIFactory1().map_err(|err| format!("CreateDXGIFactory1 failed: {err}"))? };
+        let factory1: IDXGIFactory1 = unsafe {
+            CreateDXGIFactory1().map_err(|err| format!("CreateDXGIFactory1 failed: {err}"))?
+        };
         let factory = factory1
             .cast::<IDXGIFactory2>()
             .map_err(|err| format!("IDXGIFactory1->IDXGIFactory2 cast failed: {err}"))?;
@@ -252,7 +253,10 @@ impl WindowsSwapchainRenderer {
             return Ok(());
         }
 
-        let device = self.device.as_ref().ok_or_else(|| "missing render device".to_string())?;
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| "missing render device".to_string())?;
         if let Ok(multithread) = device.cast::<ID3D11Multithread>() {
             unsafe {
                 let _ = multithread.SetMultithreadProtected(true);
@@ -280,7 +284,12 @@ impl WindowsSwapchainRenderer {
             .ok_or_else(|| "missing video context".to_string())?;
         let input_texture: ID3D11Texture2D =
             unsafe { clone_interface(frame.texture.as_ptr(), "decoder texture")? };
-        let input_view = create_input_view(video_device, processor_enum, &input_texture, frame.array_index)?;
+        let input_view = create_input_view(
+            video_device,
+            processor_enum,
+            &input_texture,
+            frame.array_index,
+        )?;
 
         let stream = D3D11_VIDEO_PROCESSOR_STREAM {
             Enable: true.into(),
@@ -384,7 +393,8 @@ impl WindowsSwapchainRenderer {
 
         if need_device_recreate {
             self.device_key = device_key;
-            self.device = Some(unsafe { clone_interface(frame.device.as_ptr(), "decoder device")? });
+            self.device =
+                Some(unsafe { clone_interface(frame.device.as_ptr(), "decoder device")? });
             self.video_device =
                 Some(unsafe { clone_interface(frame.video_device.as_ptr(), "video device")? });
             self.video_context =

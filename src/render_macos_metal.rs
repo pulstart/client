@@ -3,16 +3,17 @@
 use crate::video_frame::{MacosVideoToolboxFrame, VideoFormat};
 use core_graphics_types::geometry::{CGPoint, CGRect, CGSize};
 use eframe::{egui, Frame};
+use metal::foreign_types::ForeignType;
 use metal::{
     Buffer, CommandBuffer, CommandQueue, CompileOptions, Device, Library, MTLClearColor,
     MTLLoadAction, MTLPixelFormat, MTLPrimitiveType, MTLResourceOptions, MTLStoreAction,
     MetalLayer, RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState, TextureRef,
 };
-use metal::foreign_types::ForeignType;
 use objc::{
-    class, msg_send, sel, sel_impl,
+    class, msg_send,
     rc::{autoreleasepool, StrongPtr},
     runtime::{Object, NO, YES},
+    sel, sel_impl,
 };
 use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 use std::{ffi::c_void, ptr::NonNull};
@@ -194,7 +195,9 @@ impl MacosMetalVideoPresenter {
     }
 
     pub fn current_rect(&self) -> Option<egui::Rect> {
-        self.renderer.as_ref().and_then(MetalVideoRenderer::current_rect)
+        self.renderer
+            .as_ref()
+            .and_then(MetalVideoRenderer::current_rect)
     }
 }
 
@@ -385,7 +388,8 @@ impl MetalVideoRenderer {
 
     fn current_rect(&self) -> Option<egui::Rect> {
         let host_rect_in_parent: CGRect = unsafe { msg_send![*self.host_view, frame] };
-        let host_rect_in_root = parent_rect_in_root_view(self.root_view, self.parent_view, host_rect_in_parent);
+        let host_rect_in_root =
+            parent_rect_in_root_view(self.root_view, self.parent_view, host_rect_in_parent);
         let width = host_rect_in_root.size.width as f32;
         let height = host_rect_in_root.size.height as f32;
         if width < 1.0 || height < 1.0 {
@@ -611,15 +615,10 @@ impl NativeBackgroundView {
         let min_dimension = width.min(height);
 
         let primary_radius = min_dimension * 0.16;
-        let primary_frame = circle_frame(
-            CGPoint::new(width * 0.18, height * 0.22),
-            primary_radius,
-        );
+        let primary_frame = circle_frame(CGPoint::new(width * 0.18, height * 0.22), primary_radius);
         let secondary_radius = min_dimension * 0.20;
-        let secondary_frame = circle_frame(
-            CGPoint::new(width * 0.84, height * 0.82),
-            secondary_radius,
-        );
+        let secondary_frame =
+            circle_frame(CGPoint::new(width * 0.84, height * 0.82), secondary_radius);
 
         unsafe {
             let () = msg_send![class!(CATransaction), begin];
@@ -647,8 +646,8 @@ fn root_ns_view(frame: &Frame) -> Result<NonNull<Object>, String> {
 
 fn configure_window_for_underlay(view: NonNull<Object>) -> Result<(), String> {
     let window: *mut Object = unsafe { msg_send![view.as_ptr(), window] };
-    let window =
-        NonNull::new(window).ok_or_else(|| "AppKit window unavailable for Metal presenter".to_string())?;
+    let window = NonNull::new(window)
+        .ok_or_else(|| "AppKit window unavailable for Metal presenter".to_string())?;
     let clear_color: *mut Object = unsafe { msg_send![class!(NSColor), clearColor] };
 
     unsafe {

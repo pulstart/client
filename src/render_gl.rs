@@ -6,10 +6,10 @@ use crate::render_macos_metal::MacosMetalVideoPresenter;
 use crate::render_windows::{WindowsD3d11Importer, WindowsDirectVideoPresenter};
 #[cfg(target_os = "windows")]
 use crate::render_windows_native::WindowsNativeVideoPresenter;
-#[cfg(target_os = "linux")]
-use crate::video_frame::{LinuxDmaBufFormat, LinuxDmaBufFrame, LinuxDmaBufPlane};
 #[cfg(target_os = "macos")]
 use crate::video_frame::MacosVideoToolboxFrame;
+#[cfg(target_os = "linux")]
+use crate::video_frame::{LinuxDmaBufFormat, LinuxDmaBufFrame, LinuxDmaBufPlane};
 use crate::video_frame::{
     NativeSurfaceCapabilities, NativeSurfaceControl, VideoFormat, VideoFrameBuffer,
 };
@@ -19,6 +19,8 @@ use eframe::{egui, glow};
 use glow::{HasContext as _, PixelUnpackData};
 #[cfg(target_os = "linux")]
 use khronos_egl as egl;
+#[cfg(target_os = "macos")]
+use std::collections::VecDeque;
 #[cfg(target_os = "linux")]
 use std::ffi::c_void;
 #[cfg(target_os = "linux")]
@@ -26,8 +28,6 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
-#[cfg(target_os = "macos")]
-use std::collections::VecDeque;
 
 #[cfg(target_os = "macos")]
 const MACOS_FRAME_KEEPALIVE_DEPTH: usize = 6;
@@ -617,8 +617,7 @@ impl NativeVideoTexture {
 
     pub fn paint_direct_if_available(
         &mut self,
-        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-        frame: &eframe::Frame,
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] frame: &eframe::Frame,
         ui: &egui::Ui,
         rect: egui::Rect,
     ) -> bool {
@@ -1366,9 +1365,7 @@ impl LinuxDmabufImporter {
         let dup_fd = match fence_fd.try_clone() {
             Ok(f) => f,
             Err(err) => {
-                eprintln!(
-                    "[render] dup fence fd failed ({err}); falling back to implicit sync"
-                );
+                eprintln!("[render] dup fence fd failed ({err}); falling back to implicit sync");
                 return;
             }
         };
@@ -1379,7 +1376,8 @@ impl LinuxDmabufImporter {
             egl::ATTRIB_NONE,
         ];
         let sync = match unsafe {
-            self.egl.create_sync(display, EGL_SYNC_NATIVE_FENCE_ANDROID, &attribs)
+            self.egl
+                .create_sync(display, EGL_SYNC_NATIVE_FENCE_ANDROID, &attribs)
         } {
             Ok(sync) => {
                 // EGL owns the fd on success — must not also close it.
@@ -1387,9 +1385,7 @@ impl LinuxDmabufImporter {
                 sync
             }
             Err(err) => {
-                eprintln!(
-                    "[render] eglCreateSync(native_fence) failed ({err:?}); implicit sync"
-                );
+                eprintln!("[render] eglCreateSync(native_fence) failed ({err:?}); implicit sync");
                 return;
             }
         };

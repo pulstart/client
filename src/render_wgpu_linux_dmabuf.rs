@@ -186,7 +186,10 @@ fn import_plane(
         // race with LinuxDmaBufFrame::drop closing the same number.
         let dup_fd = libc::fcntl(plane.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
         if dup_fd < 0 {
-            return Err(format!("dup dmabuf fd: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "dup dmabuf fd: {}",
+                std::io::Error::last_os_error()
+            ));
         }
 
         let mut ext_info = vk::ExternalMemoryImageCreateInfo::default()

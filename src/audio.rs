@@ -33,15 +33,11 @@ pub fn run_audio_pipeline(
 ) -> Result<(), String> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-    let target_buffer_samples = configured_audio_buffer_samples(
-        "ST_CLIENT_AUDIO_BUFFER_MS",
-        DEFAULT_TARGET_BUFFER_MS,
-    );
-    let max_buffer_samples = configured_audio_buffer_samples(
-        "ST_CLIENT_AUDIO_MAX_BUFFER_MS",
-        DEFAULT_MAX_BUFFER_MS,
-    )
-    .max(target_buffer_samples * 2);
+    let target_buffer_samples =
+        configured_audio_buffer_samples("ST_CLIENT_AUDIO_BUFFER_MS", DEFAULT_TARGET_BUFFER_MS);
+    let max_buffer_samples =
+        configured_audio_buffer_samples("ST_CLIENT_AUDIO_MAX_BUFFER_MS", DEFAULT_MAX_BUFFER_MS)
+            .max(target_buffer_samples * 2);
     let max_queued_packets = std::env::var("ST_CLIENT_AUDIO_MAX_BACKLOG_PACKETS")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
@@ -172,22 +168,46 @@ pub fn run_audio_pipeline(
                         }
 
                         let mut recovery_mode = "plc";
-                        let recovered_last_missing = if let Some(redundant_prev) =
-                            packet.redundant_prev.as_deref()
-                        {
-                            if decode_and_enqueue(
-                                &mut decoder,
-                                redundant_prev,
-                                false,
-                                &mut pcm_buf,
-                                &ring,
-                                target_buffer_samples,
-                                max_buffer_samples,
-                            )
-                            .is_ok()
-                            {
-                                recovery_mode = "redundancy";
-                                true
+                        let recovered_last_missing =
+                            if let Some(redundant_prev) = packet.redundant_prev.as_deref() {
+                                if decode_and_enqueue(
+                                    &mut decoder,
+                                    redundant_prev,
+                                    false,
+                                    &mut pcm_buf,
+                                    &ring,
+                                    target_buffer_samples,
+                                    max_buffer_samples,
+                                )
+                                .is_ok()
+                                {
+                                    recovery_mode = "redundancy";
+                                    true
+                                } else if decode_and_enqueue(
+                                    &mut decoder,
+                                    &packet.data,
+                                    true,
+                                    &mut pcm_buf,
+                                    &ring,
+                                    target_buffer_samples,
+                                    max_buffer_samples,
+                                )
+                                .is_ok()
+                                {
+                                    recovery_mode = "fec";
+                                    true
+                                } else {
+                                    decode_and_enqueue(
+                                        &mut decoder,
+                                        &[],
+                                        false,
+                                        &mut pcm_buf,
+                                        &ring,
+                                        target_buffer_samples,
+                                        max_buffer_samples,
+                                    )
+                                    .is_ok()
+                                }
                             } else if decode_and_enqueue(
                                 &mut decoder,
                                 &packet.data,
@@ -212,32 +232,7 @@ pub fn run_audio_pipeline(
                                     max_buffer_samples,
                                 )
                                 .is_ok()
-                            }
-                        } else if decode_and_enqueue(
-                            &mut decoder,
-                            &packet.data,
-                            true,
-                            &mut pcm_buf,
-                            &ring,
-                            target_buffer_samples,
-                            max_buffer_samples,
-                        )
-                        .is_ok()
-                        {
-                            recovery_mode = "fec";
-                            true
-                        } else {
-                            decode_and_enqueue(
-                                &mut decoder,
-                                &[],
-                                false,
-                                &mut pcm_buf,
-                                &ring,
-                                target_buffer_samples,
-                                max_buffer_samples,
-                            )
-                            .is_ok()
-                        };
+                            };
                         if recovered_last_missing {
                             recovered_packets += 1;
                         }
@@ -330,7 +325,11 @@ fn trim_packet_backlog(
         return false;
     }
 
-    trim_playback_buffer(ring, dropped_packets.saturating_mul(packet_samples), target_buffer_samples);
+    trim_playback_buffer(
+        ring,
+        dropped_packets.saturating_mul(packet_samples),
+        target_buffer_samples,
+    );
     if trace && *backlog_logs < 12 {
         eprintln!(
             "[trace][audio] dropped {} stale queued packet(s) to cut playback latency",

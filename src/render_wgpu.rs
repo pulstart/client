@@ -9,11 +9,11 @@
 //! `NativeSurfaceCapabilities` — this backend reports all native surfaces as
 //! unsupported so `VideoFrameBuffer` skips building them.
 
+#[cfg(target_os = "linux")]
+use crate::video_frame::LinuxDmaBufFormat;
 use crate::video_frame::{
     NativeSurfaceCapabilities, NativeSurfaceControl, VideoFormat, VideoFrameBuffer,
 };
-#[cfg(target_os = "linux")]
-use crate::video_frame::LinuxDmaBufFormat;
 use eframe::egui;
 use eframe::wgpu;
 use std::num::NonZeroU64;
@@ -186,8 +186,8 @@ impl WgpuVideoTexture {
         // the dmabuf path — otherwise the borrow checker complains about
         // reading `self.dmabuf_support` mid-borrow.
         #[cfg(target_os = "linux")]
-        let try_dmabuf = matches!(self.dmabuf_support, DmaBufSupportState::Enabled)
-            && video.dmabuf.is_some();
+        let try_dmabuf =
+            matches!(self.dmabuf_support, DmaBufSupportState::Enabled) && video.dmabuf.is_some();
         #[cfg(not(target_os = "linux"))]
         let try_dmabuf = false;
 
@@ -271,61 +271,59 @@ impl WgpuVideoTexture {
 
 impl PipelineState {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Self, String> {
-
         // Three sampled textures (luma, chroma_u/uv, chroma_v) + one sampler
         // + one uniform (mode selector).
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("st-wgpu-video.bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("st-wgpu-video.bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(16),
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 4,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: NonZeroU64::new(16),
-                        },
-                        count: None,
-                    },
-                ],
-            });
+                    count: None,
+                },
+            ],
+        });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("st-wgpu-video.wgsl"),
@@ -515,7 +513,18 @@ impl PipelineState {
                 mode.to_le_bytes()[1],
                 mode.to_le_bytes()[2],
                 mode.to_le_bytes()[3],
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
             ];
             queue.write_buffer(&self.uniform_buf, 0, &bytes);
             self.last_mode = mode;
