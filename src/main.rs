@@ -67,6 +67,7 @@ const INPUT_SENDER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const INPUT_STATE_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
 const INPUT_STATE_REPAIR_WINDOW: Duration = Duration::from_millis(200);
 const HOVER_EDGE_MISMATCH_UPDATES_THRESHOLD: u8 = 6;
+const LOCAL_CURSOR_PREDICTION_HOLD: Duration = Duration::from_millis(80);
 
 fn trace_enabled() -> bool {
     std::env::var_os("ST_TRACE").is_some()
@@ -134,7 +135,7 @@ struct CursorOverlayGeometry {
     scale_x: f32,
     scale_y: f32,
     display_scale: f32,
-    using_pointer_pos: bool,
+    using_local_pos: bool,
 }
 
 struct StreamApp {
@@ -172,6 +173,7 @@ struct StreamApp {
     last_video_rect: Option<egui::Rect>,
     last_sent_absolute_cursor: Option<(u16, u16)>,
     hover_cursor_pos: Option<egui::Pos2>,
+    last_local_cursor_prediction_at: Option<Instant>,
     resume_hover_after_relative_drag: bool,
     hover_cursor_resync_pending: bool,
     hover_drag_edge_mismatch_updates: u8,
@@ -662,6 +664,7 @@ impl StreamApp {
             last_video_rect: None,
             last_sent_absolute_cursor: None,
             hover_cursor_pos: None,
+            last_local_cursor_prediction_at: None,
             resume_hover_after_relative_drag: false,
             hover_cursor_resync_pending: false,
             hover_drag_edge_mismatch_updates: 0,
@@ -707,6 +710,7 @@ impl StreamApp {
         self.last_video_rect = None;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
+        self.last_local_cursor_prediction_at = None;
         self.pending_wheel_units = egui::Vec2::ZERO;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
@@ -791,6 +795,7 @@ impl StreamApp {
         self.last_video_rect = None;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
+        self.last_local_cursor_prediction_at = None;
         self.pending_wheel_units = egui::Vec2::ZERO;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
@@ -813,6 +818,7 @@ impl StreamApp {
         self.pending_capture_click = false;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
+        self.last_local_cursor_prediction_at = None;
         self.pending_wheel_units = egui::Vec2::ZERO;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
@@ -832,6 +838,7 @@ impl StreamApp {
         self.last_video_rect = None;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
+        self.last_local_cursor_prediction_at = None;
         self.pending_wheel_units = egui::Vec2::ZERO;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
@@ -848,6 +855,7 @@ impl StreamApp {
         self.pointer_buttons = 0;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
+        self.last_local_cursor_prediction_at = None;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
         self.hover_drag_edge_mismatch_updates = 0;
@@ -1350,8 +1358,16 @@ impl StreamApp {
         );
 
         let use_local_cursor_pos = self.capture_mode == LocalCaptureMode::HoverAbsolute
-            || self.resume_hover_after_relative_drag;
-        let (top_left, cursor_pos, using_pointer_pos) = if use_local_cursor_pos {
+            || self.resume_hover_after_relative_drag
+            || (self.capture_mode == LocalCaptureMode::CapturedRelative
+                && input_snapshot.capabilities.separate_cursor
+                && input_snapshot.cursor_state.visible
+                && !matches!(
+                    input_snapshot.controller_state,
+                    ControllerState::Unavailable | ControllerState::OwnedByOther
+                )
+                && self.hover_cursor_pos.is_some());
+        let (top_left, cursor_pos, using_local_pos) = if use_local_cursor_pos {
             let pointer_pos = self
                 .hover_cursor_pos
                 .filter(|pos| video_rect.contains(*pos))?;
@@ -1390,7 +1406,7 @@ impl StreamApp {
             scale_x,
             scale_y,
             display_scale,
-            using_pointer_pos,
+            using_local_pos,
         })
     }
 
@@ -1471,11 +1487,11 @@ impl StreamApp {
 
         if let Some(geometry) = overlay_geometry {
             lines.push(format!(
-                "mapped: serial={} pos={} rect={} pointer_driven={}",
+                "mapped: serial={} pos={} rect={} local_driven={}",
                 geometry.serial,
                 format_pos(geometry.cursor_pos),
                 format_rect(geometry.rect),
-                if geometry.using_pointer_pos { "y" } else { "n" },
+                if geometry.using_local_pos { "y" } else { "n" },
             ));
             lines.push(format!(
                 "mapped: source={}x{} hotspot={} scale=({:.4}, {:.4}) display_scale={:.4}",
@@ -1810,19 +1826,30 @@ impl StreamApp {
             } else {
                 None
             };
-            let predicted_pos = self
-                .mapped_server_cursor_video_pos(&snapshot, video_rect)
-                .or_else(|| {
-                    self.hover_cursor_pos.map(|pos| {
-                        previous_video_rect
-                            .filter(|previous_rect| *previous_rect != video_rect)
-                            .map(|previous_rect| {
-                                remap_pos_between_video_rects(pos, previous_rect, video_rect)
-                            })
-                            .unwrap_or(pos)
+            let remote_pos = self.mapped_server_cursor_video_pos(&snapshot, video_rect);
+            let local_prediction = self.hover_cursor_pos.map(|pos| {
+                previous_video_rect
+                    .filter(|previous_rect| *previous_rect != video_rect)
+                    .map(|previous_rect| {
+                        remap_pos_between_video_rects(pos, previous_rect, video_rect)
                     })
-                })
-                .or(local_entry_pos);
+                    .unwrap_or(pos)
+            });
+            let local_prediction_recent = self
+                .last_local_cursor_prediction_at
+                .map(|at| at.elapsed() <= LOCAL_CURSOR_PREDICTION_HOLD)
+                .unwrap_or(false);
+            let entering_relative = previous_capture_mode != LocalCaptureMode::CapturedRelative
+                && !self.resume_hover_after_relative_drag;
+            let predicted_pos = if entering_relative {
+                relative_capture_entry_anchor(remote_pos, local_entry_pos)
+            } else {
+                relative_capture_tracking_anchor(
+                    remote_pos,
+                    local_prediction,
+                    local_prediction_recent,
+                )
+            };
             self.hover_cursor_pos = predicted_pos
                 .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()));
         } else if !self.resume_hover_after_relative_drag {
@@ -5260,6 +5287,18 @@ fn relative_capture_entry_anchor(
     remote_pos.or(local_pos)
 }
 
+fn relative_capture_tracking_anchor(
+    remote_pos: Option<egui::Pos2>,
+    local_prediction: Option<egui::Pos2>,
+    local_prediction_recent: bool,
+) -> Option<egui::Pos2> {
+    if local_prediction_recent {
+        local_prediction.or(remote_pos)
+    } else {
+        remote_pos.or(local_prediction)
+    }
+}
+
 fn pointer_button_mask(button: egui::PointerButton) -> u8 {
     match button {
         egui::PointerButton::Primary => MOUSE_BUTTON_PRIMARY,
@@ -6261,8 +6300,10 @@ impl eframe::App for StreamApp {
                         if snapshot.capabilities.separate_cursor && snapshot.cursor_state.visible {
                             if let Some(rect) = video_rect {
                                 let base_pos = self
-                                    .mapped_server_cursor_video_pos(&snapshot, rect)
-                                    .or(self.hover_cursor_pos)
+                                    .hover_cursor_pos
+                                    .or_else(|| {
+                                        self.mapped_server_cursor_video_pos(&snapshot, rect)
+                                    })
                                     .or(last_pointer_pos)
                                     .unwrap_or_else(|| rect.center());
                                 let attempted_pos =
@@ -6319,6 +6360,7 @@ impl eframe::App for StreamApp {
                             }
                             if let Some(next_pos) = predicted_cursor_pos {
                                 self.hover_cursor_pos = Some(next_pos);
+                                self.last_local_cursor_prediction_at = Some(Instant::now());
                                 last_pointer_pos = Some(next_pos);
                             } else if self.resume_hover_after_relative_drag {
                                 if let Some(rect) = video_rect {
@@ -6332,6 +6374,7 @@ impl eframe::App for StreamApp {
                                         ctx.pixels_per_point(),
                                     );
                                     self.hover_cursor_pos = Some(next_pos);
+                                    self.last_local_cursor_prediction_at = Some(Instant::now());
                                     last_pointer_pos = Some(next_pos);
                                 }
                             }
@@ -6812,6 +6855,28 @@ mod tests {
         assert_eq!(
             relative_capture_entry_anchor(None, Some(local)),
             Some(local)
+        );
+    }
+
+    #[test]
+    fn relative_capture_tracking_prefers_recent_local_prediction() {
+        let remote = egui::pos2(100.0, 200.0);
+        let predicted = egui::pos2(120.0, 205.0);
+
+        assert_eq!(
+            relative_capture_tracking_anchor(Some(remote), Some(predicted), true),
+            Some(predicted)
+        );
+    }
+
+    #[test]
+    fn relative_capture_tracking_returns_to_remote_after_prediction_hold() {
+        let remote = egui::pos2(100.0, 200.0);
+        let predicted = egui::pos2(120.0, 205.0);
+
+        assert_eq!(
+            relative_capture_tracking_anchor(Some(remote), Some(predicted), false),
+            Some(remote)
         );
     }
 }
