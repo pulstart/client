@@ -1294,6 +1294,61 @@ impl StreamApp {
         let _ = self.send_absolute_cursor(client_id, pos, video_rect, false);
     }
 
+    /// One-shot MouseRelative packet that warps the server cursor to land at
+    /// `local_pos` (a screen-coords position inside the video rect).  Used on
+    /// Idle→CapturedRelative entry on relative-only backends: the overlay
+    /// renders at local pos for the user, and this delta tells the server to
+    /// move its cursor there so subsequent deltas keep both aligned and clicks
+    /// land where the user sees the cursor.
+    fn send_relative_warp_to_local(
+        &self,
+        client_id: u32,
+        local_pos: egui::Pos2,
+        video_rect: egui::Rect,
+        snapshot: &input::SharedInputSnapshot,
+    ) {
+        if !snapshot.capabilities.mouse_relative {
+            return;
+        }
+        let Some(stream_size) = self.cursor_space_size() else {
+            return;
+        };
+        if stream_size.x <= 0.0
+            || stream_size.y <= 0.0
+            || video_rect.width() <= 0.0
+            || video_rect.height() <= 0.0
+        {
+            return;
+        }
+        let scale_x = stream_size.x / video_rect.width();
+        let scale_y = stream_size.y / video_rect.height();
+        let local_tip_stream_x = (local_pos.x - video_rect.left()) * scale_x;
+        let local_tip_stream_y = (local_pos.y - video_rect.top()) * scale_y;
+        // cursor_state.x/y is the top-left of the cursor bitmap in stream
+        // coords; the tip ("hotspot") is at cursor_state + hotspot.
+        let hotspot = self
+            .remote_cursor_texture_for_serial(snapshot.cursor_state.serial)
+            .map(|tex| (tex.hotspot.x, tex.hotspot.y))
+            .unwrap_or((0.0, 0.0));
+        let server_tip_stream_x = snapshot.cursor_state.x as f32 + hotspot.0;
+        let server_tip_stream_y = snapshot.cursor_state.y as f32 + hotspot.1;
+        let dx = (local_tip_stream_x - server_tip_stream_x)
+            .round()
+            .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        let dy = (local_tip_stream_y - server_tip_stream_y)
+            .round()
+            .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        self.send_input_packet(InputPacket::MouseRelative(MouseRelativeInput {
+            client_id,
+            dx,
+            dy,
+            buttons: self.pointer_buttons,
+        }));
+    }
+
     fn sync_remote_cursor_texture(&mut self, ctx: &egui::Context) {
         let snapshot = self.shared_input.snapshot();
         if snapshot.cursor_shape_version == self.seen_cursor_shape_version {
@@ -1801,11 +1856,25 @@ impl StreamApp {
             let local_pos = pointer_pos
                 .filter(|pos| video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos));
             if let Some(anchor_pos) = relative_capture_entry_anchor(remote_pos, local_pos) {
-                self.hover_cursor_pos = Some(clamp_pos_to_video_rect(
+                let clamped = clamp_pos_to_video_rect(
                     anchor_pos,
                     video_rect,
                     ctx.pixels_per_point(),
-                ));
+                );
+                self.hover_cursor_pos = Some(clamped);
+                // Anchor was local — send a one-shot warp so the server
+                // cursor catches up to where the overlay now sits.  After
+                // this, normal delta accumulation keeps both aligned.
+                if local_pos.is_some() {
+                    if let Some(client_id) = snapshot.client_id {
+                        self.send_relative_warp_to_local(
+                            client_id,
+                            clamped,
+                            video_rect,
+                            &snapshot,
+                        );
+                    }
+                }
                 ctx.request_repaint();
             }
         }
@@ -5398,7 +5467,11 @@ fn relative_capture_entry_anchor(
     remote_pos: Option<egui::Pos2>,
     local_pos: Option<egui::Pos2>,
 ) -> Option<egui::Pos2> {
-    remote_pos.or(local_pos)
+    // Prefer the local OS pointer position so the rendered overlay does not
+    // teleport to the server cursor on Idle→CapturedRelative entry.  The
+    // server is realigned to local via a one-shot warp MouseRelative packet
+    // sent from the entry transition (see send_relative_warp_to_local).
+    local_pos.or(remote_pos)
 }
 
 fn relative_capture_tracking_anchor(
@@ -6337,19 +6410,30 @@ impl eframe::App for StreamApp {
                             if rect.contains(pos) && !self.pointer_over_local_overlay(pos) {
                                 let local_pos =
                                     clamp_pos_to_video_rect(pos, rect, ctx.pixels_per_point());
-                                // Relative-only input cannot teleport to the local pointer.
-                                // Keep the remote cursor position authoritative on entry.
+                                // Render at the local pointer position so the
+                                // overlay does not teleport to the server's
+                                // cursor on entry.  The matching warp delta
+                                // below tells the server to bring its cursor
+                                // here so subsequent relative deltas keep both
+                                // in sync and clicks land correctly.
                                 let anchor_pos =
                                     self.mapped_server_cursor_video_pos(&snapshot, rect);
                                 self.capture_mode = LocalCaptureMode::CapturedRelative;
                                 self.resume_hover_after_relative_drag = false;
                                 self.hover_cursor_resync_pending = false;
-                                self.hover_cursor_pos = Some(clamp_pos_to_video_rect(
+                                let clamped = clamp_pos_to_video_rect(
                                     relative_capture_entry_anchor(anchor_pos, Some(local_pos))
                                         .unwrap_or(local_pos),
                                     rect,
                                     ctx.pixels_per_point(),
-                                ));
+                                );
+                                self.hover_cursor_pos = Some(clamped);
+                                self.send_relative_warp_to_local(
+                                    client_id,
+                                    clamped,
+                                    rect,
+                                    &snapshot,
+                                );
                                 self.suppress_mouse_delta = true;
                                 ctx.request_repaint();
                             }
@@ -6965,13 +7049,16 @@ mod tests {
     }
 
     #[test]
-    fn relative_capture_entry_prefers_remote_cursor_position() {
+    fn relative_capture_entry_prefers_local_cursor_position() {
         let remote = egui::pos2(100.0, 200.0);
         let local = egui::pos2(800.0, 600.0);
 
+        // Local wins so the overlay doesn't teleport to wherever the server
+        // cursor happens to be when the user enters/clicks the video.  The
+        // server cursor is realigned via a warp delta.
         assert_eq!(
             relative_capture_entry_anchor(Some(remote), Some(local)),
-            Some(remote)
+            Some(local)
         );
     }
 
