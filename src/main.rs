@@ -1585,8 +1585,13 @@ impl StreamApp {
         let pointer_over_local_overlay = pointer_pos
             .map(|pos| self.pointer_over_local_overlay(pos))
             .unwrap_or(false);
+        // 1 logical-pixel tolerance: with fractional DPI scaling the OS can
+        // report pointer positions sub-pixel outside the aspect-fit video_rect
+        // while the user is still pixel-on-edge.  Without slack here,
+        // auto_release_capture fires every other frame and the overlay blinks
+        // (or flips between local pos and server pos with my recent fix).
         let pointer_inside_video_rect = pointer_pos
-            .map(|pos| video_rect.contains(pos))
+            .map(|pos| video_rect.expand(1.0).contains(pos))
             .unwrap_or(false);
         let pointer_over_video = pointer_inside_video_rect && !pointer_over_local_overlay;
         let clicked_video = response.clicked_by(egui::PointerButton::Primary) && pointer_over_video;
@@ -1812,25 +1817,34 @@ impl StreamApp {
                     self.send_absolute_cursor_if_needed(client_id, pos, video_rect);
                 }
             } else {
+                // In every branch: clamp into video_rect rather than dropping on
+                // a sub-pixel `contains` miss.  Auto-release (line 1600-1604)
+                // already handles "pointer genuinely outside the rect" by
+                // changing capture_mode away from HoverAbsolute, so when we
+                // reach this branch we know the pointer is over-video; the only
+                // failure mode of the old filter was sub-pixel boundary noise
+                // that toggled hover_cursor_pos between Some and None each
+                // frame, which made the overlay flip between local and server
+                // positions.
                 let hover_pos = if hover_drag_active {
                     actual_pointer_pos
                         .or(pointer_pos)
-                        .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()))
                         .filter(|pos| !self.pointer_over_local_overlay(*pos))
+                        .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()))
                 } else if self.hover_cursor_resync_pending {
                     self.hover_cursor_pos
-                        .filter(|pos| {
-                            video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
-                        })
+                        .filter(|pos| !self.pointer_over_local_overlay(*pos))
                         .or_else(|| {
-                            actual_pointer_pos.or(pointer_pos).filter(|pos| {
-                                video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
-                            })
+                            actual_pointer_pos
+                                .or(pointer_pos)
+                                .filter(|pos| !self.pointer_over_local_overlay(*pos))
                         })
+                        .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()))
                 } else {
-                    actual_pointer_pos.or(pointer_pos).filter(|pos| {
-                        video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
-                    })
+                    actual_pointer_pos
+                        .or(pointer_pos)
+                        .filter(|pos| !self.pointer_over_local_overlay(*pos))
+                        .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()))
                 };
                 self.hover_cursor_pos = hover_pos;
                 if let (Some(client_id), Some(pos)) = (snapshot.client_id, hover_pos) {
@@ -6231,11 +6245,20 @@ impl eframe::App for StreamApp {
             self.clear_remote_keyboard();
         }
 
-        let video_rect = raw_input
-            .screen_rect
-            .and_then(|rect| self.video_rect_for_container(rect))
-            .or_else(|| self.current_video_rect(ctx))
-            .or(self.last_video_rect);
+        // Match handle_connected_video_response / compute_cursor_overlay_geometry:
+        // they both source video_rect from current_video_rect first.  Using
+        // raw_input.screen_rect here would diverge when egui has any top/bottom
+        // panel margin, causing hover_cursor_pos to toggle Some↔None on
+        // sub-pixel boundary positions and the overlay to flip between local
+        // and server positions.
+        let video_rect = self
+            .current_video_rect(ctx)
+            .or(self.last_video_rect)
+            .or_else(|| {
+                raw_input
+                    .screen_rect
+                    .and_then(|rect| self.video_rect_for_container(rect))
+            });
         let virtual_hover = self.capture_mode == LocalCaptureMode::HoverAbsolute
             && self.uses_virtual_hover_cursor(&snapshot);
         let mut last_pointer_pos = raw_input
@@ -6330,10 +6353,14 @@ impl eframe::App for StreamApp {
                         && controller_state_allows_input(snapshot.controller_state)
                     {
                         if let Some(rect) = video_rect {
+                            // Same 1-pixel tolerance as the auto_release check
+                            // in handle_connected_video_response: a strict
+                            // contains miss on a sub-pixel boundary used to
+                            // fire auto_release here every other frame.
                             if self.pointer_over_local_overlay(pos) {
                                 self.auto_release_capture(false);
                                 ctx.request_repaint();
-                            } else if rect.contains(pos) {
+                            } else if rect.expand(1.0).contains(pos) {
                                 let next_pos =
                                     clamp_pos_to_video_rect(pos, rect, ctx.pixels_per_point());
                                 self.hover_cursor_pos = Some(next_pos);
