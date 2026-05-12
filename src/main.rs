@@ -1372,7 +1372,7 @@ impl StreamApp {
             snap(texture.hotspot.y * display_scale),
         );
 
-        let use_local_cursor_pos = self.capture_mode == LocalCaptureMode::HoverAbsolute
+        let local_cursor_eligible = self.capture_mode == LocalCaptureMode::HoverAbsolute
             || self.resume_hover_after_relative_drag
             || (self.capture_mode == LocalCaptureMode::CapturedRelative
                 && input_snapshot.capabilities.separate_cursor
@@ -1380,12 +1380,17 @@ impl StreamApp {
                 && !matches!(
                     input_snapshot.controller_state,
                     ControllerState::Unavailable | ControllerState::OwnedByOther
-                )
-                && self.hover_cursor_pos.is_some());
-        let (top_left, cursor_pos, using_local_pos) = if use_local_cursor_pos {
-            let pointer_pos = self
-                .hover_cursor_pos
-                .filter(|pos| video_rect.contains(*pos))?;
+                ));
+        // Active local pos wins; server pos is only a last-resort fallback so the
+        // overlay always renders something while overlay_cursor_active hides the
+        // OS cursor.  Never let server pos override an active local pos.
+        let local_pointer_pos = if local_cursor_eligible {
+            self.hover_cursor_pos
+                .filter(|pos| video_rect.contains(*pos))
+        } else {
+            None
+        };
+        let (top_left, cursor_pos, using_local_pos) = if let Some(pointer_pos) = local_pointer_pos {
             (
                 egui::pos2(pointer_pos.x - hotspot.x, pointer_pos.y - hotspot.y),
                 pointer_pos,
@@ -1900,20 +1905,39 @@ impl StreamApp {
             return;
         }
 
-        let Some(pos) = self.hover_cursor_pos else {
-            return;
-        };
         let Some(video_rect) = self.current_video_rect(ctx).or(self.last_video_rect) else {
             return;
         };
         if self.capture_mode != LocalCaptureMode::HoverAbsolute
             || !controller_state_has_separate_cursor(snapshot.controller_state)
             || !snapshot.capabilities.hover_capture
-            || !video_rect.contains(pos)
             || !snapshot.cursor_state.visible
         {
             return;
         }
+        // Active local pos wins; fall back to server cursor_state only when
+        // no local pos is available so the placeholder doesn't disappear
+        // while overlay_cursor_active hides the OS cursor.
+        let pos = self
+            .hover_cursor_pos
+            .filter(|pos| video_rect.contains(*pos))
+            .or_else(|| {
+                let stream_size = self.cursor_space_size()?;
+                if stream_size.x <= 0.0 || stream_size.y <= 0.0 {
+                    return None;
+                }
+                let scale_x = video_rect.width() / stream_size.x;
+                let scale_y = video_rect.height() / stream_size.y;
+                let server = self.server_cursor_stream_top_left(&snapshot);
+                let pos = egui::pos2(
+                    video_rect.left() + server.x * scale_x,
+                    video_rect.top() + server.y * scale_y,
+                );
+                Some(pos).filter(|pos| video_rect.contains(*pos))
+            });
+        let Some(pos) = pos else {
+            return;
+        };
 
         egui::Area::new(egui::Id::new("remote_cursor_fallback_overlay"))
             .order(egui::Order::Tooltip)
