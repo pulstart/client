@@ -56,17 +56,38 @@ pub struct ApiDiscoveryShared {
     tunnel_keys: Mutex<TunnelKeys>,
     /// Derived ChaCha20 shared key from the latest partner key, if available.
     shared_key: Mutex<Option<[u8; 32]>>,
+    /// Cached `CryptoContext` for the current `shared_key`. We hand out the
+    /// same `Arc` to every caller so the AEAD nonce counter is monotonic
+    /// across reconnects; reusing nonce=0 across sessions on the same key
+    /// would let an attacker replay captured client→host packets.
+    crypto: Mutex<Option<Arc<CryptoContext>>>,
     /// Partner (host) NAT candidates parsed as SocketAddr.
     pub partner_candidates: Mutex<Vec<SocketAddr>>,
     /// Process-lifetime UDP socket used for STUN and hole punching.
     punch_socket: Mutex<Option<UdpSocket>>,
     /// Local candidates advertised to the API server (ip:port strings).
     pub punch_candidates: Mutex<Vec<String>>,
+    /// Last time we refreshed `punch_candidates` via STUN. Used to age out
+    /// stale NAT mappings so we don't advertise dead public ip:port pairs.
+    last_stun: Mutex<Option<Instant>>,
+    /// External `ip:port` granted by the router via PCP / NAT-PMP. Independent
+    /// of the STUN-discovered mapping: the router gives us a static
+    /// forwarding rule that survives idle periods AND works on symmetric
+    /// NATs. Refreshed periodically by `start_port_mapping`.
+    portmap_external: Mutex<Option<SocketAddr>>,
     /// Monotonic punch-request nonce sent to the API server.
     next_punch_nonce: AtomicU64,
+    /// True while a punched session owns the punch socket. STUN refresh
+    /// (which would do an unauthenticated recv) is skipped while this is set.
+    punch_session_active: AtomicBool,
     /// Whether the last API request succeeded.
     pub connected: AtomicBool,
 }
+
+/// Refresh STUN-derived candidates if they're older than this. UDP NAT
+/// mappings typically expire after 30–120 s of silence, so 25 s leaves
+/// margin to re-probe before the partner-advertised public address goes dead.
+const STUN_REFRESH_TTL: Duration = Duration::from_secs(25);
 
 impl ApiDiscoveryShared {
     pub fn new(api_url: String, token: String, peer_id: String) -> Self {
@@ -77,20 +98,30 @@ impl ApiDiscoveryShared {
             host: Mutex::new(None),
             tunnel_keys: Mutex::new(TunnelKeys::generate()),
             shared_key: Mutex::new(None),
+            crypto: Mutex::new(None),
             partner_candidates: Mutex::new(Vec::new()),
             punch_socket: Mutex::new(None),
             punch_candidates: Mutex::new(Vec::new()),
+            last_stun: Mutex::new(None),
+            portmap_external: Mutex::new(None),
             next_punch_nonce: AtomicU64::new(1),
+            punch_session_active: AtomicBool::new(false),
             connected: AtomicBool::new(false),
         }
     }
 
-    /// Build a CryptoContext for the client side if a shared key has been negotiated.
+    /// Return the cached `CryptoContext` for the current shared key. Cached
+    /// so the AEAD nonce counter is monotonic across reconnects.
     pub fn crypto_context(&self) -> Option<Arc<CryptoContext>> {
-        self.shared_key
-            .lock()
-            .unwrap()
-            .map(|key| Arc::new(CryptoContext::new(key, false)))
+        let cached = self.crypto.lock().unwrap();
+        if let Some(ctx) = cached.clone() {
+            return Some(ctx);
+        }
+        drop(cached);
+        let key = (*self.shared_key.lock().unwrap())?;
+        let ctx = Arc::new(CryptoContext::new(key, false));
+        *self.crypto.lock().unwrap() = Some(Arc::clone(&ctx));
+        Some(ctx)
     }
 
     /// Clone the process-lifetime punch socket for an individual attempt/session.
@@ -109,6 +140,46 @@ impl ApiDiscoveryShared {
         self.connected.load(Ordering::Relaxed)
     }
 
+    pub fn is_punch_session_active(&self) -> bool {
+        self.punch_session_active.load(Ordering::Relaxed)
+    }
+
+    pub fn set_punch_session_active(&self, active: bool) {
+        self.punch_session_active.store(active, Ordering::Relaxed);
+    }
+
+    /// Record (or clear) the PCP/NAT-PMP-granted external address. Called by
+    /// the port-mapping renewal thread.
+    pub fn set_portmap_external(&self, addr: Option<SocketAddr>) {
+        let mut current = self.portmap_external.lock().unwrap();
+        if *current != addr {
+            *current = addr;
+            if let Some(a) = addr {
+                eprintln!("[portmap] External mapping acquired: {a}");
+            } else {
+                eprintln!("[portmap] External mapping cleared");
+            }
+        }
+    }
+
+    /// Local port that the punch socket is bound to, if known.
+    pub fn punch_socket_port(&self) -> Option<u16> {
+        let guard = self.punch_socket.lock().unwrap();
+        guard.as_ref().and_then(|s| s.local_addr().ok().map(|a| a.port()))
+    }
+
+    /// Append the router-mapped external `ip:port` to the candidate list
+    /// (if any), de-duplicating against existing entries.
+    fn augment_with_portmap(&self, mut candidates: Vec<String>) -> Vec<String> {
+        if let Some(addr) = *self.portmap_external.lock().unwrap() {
+            let c = addr.to_string();
+            if !candidates.contains(&c) {
+                candidates.push(c);
+            }
+        }
+        candidates
+    }
+
     fn public_key_b64(&self) -> String {
         let keys = self.tunnel_keys.lock().unwrap();
         base64_encode(&keys.public_key_bytes())
@@ -120,6 +191,9 @@ impl ApiDiscoveryShared {
             let had_key = current.is_some();
             let has_key = shared_key.is_some();
             *current = shared_key;
+            // The cached CryptoContext is keyed off shared_key — invalidate so
+            // a fresh one is built on next crypto_context() call.
+            *self.crypto.lock().unwrap() = None;
             if has_key && !had_key {
                 eprintln!("[api] Shared key derived");
             }
@@ -150,11 +224,16 @@ impl ApiDiscoveryShared {
 
     fn ensure_punch_socket(&self) -> Result<Vec<String>, String> {
         let has_socket = self.punch_socket.lock().unwrap().is_some();
-        if has_socket {
-            let candidates = self.punch_candidates.lock().unwrap().clone();
-            if !candidates.is_empty() {
-                return Ok(candidates);
-            }
+        let cached = self.punch_candidates.lock().unwrap().clone();
+        let stun_fresh = match *self.last_stun.lock().unwrap() {
+            Some(t) => t.elapsed() < STUN_REFRESH_TTL,
+            None => false,
+        };
+        // Reuse the cached candidate list if it's fresh OR if a live punched
+        // session owns the socket (a STUN recv would steal its packets).
+        let session_active = self.is_punch_session_active();
+        if has_socket && !cached.is_empty() && (stun_fresh || session_active) {
+            return Ok(self.augment_with_portmap(cached));
         }
 
         let mut socket_guard = self.punch_socket.lock().unwrap();
@@ -175,7 +254,8 @@ impl ApiDiscoveryShared {
         drop(socket_guard);
 
         *self.punch_candidates.lock().unwrap() = candidates.clone();
-        Ok(candidates)
+        *self.last_stun.lock().unwrap() = Some(Instant::now());
+        Ok(self.augment_with_portmap(candidates))
     }
 }
 
@@ -246,6 +326,61 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 /// 2. Polls for the host to appear.
 /// 3. Performs X25519 key exchange when the host is online.
 /// 4. Stores the derived shared key and partner candidates.
+/// Spawn a background thread that maintains a PCP/NAT-PMP UDP port mapping
+/// for the punch socket. When the client's router supports either protocol,
+/// this gives the server a directly-reachable `ip:port` regardless of the
+/// client's NAT type — sidestepping symmetric NAT issues entirely on the
+/// client side. Quiet no-op if the gateway speaks neither protocol.
+pub fn start_port_mapping(shared: Arc<ApiDiscoveryShared>) {
+    std::thread::spawn(move || {
+        // Wait for the punch socket to be bound; the renewal task can't
+        // request a forward for a port that doesn't exist yet.
+        let mut internal_port: u16 = loop {
+            if let Some(p) = shared.punch_socket_port() {
+                break p;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        };
+
+        let mut consecutive_failures: u32 = 0;
+        loop {
+            if let Some(p) = shared.punch_socket_port() {
+                internal_port = p;
+            }
+
+            let next_sleep = match st_protocol::portmap::try_acquire(internal_port) {
+                Some(mapping) => {
+                    eprintln!(
+                        "[portmap] {:?} mapping {} (lease {}s)",
+                        mapping.method,
+                        mapping.external_addr,
+                        mapping.lifetime.as_secs()
+                    );
+                    shared.set_portmap_external(Some(mapping.external_addr));
+                    consecutive_failures = 0;
+                    // Renew at lifetime/2, clamped to [60s, 30min] so we don't
+                    // spin too fast on tiny leases or wait too long on huge ones.
+                    let half = mapping.lifetime / 2;
+                    half.clamp(Duration::from_secs(60), Duration::from_secs(1800))
+                }
+                None => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    // Don't drop a previously-good mapping on a single timeout.
+                    if consecutive_failures >= 2 {
+                        shared.set_portmap_external(None);
+                    }
+                    match consecutive_failures {
+                        0..=1 => Duration::from_secs(60),
+                        2..=4 => Duration::from_secs(300),
+                        _ => Duration::from_secs(900),
+                    }
+                }
+            };
+            std::thread::sleep(next_sleep);
+        }
+    });
+}
+
 pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::Context) {
     std::thread::spawn(move || {
         let peer_id = shared.peer_id.lock().unwrap().clone();

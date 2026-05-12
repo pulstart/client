@@ -267,7 +267,17 @@ fn addr_ip(addr: &str) -> Option<std::net::IpAddr> {
 
 fn is_privateish_ip(ip: std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        std::net::IpAddr::V4(v4) => {
+            if v4.is_private() || v4.is_loopback() || v4.is_link_local() {
+                return true;
+            }
+            // CGNAT range (100.64.0.0/10), which includes Tailscale's typical
+            // address space. stdlib's Ipv4Addr::is_private() doesn't cover it,
+            // and we don't want hole-punch fallback firing on a Tailscale IP
+            // since punching to a CGNAT address has no chance of working.
+            let o = v4.octets();
+            o[0] == 100 && (64..=127).contains(&o[1])
+        }
         std::net::IpAddr::V6(v6) => {
             v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
         }
@@ -629,6 +639,11 @@ impl StreamApp {
             peer_id,
         ));
         api_client::start_api_discovery(Arc::clone(&api_discovery), cc.egui_ctx.clone());
+        // Ask the client's router for an explicit external port forward
+        // (PCP / NAT-PMP). When successful, the resulting candidate works
+        // even on symmetric NATs and survives idle periods. Quiet no-op
+        // if the gateway speaks neither protocol.
+        api_client::start_port_mapping(Arc::clone(&api_discovery));
         Self {
             server_addr: String::new(),
             server_list,
@@ -4242,6 +4257,18 @@ fn run_punched_session(
         "[punch] Attempting hole punch to {} candidates...",
         partner_candidates.len()
     );
+    // Mark the punch socket as in-use for the duration of this session so
+    // the background API thread doesn't try to re-STUN on it (its recv would
+    // steal session packets).
+    struct PunchSessionGuard(Arc<api_client::ApiDiscoveryShared>);
+    impl Drop for PunchSessionGuard {
+        fn drop(&mut self) {
+            self.0.set_punch_session_active(false);
+        }
+    }
+    api_discovery.set_punch_session_active(true);
+    let _session_guard = PunchSessionGuard(Arc::clone(&api_discovery));
+
     let peer = match st_protocol::tunnel::hole_punch(
         &socket,
         &partner_candidates,
