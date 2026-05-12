@@ -17,11 +17,11 @@ const MAX_OPUS_FRAME_SAMPLES: usize = 5760;
 /// Conceal up to 60ms of consecutive missing packets before resyncing.
 const MAX_CONCEALED_AUDIO_PACKETS: usize = 3;
 const AUDIO_PACKET_DURATION_MS: usize = 20;
-/// Steady-state playback buffer. One packet of jitter cushion on top of the
+/// Steady-state playback buffer. Two packets of jitter cushion on top of the
 /// 20ms producer cadence. Tuned for game-streaming latency, not studio audio.
-const DEFAULT_TARGET_BUFFER_MS: usize = 40;
+const DEFAULT_TARGET_BUFFER_MS: usize = 60;
 /// Upper bound on the playback buffer before draining excess samples.
-const DEFAULT_MAX_BUFFER_MS: usize = 100;
+const DEFAULT_MAX_BUFFER_MS: usize = 140;
 /// Channel backlog before the decode thread drops stale packets. Loose enough
 /// that normal scheduler bursts (3-4 packets arriving together) don't trigger
 /// a drop; tight enough that a real stall doesn't accumulate audible latency.
@@ -30,11 +30,21 @@ const DEFAULT_MAX_QUEUED_PACKETS: usize = 4;
 /// the last real sample toward silence over ~30ms instead of slamming to zero,
 /// which removes the audible click at the boundary.
 const SILENCE_DECAY_PER_SAMPLE: f32 = 0.995;
+/// Crossfade window applied across any known waveform discontinuity (underrun,
+/// mid-buffer trim, large packet gap, concealment-to-primary boundary). ~2ms
+/// at 48kHz interleaved stereo — short enough to be inaudible as delay, long
+/// enough to mask a sample-level jump as a smooth ramp.
+const CROSSFADE_SAMPLES: usize = 192;
 
 struct PlaybackBuffer {
     samples: VecDeque<f32>,
     primed: bool,
     last_sample: f32,
+    /// Set when the next chunk pushed into `samples` is known to start at a
+    /// value that may not match what cpal last emitted (or what is currently
+    /// at the back of the buffer). The next decode applies a crossfade ramp
+    /// over [`CROSSFADE_SAMPLES`] to mask the jump.
+    needs_crossfade: bool,
 }
 
 pub fn run_audio_pipeline(
@@ -75,6 +85,7 @@ pub fn run_audio_pipeline(
         samples: VecDeque::with_capacity(max_buffer_samples),
         primed: false,
         last_sample: 0.0,
+        needs_crossfade: false,
     }));
     let ring_cb = Arc::clone(&ring);
     let last_sample_bits = Arc::new(AtomicU32::new(0.0f32.to_bits()));
@@ -112,6 +123,7 @@ pub fn run_audio_pipeline(
                             *sample = next;
                         } else {
                             buf.primed = false;
+                            buf.needs_crossfade = true;
                             *sample = buf.last_sample;
                             buf.last_sample *= SILENCE_DECAY_PER_SAMPLE;
                         }
@@ -227,6 +239,11 @@ pub fn run_audio_pipeline(
                             }
                         }
 
+                        // PLC / FEC / redundancy tails may not perfectly match
+                        // the next real packet's first sample. Crossfade the
+                        // boundary on the upcoming primary push.
+                        mark_needs_crossfade(&ring);
+
                         if trace && concealment_logs < 12 {
                             eprintln!(
                                 "[trace][audio] recovered {} missing packet(s) before seq={} via redundancy={} fec={} plc={}",
@@ -240,6 +257,9 @@ pub fn run_audio_pipeline(
                         }
                     } else {
                         expected_seq = None;
+                        // Hard resync — buffer (if any) ends at one waveform,
+                        // primary starts at another. Crossfade the join.
+                        mark_needs_crossfade(&ring);
                         if trace && concealment_logs < 12 {
                             eprintln!(
                                 "[trace][audio] large audio gap ({} packets), resyncing at seq={}",
@@ -341,6 +361,7 @@ fn trim_playback_buffer(
 ) {
     let mut playback = ring.lock().unwrap();
     let to_drop = dropped_samples.min(playback.samples.len());
+    let did_drop = to_drop > 0 || dropped_samples > to_drop;
     if to_drop > 0 {
         playback.samples.drain(..to_drop);
     }
@@ -349,9 +370,46 @@ fn trim_playback_buffer(
     }
     if playback.samples.is_empty() {
         playback.primed = false;
+        if did_drop {
+            // Next push will need to ramp from buf.last_sample.
+            playback.needs_crossfade = true;
+        }
     } else if playback.samples.len() > target_buffer_samples.saturating_mul(2) {
         let trim_extra = playback.samples.len() - target_buffer_samples.saturating_mul(2);
         playback.samples.drain(..trim_extra);
+        crossfade_buffer_front(&mut playback);
+    } else if did_drop {
+        crossfade_buffer_front(&mut playback);
+    }
+}
+
+fn crossfade_buffer_front(playback: &mut PlaybackBuffer) {
+    let len = playback.samples.len().min(CROSSFADE_SAMPLES);
+    if len == 0 {
+        return;
+    }
+    let anchor = playback.last_sample;
+    for i in 0..len {
+        let t = (i + 1) as f32 / len as f32;
+        let v = playback.samples[i];
+        playback.samples[i] = anchor * (1.0 - t) + v * t;
+    }
+}
+
+fn mark_needs_crossfade(ring: &Arc<Mutex<PlaybackBuffer>>) {
+    if let Ok(mut playback) = ring.lock() {
+        playback.needs_crossfade = true;
+    }
+}
+
+fn apply_crossfade_ramp(chunk: &mut [f32], anchor: f32) {
+    let len = chunk.len().min(CROSSFADE_SAMPLES);
+    if len == 0 {
+        return;
+    }
+    for i in 0..len {
+        let t = (i + 1) as f32 / len as f32;
+        chunk[i] = anchor * (1.0 - t) + chunk[i] * t;
     }
 }
 
@@ -367,6 +425,18 @@ fn decode_and_enqueue(
     let samples_per_channel = decoder.decode_float(opus_data, pcm_buf, fec)?;
     let total = samples_per_channel * CHANNELS as usize;
     let mut playback = ring.lock().unwrap();
+    if total > 0 && playback.needs_crossfade {
+        // Anchor on the actual sample cpal will emit just before this chunk:
+        // the back of the buffer if non-empty, otherwise the cpal's last
+        // emitted sample (which has been decaying during the underrun).
+        let anchor = playback
+            .samples
+            .back()
+            .copied()
+            .unwrap_or(playback.last_sample);
+        apply_crossfade_ramp(&mut pcm_buf[..total], anchor);
+        playback.needs_crossfade = false;
+    }
     playback.samples.extend(&pcm_buf[..total]);
     if playback.samples.len() > max_buffer_samples {
         let retain = target_buffer_samples
