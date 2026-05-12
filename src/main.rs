@@ -4490,12 +4490,35 @@ fn run_punched_session(
         Arc::clone(&ft_shared_state),
         suppressed_paths,
     );
+
+    // UDP gives no FIN; if the server vanishes (crash, network loss) nothing tells
+    // us. The server pushes video every frame plus periodic control traffic, so a
+    // few seconds of silence means it's gone — break out instead of sitting on a
+    // dead session forever. Symmetric to the inactivity timeout in the host's
+    // handle_punched_client loop.
+    const PUNCHED_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(5);
+    let mut last_peer_activity = Instant::now();
+
     loop {
         if session_cancelled(
             disconnect.as_ref(),
             connection_epoch.as_ref(),
             session_epoch,
         ) {
+            break;
+        }
+        if last_peer_activity.elapsed() > PUNCHED_INACTIVITY_TIMEOUT {
+            set_error(
+                &state,
+                &ctx,
+                &disconnect,
+                &connection_epoch,
+                session_epoch,
+                format!(
+                    "Server unreachable: no traffic for {}s",
+                    PUNCHED_INACTIVITY_TIMEOUT.as_secs()
+                ),
+            );
             break;
         }
 
@@ -4585,6 +4608,7 @@ fn run_punched_session(
                 break;
             }
             did_work = true;
+            last_peer_activity = Instant::now();
             for msg in incoming {
                 match msg {
                     PunchedMessage::Media(data) => {
