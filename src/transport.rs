@@ -1,7 +1,5 @@
 use crossbeam_channel::{Receiver as PacketChannel, TryRecvError};
-use st_protocol::packet::{
-    AudioRedundancyMeta, PacketHeader, PayloadType, AUDIO_REDUNDANCY_HEADER_SIZE, HEADER_SIZE,
-};
+use st_protocol::packet::{parse_audio_packet, PacketHeader, PayloadType, HEADER_SIZE};
 use st_protocol::tunnel::CryptoContext;
 use st_protocol::{CompletedFrame, FrameAssembler, TransportFeedback};
 use std::collections::VecDeque;
@@ -269,7 +267,9 @@ mod linux_batch {
 pub struct AudioPacket {
     pub seq: u16,
     pub data: Vec<u8>,
-    pub redundant_prev: Option<Vec<u8>>,
+    /// Redundant copies of previous opus packets, oldest-first.
+    /// `redundant_prev[i]` is the opus packet at seq `self.seq - (len - i)`.
+    pub redundant_prev: Vec<Vec<u8>>,
 }
 
 pub enum ReceivedData {
@@ -699,20 +699,15 @@ impl PacketProcessor {
             if header.payload_type == PayloadType::Audio {
                 if raw_len > HEADER_SIZE {
                     let payload = &raw[HEADER_SIZE..];
-                    let (data, redundant_prev) = if let Some(meta) =
-                        AudioRedundancyMeta::deserialize(payload)
-                    {
-                        let primary_start = AUDIO_REDUNDANCY_HEADER_SIZE;
-                        let primary_end = payload.len().saturating_sub(meta.redundant_len as usize);
-                        let primary = payload[primary_start..primary_end].to_vec();
-                        let redundant_prev = if meta.redundant_len > 0 {
-                            Some(payload[primary_end..].to_vec())
-                        } else {
-                            None
-                        };
-                        (primary, redundant_prev)
+                    let (data, redundant_prev) = if let Some(view) = parse_audio_packet(payload) {
+                        let redundant_prev = view
+                            .redundant
+                            .iter()
+                            .map(|chunk| chunk.to_vec())
+                            .collect();
+                        (view.primary.to_vec(), redundant_prev)
                     } else {
-                        (payload.to_vec(), None)
+                        (payload.to_vec(), Vec::new())
                     };
                     self.feedback.received_bytes =
                         self.feedback.received_bytes.saturating_add(raw_len as u64);

@@ -148,31 +148,21 @@ pub fn run_audio_pipeline(
             if delta != 0 {
                 if delta < 0x8000 {
                     let missing_packets = delta as usize;
-                    let plc_packets = missing_packets.saturating_sub(1);
-                    if plc_packets <= MAX_CONCEALED_AUDIO_PACKETS {
-                        let mut recovered_packets = 0usize;
-                        for _ in 0..plc_packets {
-                            if decode_and_enqueue(
-                                &mut decoder,
-                                &[],
-                                false,
-                                &mut pcm_buf,
-                                &ring,
-                                target_buffer_samples,
-                                max_buffer_samples,
-                            )
-                            .is_ok()
-                            {
-                                recovered_packets += 1;
-                            }
-                        }
-
-                        let mut recovery_mode = "plc";
-                        let recovered_last_missing =
-                            if let Some(redundant_prev) = packet.redundant_prev.as_deref() {
+                    if missing_packets <= MAX_CONCEALED_AUDIO_PACKETS {
+                        let redundancy_count = packet.redundant_prev.len();
+                        let mut via_redundancy = 0usize;
+                        let mut via_fec = 0usize;
+                        let mut via_plc = 0usize;
+                        for i in 0..missing_packets {
+                            // distance_from_primary in 1..=missing_packets;
+                            // 1 = the slot immediately before the primary packet.
+                            let distance_from_primary = (missing_packets - i) as u16;
+                            let mut decoded = false;
+                            if (distance_from_primary as usize) <= redundancy_count {
+                                let idx = redundancy_count - distance_from_primary as usize;
                                 if decode_and_enqueue(
                                     &mut decoder,
-                                    redundant_prev,
+                                    &packet.redundant_prev[idx],
                                     false,
                                     &mut pcm_buf,
                                     &ring,
@@ -181,9 +171,14 @@ pub fn run_audio_pipeline(
                                 )
                                 .is_ok()
                                 {
-                                    recovery_mode = "redundancy";
-                                    true
-                                } else if decode_and_enqueue(
+                                    via_redundancy += 1;
+                                    decoded = true;
+                                }
+                            }
+                            // Slot immediately before the primary is also
+                            // recoverable from the primary's in-band LBRR FEC.
+                            if !decoded && distance_from_primary == 1 {
+                                if decode_and_enqueue(
                                     &mut decoder,
                                     &packet.data,
                                     true,
@@ -194,35 +189,12 @@ pub fn run_audio_pipeline(
                                 )
                                 .is_ok()
                                 {
-                                    recovery_mode = "fec";
-                                    true
-                                } else {
-                                    decode_and_enqueue(
-                                        &mut decoder,
-                                        &[],
-                                        false,
-                                        &mut pcm_buf,
-                                        &ring,
-                                        target_buffer_samples,
-                                        max_buffer_samples,
-                                    )
-                                    .is_ok()
+                                    via_fec += 1;
+                                    decoded = true;
                                 }
-                            } else if decode_and_enqueue(
-                                &mut decoder,
-                                &packet.data,
-                                true,
-                                &mut pcm_buf,
-                                &ring,
-                                target_buffer_samples,
-                                max_buffer_samples,
-                            )
-                            .is_ok()
-                            {
-                                recovery_mode = "fec";
-                                true
-                            } else {
-                                decode_and_enqueue(
+                            }
+                            if !decoded {
+                                if decode_and_enqueue(
                                     &mut decoder,
                                     &[],
                                     false,
@@ -232,15 +204,20 @@ pub fn run_audio_pipeline(
                                     max_buffer_samples,
                                 )
                                 .is_ok()
-                            };
-                        if recovered_last_missing {
-                            recovered_packets += 1;
+                                {
+                                    via_plc += 1;
+                                }
+                            }
                         }
 
                         if trace && concealment_logs < 12 {
                             eprintln!(
-                                "[trace][audio] recovered {} missing packet(s) before seq={} via {}",
-                                recovered_packets, packet.seq, recovery_mode
+                                "[trace][audio] recovered {} missing packet(s) before seq={} via redundancy={} fec={} plc={}",
+                                via_redundancy + via_fec + via_plc,
+                                packet.seq,
+                                via_redundancy,
+                                via_fec,
+                                via_plc
                             );
                             concealment_logs += 1;
                         }
