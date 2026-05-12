@@ -17,9 +17,19 @@ const MAX_OPUS_FRAME_SAMPLES: usize = 5760;
 /// Conceal up to 60ms of consecutive missing packets before resyncing.
 const MAX_CONCEALED_AUDIO_PACKETS: usize = 3;
 const AUDIO_PACKET_DURATION_MS: usize = 20;
-const DEFAULT_TARGET_BUFFER_MS: usize = 20;
-const DEFAULT_MAX_BUFFER_MS: usize = 60;
-const DEFAULT_MAX_QUEUED_PACKETS: usize = 2;
+/// Steady-state playback buffer. One packet of jitter cushion on top of the
+/// 20ms producer cadence. Tuned for game-streaming latency, not studio audio.
+const DEFAULT_TARGET_BUFFER_MS: usize = 40;
+/// Upper bound on the playback buffer before draining excess samples.
+const DEFAULT_MAX_BUFFER_MS: usize = 100;
+/// Channel backlog before the decode thread drops stale packets. Loose enough
+/// that normal scheduler bursts (3-4 packets arriving together) don't trigger
+/// a drop; tight enough that a real stall doesn't accumulate audible latency.
+const DEFAULT_MAX_QUEUED_PACKETS: usize = 4;
+/// Per-sample decay applied during underruns and brief lock contention. Fades
+/// the last real sample toward silence over ~30ms instead of slamming to zero,
+/// which removes the audible click at the boundary.
+const SILENCE_DECAY_PER_SAMPLE: f32 = 0.995;
 
 struct PlaybackBuffer {
     samples: VecDeque<f32>,
@@ -79,10 +89,15 @@ pub fn run_audio_pipeline(
                 let mut buf = match ring_cb.try_lock() {
                     Ok(b) => b,
                     Err(_) => {
-                        let held = f32::from_bits(last_sample_bits_cb.load(Ordering::Relaxed));
+                        // Real-time callback can't block. Fade from the last
+                        // real sample toward silence so brief contention sounds
+                        // like a dip, not a DC step or a click.
+                        let mut held = f32::from_bits(last_sample_bits_cb.load(Ordering::Relaxed));
                         for sample in output.iter_mut() {
                             *sample = held;
+                            held *= SILENCE_DECAY_PER_SAMPLE;
                         }
+                        last_sample_bits_cb.store(held.to_bits(), Ordering::Relaxed);
                         return;
                     }
                 };
@@ -98,9 +113,11 @@ pub fn run_audio_pipeline(
                         } else {
                             buf.primed = false;
                             *sample = buf.last_sample;
+                            buf.last_sample *= SILENCE_DECAY_PER_SAMPLE;
                         }
                     } else {
-                        *sample = 0.0;
+                        *sample = buf.last_sample;
+                        buf.last_sample *= SILENCE_DECAY_PER_SAMPLE;
                     }
                 }
             },

@@ -1659,6 +1659,12 @@ impl StreamApp {
                 }
                 self.await_pointer_exit_after_auto_release = false;
                 self.pending_capture_click = false;
+            } else {
+                // ControllerState / InputCapabilities haven't landed yet
+                // (TCP control messages arrive after StreamStarted).  Remember
+                // the click so we re-evaluate capture once the controller
+                // transitions out of Unavailable.
+                self.pending_capture_click = true;
             }
             ctx.request_repaint();
         }
