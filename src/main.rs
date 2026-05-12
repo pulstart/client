@@ -1102,10 +1102,16 @@ impl StreamApp {
                         ctx.input(|i| i.pointer.latest_pos())
                     }
                 });
+                // 1 logical-pixel tolerance matches the other contains checks
+                // (handle_connected_video_response, raw_input_hook).  Without
+                // it, on fractional-DPI boundary frames the OS cursor would
+                // reappear briefly while the custom overlay is still drawn —
+                // exactly the "jumping" symptom.
                 pointer_pos
                     .zip(self.current_video_rect(ctx).or(self.last_video_rect))
                     .map(|(pointer_pos, rect)| {
-                        rect.contains(pointer_pos) && !self.pointer_over_local_overlay(pointer_pos)
+                        rect.expand(1.0).contains(pointer_pos)
+                            && !self.pointer_over_local_overlay(pointer_pos)
                     })
                     .unwrap_or(false)
             }
@@ -1338,7 +1344,17 @@ impl StreamApp {
         }
         if !controller_state_has_separate_cursor(input_snapshot.controller_state)
             || !input_snapshot.capabilities.separate_cursor
-            || !input_snapshot.cursor_state.visible
+        {
+            return None;
+        }
+        // In CapturedRelative the server owns the cursor (a game may have
+        // grabbed it for mouselook) so we honor cursor_state.visible.  In
+        // HoverAbsolute the client owns the cursor — transient `visible=false`
+        // pulses from the compositor would otherwise make the overlay blink
+        // out and back on, which reads as "jumping / changing shape" since the
+        // texture cache may have rotated by the time it reappears.
+        if self.capture_mode == LocalCaptureMode::CapturedRelative
+            && !input_snapshot.cursor_state.visible
         {
             return None;
         }
@@ -1925,10 +1941,13 @@ impl StreamApp {
         if self.capture_mode != LocalCaptureMode::HoverAbsolute
             || !controller_state_has_separate_cursor(snapshot.controller_state)
             || !snapshot.capabilities.hover_capture
-            || !snapshot.cursor_state.visible
         {
             return;
         }
+        // Same reasoning as compute_cursor_overlay_geometry: in HoverAbsolute
+        // the client owns the cursor, so don't gate the placeholder on
+        // cursor_state.visible — that flag flickers on some compositors and
+        // we'd otherwise leave the OS cursor hidden with nothing drawn.
         // Active local pos wins; fall back to server cursor_state only when
         // no local pos is available so the placeholder doesn't disappear
         // while overlay_cursor_active hides the OS cursor.
