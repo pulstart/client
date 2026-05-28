@@ -217,7 +217,11 @@ struct StreamApp {
     applied_cursor_visible: Option<bool>,
     applied_cursor_grab: Option<egui::CursorGrab>,
     pending_wheel_units: egui::Vec2,
-    suppress_mouse_delta: bool,
+    /// Number of upcoming frames whose `MouseMoved` deltas must be dropped.
+    /// Set on every `CursorGrab` change because locking/warping the pointer
+    /// makes the OS emit a spurious recentering delta that can land one or two
+    /// frames late; a single-frame skip is not enough to catch it.
+    suppress_mouse_delta: u8,
     suppress_pointer_pos_frames: u8,
     excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
     file_transfer_state: file_transfer::SharedTransferState,
@@ -722,7 +726,7 @@ impl StreamApp {
             applied_cursor_visible: None,
             applied_cursor_grab: None,
             pending_wheel_units: egui::Vec2::ZERO,
-            suppress_mouse_delta: false,
+            suppress_mouse_delta: 0,
             suppress_pointer_pos_frames: 0,
             excluded_video_codecs: Arc::new(Mutex::new(st_protocol::VideoCodecSupport::empty())),
             file_transfer_state: file_transfer::new_shared_state(),
@@ -1236,7 +1240,7 @@ impl StreamApp {
         }
         if self.applied_cursor_grab != Some(cursor_grab) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(cursor_grab));
-            self.suppress_mouse_delta = true;
+            self.suppress_mouse_delta = 2;
             self.suppress_pointer_pos_frames = 2;
             self.applied_cursor_grab = Some(cursor_grab);
         }
@@ -1765,8 +1769,16 @@ impl StreamApp {
         // Track how long the server has reported the cursor hidden. A game that
         // grabs the pointer for mouselook hides it; that is our signal to switch
         // into relative capture (and back out when it reappears).
+        // Only honor a hidden cursor once the server has actually sent at least
+        // one real CursorState (version > 0). The client's initial cursor_state
+        // defaults to visible=false, and the server suppresses the all-zero
+        // default, so without this guard the client misreads its own
+        // uninitialized state as "a game hid the cursor" and locks itself into
+        // relative capture on connect — pointer grabbed and no cursor drawn,
+        // with no way to leave the window short of force-release.
         let server_cursor_hidden = separate_cursor
             && controller_state_has_separate_cursor(snapshot.controller_state)
+            && snapshot.cursor_state_version > 0
             && !snapshot.cursor_state.visible;
         if server_cursor_hidden {
             self.cursor_hidden_frames = self.cursor_hidden_frames.saturating_add(1);
@@ -5927,6 +5939,7 @@ impl eframe::App for StreamApp {
         self.keep_awake
             .set_active(matches!(state, ConnectionState::Connected));
         self.suppress_pointer_pos_frames = self.suppress_pointer_pos_frames.saturating_sub(1);
+        self.suppress_mouse_delta = self.suppress_mouse_delta.saturating_sub(1);
         self.apply_pointer_capture_mode(ctx);
         self.sync_remote_cursor_texture(ctx);
         self.video_texture.set_windows_overlayless_preferred(
@@ -6317,7 +6330,7 @@ impl eframe::App for StreamApp {
                     }
                 }
                 egui::Event::MouseMoved(delta) => {
-                    if self.suppress_mouse_delta {
+                    if self.suppress_mouse_delta > 0 {
                         continue;
                     }
                     if self.capture_mode == LocalCaptureMode::CapturedRelative
@@ -6673,8 +6686,6 @@ impl eframe::App for StreamApp {
                 _ => {}
             }
         }
-
-        self.suppress_mouse_delta = false;
 
         if keyboard_dirty {
             self.send_keyboard_snapshot(client_id);
