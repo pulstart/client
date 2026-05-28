@@ -66,8 +66,17 @@ const MAX_REMOTE_CURSOR_TEXTURES: usize = 8;
 const INPUT_SENDER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const INPUT_STATE_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
 const INPUT_STATE_REPAIR_WINDOW: Duration = Duration::from_millis(200);
-const HOVER_EDGE_MISMATCH_UPDATES_THRESHOLD: u8 = 6;
-const LOCAL_CURSOR_PREDICTION_HOLD: Duration = Duration::from_millis(80);
+/// Consecutive frames the server must report the cursor hidden before the
+/// client switches into relative game capture (mouselook). Debounced so a
+/// single `visible=false` pulse from the compositor does not lock the pointer
+/// during ordinary desktop use.
+const CURSOR_HIDDEN_CAPTURE_FRAMES: u8 = 4;
+/// How long a locally-predicted cursor position is trusted for the relative
+/// (game) overlay before it re-anchors to the server-reported position. Long
+/// enough to bridge the gap between consecutive mouse-move events at low poll
+/// rates, short enough that the overlay snaps back to where clicks actually
+/// land shortly after the user stops moving.
+const LOCAL_CURSOR_PREDICTION_TTL: Duration = Duration::from_millis(120);
 
 fn trace_enabled() -> bool {
     std::env::var_os("ST_TRACE").is_some()
@@ -172,12 +181,28 @@ struct StreamApp {
     pending_capture_click: bool,
     last_video_rect: Option<egui::Rect>,
     last_sent_absolute_cursor: Option<(u16, u16)>,
+    // Local pointer position used to draw the remote cursor overlay in Desktop
+    // (HoverAbsolute) mode. In Desktop mode the drawn cursor is *always* the
+    // local pointer position — the server's reported cursor position is never
+    // read back to place it, which is what eliminates the position feedback
+    // loop and the cursor "jumping".
     hover_cursor_pos: Option<egui::Pos2>,
-    last_local_cursor_prediction_at: Option<Instant>,
+    // Consecutive frames the server has reported the cursor hidden. Drives the
+    // automatic Desktop -> Game (relative mouselook) capture transition.
+    cursor_hidden_frames: u8,
+    // Game (CapturedRelative) sub-state: true while a hidden-cursor button drag
+    // temporarily promoted Desktop hover into relative capture. On button
+    // release we drop straight back to HoverAbsolute instead of staying locked.
     resume_hover_after_relative_drag: bool,
+    // Set when we re-enter Desktop hover and must force a one-shot absolute
+    // resync so the server cursor snaps to the local overlay even if the pointer
+    // is stationary (no PointerMoved event to trigger the usual send).
     hover_cursor_resync_pending: bool,
-    hover_drag_edge_mismatch_updates: u8,
-    hover_drag_edge_mismatch_cursor_state_version: u64,
+    // When the relative-mode overlay was last advanced from a locally predicted
+    // delta. While this is recent the overlay is drawn at the predicted local
+    // position (1:1, no network latency); once it goes stale the overlay
+    // re-anchors to the server-reported cursor so clicks land where it is drawn.
+    last_local_cursor_prediction_at: Option<Instant>,
     remote_cursor_textures: BTreeMap<u64, RemoteCursorTexture>,
     latest_remote_cursor_serial: Option<u64>,
     seen_cursor_shape_version: u64,
@@ -679,11 +704,10 @@ impl StreamApp {
             last_video_rect: None,
             last_sent_absolute_cursor: None,
             hover_cursor_pos: None,
-            last_local_cursor_prediction_at: None,
+            cursor_hidden_frames: 0,
             resume_hover_after_relative_drag: false,
             hover_cursor_resync_pending: false,
-            hover_drag_edge_mismatch_updates: 0,
-            hover_drag_edge_mismatch_cursor_state_version: 0,
+            last_local_cursor_prediction_at: None,
             remote_cursor_textures: BTreeMap::new(),
             latest_remote_cursor_serial: None,
             seen_cursor_shape_version: 0,
@@ -725,12 +749,11 @@ impl StreamApp {
         self.last_video_rect = None;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
-        self.last_local_cursor_prediction_at = None;
         self.pending_wheel_units = egui::Vec2::ZERO;
+        self.cursor_hidden_frames = 0;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
-        self.hover_drag_edge_mismatch_updates = 0;
-        self.hover_drag_edge_mismatch_cursor_state_version = 0;
+        self.last_local_cursor_prediction_at = None;
         self.await_pointer_exit_after_auto_release = false;
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
@@ -810,12 +833,8 @@ impl StreamApp {
         self.last_video_rect = None;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
-        self.last_local_cursor_prediction_at = None;
         self.pending_wheel_units = egui::Vec2::ZERO;
-        self.resume_hover_after_relative_drag = false;
-        self.hover_cursor_resync_pending = false;
-        self.hover_drag_edge_mismatch_updates = 0;
-        self.hover_drag_edge_mismatch_cursor_state_version = 0;
+        self.cursor_hidden_frames = 0;
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
         self.seen_cursor_shape_version = 0;
@@ -833,12 +852,11 @@ impl StreamApp {
         self.pending_capture_click = false;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
-        self.last_local_cursor_prediction_at = None;
         self.pending_wheel_units = egui::Vec2::ZERO;
+        self.cursor_hidden_frames = 0;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
-        self.hover_drag_edge_mismatch_updates = 0;
-        self.hover_drag_edge_mismatch_cursor_state_version = 0;
+        self.last_local_cursor_prediction_at = None;
         self.await_pointer_exit_after_auto_release = false;
     }
 
@@ -853,15 +871,38 @@ impl StreamApp {
         self.last_video_rect = None;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
-        self.last_local_cursor_prediction_at = None;
         self.pending_wheel_units = egui::Vec2::ZERO;
-        self.resume_hover_after_relative_drag = false;
-        self.hover_cursor_resync_pending = false;
-        self.hover_drag_edge_mismatch_updates = 0;
-        self.hover_drag_edge_mismatch_cursor_state_version = 0;
+        self.cursor_hidden_frames = 0;
         self.menu_open = false;
         self.await_pointer_exit_after_auto_release = false;
         self.local_overlay_hit_rects.clear();
+    }
+
+    /// Entering relative (game) capture by click on a relative-only backend
+    /// (no absolute injection): anchor the rendered overlay at the local pointer
+    /// and warp the server cursor to match, so the cursor does not teleport to
+    /// the server-reported position on entry. Subsequent relative deltas keep
+    /// both aligned.
+    fn anchor_relative_capture_to_local(
+        &mut self,
+        ctx: &egui::Context,
+        video_rect: egui::Rect,
+        pointer_pos: Option<egui::Pos2>,
+        snapshot: &input::SharedInputSnapshot,
+    ) {
+        let Some(client_id) = snapshot.client_id else {
+            return;
+        };
+        let local = pointer_pos
+            .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()));
+        let remote = self.mapped_server_cursor_video_pos(snapshot, video_rect);
+        if let Some(anchor) = relative_capture_entry_anchor(remote, local) {
+            self.hover_cursor_pos = Some(anchor);
+            self.last_local_cursor_prediction_at = Some(Instant::now());
+        }
+        if let Some(local) = local {
+            self.send_relative_warp_to_local(client_id, local, video_rect, snapshot);
+        }
     }
 
     fn force_release_capture(&mut self) {
@@ -870,11 +911,10 @@ impl StreamApp {
         self.pointer_buttons = 0;
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
-        self.last_local_cursor_prediction_at = None;
+        self.cursor_hidden_frames = 0;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
-        self.hover_drag_edge_mismatch_updates = 0;
-        self.hover_drag_edge_mismatch_cursor_state_version = 0;
+        self.last_local_cursor_prediction_at = None;
         self.await_pointer_exit_after_auto_release = false;
         self.clear_remote_keyboard();
         if let Some(client_id) = self.shared_input.snapshot().client_id {
@@ -1087,14 +1127,29 @@ impl StreamApp {
             .and_then(|serial| self.remote_cursor_textures.get(&serial))
     }
 
+    /// True when the client is drawing its own remote-cursor overlay this
+    /// frame and the OS cursor should therefore be hidden.
     fn overlay_cursor_active(&self, ctx: &egui::Context) -> bool {
         let snapshot = self.shared_input.snapshot();
-        if !controller_state_has_separate_cursor(snapshot.controller_state) {
+        if !controller_state_has_separate_cursor(snapshot.controller_state)
+            || !snapshot.capabilities.separate_cursor
+        {
+            return false;
+        }
+        // We only draw a custom cursor when we actually have its shape; without
+        // one we leave the native OS cursor visible so there is always exactly
+        // one cursor on screen.
+        if self
+            .remote_cursor_texture_for_serial(snapshot.cursor_state.serial)
+            .is_none()
+        {
             return false;
         }
 
         match self.capture_mode {
             LocalCaptureMode::HoverAbsolute => {
+                // Desktop: drawn at the local pointer position. Active whenever
+                // that pointer is over the video and not over the local HUD.
                 let pointer_pos = self.hover_cursor_pos.or_else(|| {
                     if self.uses_virtual_hover_cursor(&snapshot) {
                         None
@@ -1102,11 +1157,8 @@ impl StreamApp {
                         ctx.input(|i| i.pointer.latest_pos())
                     }
                 });
-                // 1 logical-pixel tolerance matches the other contains checks
-                // (handle_connected_video_response, raw_input_hook).  Without
-                // it, on fractional-DPI boundary frames the OS cursor would
-                // reappear briefly while the custom overlay is still drawn —
-                // exactly the "jumping" symptom.
+                // 1 logical-pixel tolerance avoids the OS cursor flickering back
+                // on sub-pixel/fractional-DPI boundary frames.
                 pointer_pos
                     .zip(self.current_video_rect(ctx).or(self.last_video_rect))
                     .map(|(pointer_pos, rect)| {
@@ -1115,53 +1167,63 @@ impl StreamApp {
                     })
                     .unwrap_or(false)
             }
-            LocalCaptureMode::CapturedRelative => {
-                snapshot.capabilities.separate_cursor
-                    && (self
-                        .remote_cursor_texture_for_serial(snapshot.cursor_state.serial)
-                        .is_some()
-                        || snapshot.cursor_state.visible
-                        || snapshot.cursor_state.serial == 0)
-            }
+            // Game: drawn at the server-reported position, only while the
+            // server says the cursor is visible (hidden == mouselook).
+            LocalCaptureMode::CapturedRelative => snapshot.cursor_state.visible,
             _ => false,
         }
     }
 
+    /// Relative (game) capture where the server reports a visible cursor but we
+    /// have no shape bitmap to draw: fall back to showing the native OS cursor
+    /// confined to the window rather than hiding the pointer with nothing drawn.
     fn native_cursor_fallback_active(&self) -> bool {
         let snapshot = self.shared_input.snapshot();
         self.capture_mode == LocalCaptureMode::CapturedRelative
             && controller_state_has_separate_cursor(snapshot.controller_state)
             && snapshot.capabilities.separate_cursor
+            && snapshot.cursor_state.visible
             && self
                 .remote_cursor_texture_for_serial(snapshot.cursor_state.serial)
                 .is_none()
-            && (snapshot.cursor_state.visible || snapshot.cursor_state.serial == 0)
     }
 
     fn apply_pointer_capture_mode(&mut self, ctx: &egui::Context) {
         let snapshot = self.shared_input.snapshot();
         let overlay_cursor_active = self.overlay_cursor_active(ctx);
-        let hover_drag_active = self.capture_mode == LocalCaptureMode::HoverAbsolute
-            && controller_state_allows_input(snapshot.controller_state)
-            && self.pointer_buttons != 0;
-        let (cursor_visible, cursor_grab) =
-            if self.capture_mode == LocalCaptureMode::CapturedRelative {
+        let (cursor_visible, cursor_grab) = match self.capture_mode {
+            // Game / relative capture: the OS cursor is locked + hidden so we
+            // can read raw relative deltas (mouselook), unless there is no shape
+            // to draw, in which case we show the native cursor confined.
+            LocalCaptureMode::CapturedRelative => {
                 if self.native_cursor_fallback_active() {
                     (true, egui::CursorGrab::Confined)
                 } else {
                     (false, egui::CursorGrab::Locked)
                 }
-            } else if self.capture_mode == LocalCaptureMode::HoverAbsolute
-                && self.uses_virtual_hover_cursor(&snapshot)
-            {
-                (false, egui::CursorGrab::Locked)
-            } else if hover_drag_active {
-                (false, egui::CursorGrab::Confined)
-            } else if overlay_cursor_active {
-                (false, egui::CursorGrab::None)
-            } else {
-                (true, egui::CursorGrab::None)
-            };
+            }
+            LocalCaptureMode::HoverAbsolute => {
+                if self.uses_virtual_hover_cursor(&snapshot) {
+                    // macOS without a separate cursor: lock + hide, draw virtual.
+                    (false, egui::CursorGrab::Locked)
+                } else {
+                    // Desktop: keep the pointer free (grab None) so the user can
+                    // leave the video to control their own machine at any time.
+                    // While a button is held we confine it so a drag (text
+                    // selection, window drag) cannot escape the video mid-drag.
+                    let dragging = self.pointer_buttons != 0
+                        && controller_state_allows_input(snapshot.controller_state);
+                    let grab = if dragging {
+                        egui::CursorGrab::Confined
+                    } else {
+                        egui::CursorGrab::None
+                    };
+                    (!overlay_cursor_active, grab)
+                }
+            }
+            // Idle / ForceReleased: the local OS cursor is the real cursor.
+            _ => (true, egui::CursorGrab::None),
+        };
 
         // Hide the cursor before changing the grab mode so that
         // CursorGrab::Locked (which centres the OS cursor on Windows) does
@@ -1402,12 +1464,8 @@ impl StreamApp {
         {
             return None;
         }
-        // In CapturedRelative the server owns the cursor (a game may have
-        // grabbed it for mouselook) so we honor cursor_state.visible.  In
-        // HoverAbsolute the client owns the cursor — transient `visible=false`
-        // pulses from the compositor would otherwise make the overlay blink
-        // out and back on, which reads as "jumping / changing shape" since the
-        // texture cache may have rotated by the time it reappears.
+        // In CapturedRelative (Game) the server owns the cursor — honor its
+        // visibility so a mouselook-hidden cursor draws nothing.
         if self.capture_mode == LocalCaptureMode::CapturedRelative
             && !input_snapshot.cursor_state.visible
         {
@@ -1443,39 +1501,49 @@ impl StreamApp {
             snap(texture.hotspot.y * display_scale),
         );
 
-        let local_cursor_eligible = self.capture_mode == LocalCaptureMode::HoverAbsolute
-            || self.resume_hover_after_relative_drag
-            || (self.capture_mode == LocalCaptureMode::CapturedRelative
-                && input_snapshot.capabilities.separate_cursor
-                && input_snapshot.cursor_state.visible
-                && !matches!(
-                    input_snapshot.controller_state,
-                    ControllerState::Unavailable | ControllerState::OwnedByOther
-                ));
-        // Active local pos wins; server pos is only a last-resort fallback so the
-        // overlay always renders something while overlay_cursor_active hides the
-        // OS cursor.  Never let server pos override an active local pos.
-        let local_pointer_pos = if local_cursor_eligible {
-            self.hover_cursor_pos
-                .filter(|pos| video_rect.contains(*pos))
-        } else {
-            None
+        // The two modes have exactly one source of position each — no merging,
+        // no fallback, no timer arbitration. That is what stops the jumping.
+        //   * Desktop (HoverAbsolute): the local pointer, 1:1. The server cursor
+        //     follows via absolute injection but is never read back here.
+        //   * Game (CapturedRelative): the server-reported position, scaled into
+        //     the video rect.
+        let (cursor_pos, using_local_pos) = match self.capture_mode {
+            LocalCaptureMode::HoverAbsolute => {
+                let pos = self
+                    .hover_cursor_pos
+                    .filter(|pos| video_rect.expand(1.0).contains(*pos))?;
+                (pos, true)
+            }
+            LocalCaptureMode::CapturedRelative => {
+                // While the user is actively moving, draw at the locally
+                // predicted position so the cursor tracks the hand 1:1 with no
+                // network latency. Once movement goes idle, fall back to the
+                // server-reported position so any accumulated relative-delta
+                // rounding drift re-anchors to where clicks actually land.
+                let recent_local_prediction = self
+                    .last_local_cursor_prediction_at
+                    .map(|at| at.elapsed() < LOCAL_CURSOR_PREDICTION_TTL)
+                    .unwrap_or(false);
+                let local_prediction = self
+                    .hover_cursor_pos
+                    .filter(|pos| video_rect.expand(1.0).contains(*pos));
+                let server_top_left = self.server_cursor_stream_top_left(input_snapshot);
+                let server_pos = egui::pos2(
+                    video_rect.left() + server_top_left.x * scale_x + hotspot.x,
+                    video_rect.top() + server_top_left.y * scale_y + hotspot.y,
+                );
+                let anchor = relative_capture_tracking_anchor(
+                    Some(server_pos),
+                    local_prediction,
+                    recent_local_prediction,
+                )
+                .unwrap_or(server_pos);
+                let using_local = recent_local_prediction && local_prediction.is_some();
+                (anchor, using_local)
+            }
+            _ => return None,
         };
-        let (top_left, cursor_pos, using_local_pos) = if let Some(pointer_pos) = local_pointer_pos {
-            (
-                egui::pos2(pointer_pos.x - hotspot.x, pointer_pos.y - hotspot.y),
-                pointer_pos,
-                true,
-            )
-        } else {
-            let server_top_left = self.server_cursor_stream_top_left(input_snapshot);
-            let top_left = egui::pos2(
-                video_rect.left() + server_top_left.x * scale_x,
-                video_rect.top() + server_top_left.y * scale_y,
-            );
-            let cursor_pos = egui::pos2(top_left.x + hotspot.x, top_left.y + hotspot.y);
-            (top_left, cursor_pos, false)
-        };
+        let top_left = egui::pos2(cursor_pos.x - hotspot.x, cursor_pos.y - hotspot.y);
 
         let top_left = egui::pos2(snap(top_left.x), snap(top_left.y));
         let rect = egui::Rect::from_min_size(top_left, size);
@@ -1607,12 +1675,15 @@ impl StreamApp {
         let previous_capture_mode = self.capture_mode;
 
         let snapshot = self.shared_input.snapshot();
-        let hover_supported = snapshot.capabilities.hover_capture;
-        let prefer_hover_absolute = snapshot.capabilities.hover_capture;
-        let hover_drag_active = previous_capture_mode == LocalCaptureMode::HoverAbsolute
-            && controller_state_allows_input(snapshot.controller_state)
-            && self.pointer_buttons != 0;
+        let controller_ok = controller_state_allows_input(snapshot.controller_state);
+        let absolute_ok = snapshot.capabilities.mouse_absolute;
+        let relative_ok = snapshot.capabilities.mouse_relative;
+        let separate_cursor = snapshot.capabilities.separate_cursor;
+        // The server advertises hover_capture when it can position an absolute
+        // cursor for Parsec-style desktop control.
+        let hover_supported = snapshot.capabilities.hover_capture && absolute_ok;
         let virtual_hover = self.uses_virtual_hover_cursor(&snapshot);
+
         let actual_pointer_pos = if self.suppress_pointer_pos_frames > 0 {
             self.hover_cursor_pos
                 .or_else(|| ctx.input(|i| i.pointer.latest_pos()))
@@ -1625,9 +1696,11 @@ impl StreamApp {
             } else {
                 actual_pointer_pos
             };
+        // macOS virtual-hover keeps the OS cursor locked and tracks a synthetic
+        // pointer; remap it when the video rect changes so it stays put.
         if virtual_hover
             && previous_capture_mode == LocalCaptureMode::HoverAbsolute
-            && controller_state_allows_input(snapshot.controller_state)
+            && controller_ok
             && hover_supported
         {
             let base_pos = if previous_video_rect != Some(video_rect) {
@@ -1639,7 +1712,7 @@ impl StreamApp {
                             })
                             .unwrap_or(pos)
                     })
-                    .or(if virtual_hover && self.hover_cursor_pos.is_some() {
+                    .or(if self.hover_cursor_pos.is_some() {
                         None
                     } else {
                         actual_pointer_pos
@@ -1653,24 +1726,24 @@ impl StreamApp {
                 pointer_pos = Some(clamped);
             }
         }
+
         let pointer_over_local_overlay = pointer_pos
             .map(|pos| self.pointer_over_local_overlay(pos))
             .unwrap_or(false);
-        // 1 logical-pixel tolerance: with fractional DPI scaling the OS can
-        // report pointer positions sub-pixel outside the aspect-fit video_rect
-        // while the user is still pixel-on-edge.  Without slack here,
-        // auto_release_capture fires every other frame and the overlay blinks
-        // (or flips between local pos and server pos with my recent fix).
+        // 1 logical-pixel tolerance so fractional-DPI sub-pixel boundary noise
+        // does not flap the over-video test every frame.
         let pointer_inside_video_rect = pointer_pos
             .map(|pos| video_rect.expand(1.0).contains(pos))
             .unwrap_or(false);
         let pointer_over_video = pointer_inside_video_rect && !pointer_over_local_overlay;
         let clicked_video = response.clicked_by(egui::PointerButton::Primary) && pointer_over_video;
-        let hover_drag_active = hover_drag_active && pointer_over_video;
+        let dragging = self.pointer_buttons != 0;
         if self.await_pointer_exit_after_auto_release && !pointer_inside_video_rect {
             self.await_pointer_exit_after_auto_release = false;
         }
-        if !controller_state_allows_input(snapshot.controller_state)
+
+        // Lost control entirely -> hands off.
+        if !controller_ok
             && matches!(
                 self.capture_mode,
                 LocalCaptureMode::HoverAbsolute | LocalCaptureMode::CapturedRelative
@@ -1678,17 +1751,10 @@ impl StreamApp {
         {
             self.capture_mode = LocalCaptureMode::Idle;
         }
-        if (!pointer_over_video || !hover_supported)
-            && self.capture_mode == LocalCaptureMode::HoverAbsolute
-            && !hover_drag_active
-        {
-            self.auto_release_capture(false);
-        }
 
+        // Window focus lost: the OS resets grab/visibility. Re-apply next frame,
+        // and drop any game capture so the pointer is never stuck locked.
         if !ctx.input(|i| i.focused) {
-            // The OS resets cursor grab and visibility when the window loses
-            // focus.  Clear the applied state so apply_pointer_capture_mode
-            // re-sends the commands when focus returns.
             self.applied_cursor_grab = None;
             self.applied_cursor_visible = None;
             if self.capture_mode == LocalCaptureMode::CapturedRelative {
@@ -1696,288 +1762,165 @@ impl StreamApp {
             }
         }
 
-        if hover_supported
-            && self.capture_mode != LocalCaptureMode::CapturedRelative
-            && self.capture_mode != LocalCaptureMode::ForceReleased
-            && !self.await_pointer_exit_after_auto_release
-            && pointer_over_video
-            && controller_state_allows_input(snapshot.controller_state)
-        {
-            self.capture_mode = LocalCaptureMode::HoverAbsolute;
+        // Track how long the server has reported the cursor hidden. A game that
+        // grabs the pointer for mouselook hides it; that is our signal to switch
+        // into relative capture (and back out when it reappears).
+        let server_cursor_hidden = separate_cursor
+            && controller_state_has_separate_cursor(snapshot.controller_state)
+            && !snapshot.cursor_state.visible;
+        if server_cursor_hidden {
+            self.cursor_hidden_frames = self.cursor_hidden_frames.saturating_add(1);
+        } else {
+            self.cursor_hidden_frames = 0;
         }
-        let relative_hover_supported = !hover_supported
-            && snapshot.capabilities.mouse_relative
-            && snapshot.capabilities.separate_cursor
-            && snapshot.cursor_state.visible;
-        if relative_hover_supported
-            && self.capture_mode != LocalCaptureMode::CapturedRelative
-            && self.capture_mode != LocalCaptureMode::ForceReleased
-            && !self.await_pointer_exit_after_auto_release
-            && pointer_over_video
-            && controller_state_allows_input(snapshot.controller_state)
-        {
-            self.capture_mode = LocalCaptureMode::CapturedRelative;
-            self.resume_hover_after_relative_drag = false;
-            self.hover_cursor_resync_pending = false;
-            if let Some(pos) = self.mapped_server_cursor_video_pos(&snapshot, video_rect) {
-                self.hover_cursor_pos = Some(clamp_pos_to_video_rect(
-                    pos,
-                    video_rect,
-                    ctx.pixels_per_point(),
-                ));
+        let want_game_capture =
+            relative_ok && self.cursor_hidden_frames >= CURSOR_HIDDEN_CAPTURE_FRAMES;
+
+        // ---- Mode resolution -------------------------------------------------
+        // ForceReleased stays hands-off until the user clicks back into the
+        // video (handled in the click block below).
+        if controller_ok && self.capture_mode != LocalCaptureMode::ForceReleased {
+            if self.capture_mode == LocalCaptureMode::CapturedRelative {
+                // Currently in Game/relative capture. On an absolute-capable
+                // backend, leave it the moment the server shows the cursor
+                // again (the game released the pointer). Relative-only backends
+                // stay captured until the force-release shortcut.
+                if absolute_ok && !want_game_capture {
+                    // Warp the local pointer to where the server cursor now is so
+                    // Desktop control resumes from the same spot. This is the one
+                    // place we read the server position back into a local pos —
+                    // a single discrete event, not a per-frame feedback loop.
+                    if let Some(pos) = self.mapped_server_cursor_video_pos(&snapshot, video_rect) {
+                        let clamped =
+                            clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point());
+                        self.hover_cursor_pos = Some(clamped);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(clamped));
+                    }
+                    self.capture_mode = if hover_supported && pointer_over_video {
+                        LocalCaptureMode::HoverAbsolute
+                    } else {
+                        LocalCaptureMode::Idle
+                    };
+                    self.last_sent_absolute_cursor = None;
+                    ctx.request_repaint();
+                }
+            } else if want_game_capture
+                && (self.capture_mode == LocalCaptureMode::HoverAbsolute || pointer_over_video)
+            {
+                // A game grabbed the pointer while we were engaged with the
+                // video: enter relative mouselook capture.
+                self.capture_mode = LocalCaptureMode::CapturedRelative;
+                ctx.request_repaint();
+            } else if hover_supported && pointer_over_video && !self.await_pointer_exit_after_auto_release {
+                // Desktop passthrough: automatic free-cursor control while the
+                // pointer is over the video.
+                self.capture_mode = LocalCaptureMode::HoverAbsolute;
+            } else if self.capture_mode == LocalCaptureMode::HoverAbsolute
+                && !pointer_over_video
+                && !dragging
+            {
+                // Pointer left the video (or moved onto the HUD) and no button is
+                // held: hand control straight back to the local machine.
+                self.auto_release_capture(false);
             }
-            ctx.request_repaint();
         }
 
-        if clicked_video {
-            if controller_state_allows_input(snapshot.controller_state) {
-                if hover_supported && prefer_hover_absolute {
-                    self.capture_mode = LocalCaptureMode::HoverAbsolute;
-                } else if snapshot.capabilities.mouse_relative {
-                    self.capture_mode = LocalCaptureMode::CapturedRelative;
-                } else if hover_supported {
-                    self.capture_mode = LocalCaptureMode::HoverAbsolute;
+        // Click re-arms forwarding from a hands-off state. Clicking while
+        // already forwarding just acts (handled in the raw input hook), so it
+        // must not override an active Game capture here.
+        if response.clicked_by(egui::PointerButton::Primary) && pointer_over_video {
+            if controller_ok {
+                if matches!(
+                    self.capture_mode,
+                    LocalCaptureMode::Idle | LocalCaptureMode::ForceReleased
+                ) {
+                    if hover_supported {
+                        self.capture_mode = LocalCaptureMode::HoverAbsolute;
+                    } else if relative_ok {
+                        self.capture_mode = LocalCaptureMode::CapturedRelative;
+                        self.anchor_relative_capture_to_local(
+                            ctx,
+                            video_rect,
+                            pointer_pos,
+                            &snapshot,
+                        );
+                    }
                 }
                 self.await_pointer_exit_after_auto_release = false;
                 self.pending_capture_click = false;
             } else {
-                // ControllerState / InputCapabilities haven't landed yet
-                // (TCP control messages arrive after StreamStarted).  Remember
-                // the click so we re-evaluate capture once the controller
-                // transitions out of Unavailable.
+                // Capabilities/controller state arrive over TCP after
+                // StreamStarted; remember the click and re-evaluate once they do.
                 self.pending_capture_click = true;
             }
             ctx.request_repaint();
         }
-
-        if self.pending_capture_click && controller_state_allows_input(snapshot.controller_state) {
-            if hover_supported && prefer_hover_absolute {
-                self.capture_mode = LocalCaptureMode::HoverAbsolute;
-            } else if snapshot.capabilities.mouse_relative {
-                self.capture_mode = LocalCaptureMode::CapturedRelative;
-            } else if hover_supported {
-                self.capture_mode = LocalCaptureMode::HoverAbsolute;
+        if self.pending_capture_click && controller_ok {
+            if matches!(
+                self.capture_mode,
+                LocalCaptureMode::Idle | LocalCaptureMode::ForceReleased
+            ) {
+                if hover_supported {
+                    self.capture_mode = LocalCaptureMode::HoverAbsolute;
+                } else if relative_ok {
+                    self.capture_mode = LocalCaptureMode::CapturedRelative;
+                    self.anchor_relative_capture_to_local(
+                        ctx,
+                        video_rect,
+                        pointer_pos,
+                        &snapshot,
+                    );
+                }
             }
             self.await_pointer_exit_after_auto_release = false;
             self.pending_capture_click = false;
         }
 
-        if pointer_over_video
-            && self.capture_mode == LocalCaptureMode::ForceReleased
-            && clicked_video
-            && controller_state_allows_input(snapshot.controller_state)
-        {
-            if hover_supported && prefer_hover_absolute {
-                self.capture_mode = LocalCaptureMode::HoverAbsolute;
-            } else if snapshot.capabilities.mouse_relative {
-                self.capture_mode = LocalCaptureMode::CapturedRelative;
-            }
-        }
-
-        let drag_buttons = MOUSE_BUTTON_PRIMARY | MOUSE_BUTTON_SECONDARY;
-        let hidden_cursor_relative_drag = snapshot.capabilities.separate_cursor
-            && snapshot.capabilities.mouse_relative
-            && !snapshot.cursor_state.visible;
-        let edge_mismatch_relative_drag = if self.capture_mode == LocalCaptureMode::HoverAbsolute
-            && controller_state_allows_input(snapshot.controller_state)
-            && self.pointer_buttons & drag_buttons != 0
-            && snapshot.capabilities.separate_cursor
-            && snapshot.capabilities.mouse_relative
-            && snapshot.cursor_state.visible
-        {
-            pointer_pos
-                .filter(|pos| video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos))
-                .filter(|pos| pos_near_video_edge(*pos, video_rect, ctx.pixels_per_point()))
-                .and_then(|pos| {
-                    self.mapped_server_cursor_video_pos(&snapshot, video_rect)
-                        .map(|remote_pos| pos.distance(remote_pos))
-                })
-                .map(|distance| {
-                    distance
-                        >= (video_rect.width().min(video_rect.height()) * 0.10).clamp(64.0, 160.0)
-                })
-                .unwrap_or(false)
-        } else {
-            false
-        };
-        if edge_mismatch_relative_drag {
-            if snapshot.cursor_state_version != self.hover_drag_edge_mismatch_cursor_state_version {
-                self.hover_drag_edge_mismatch_updates =
-                    self.hover_drag_edge_mismatch_updates.saturating_add(1);
-                self.hover_drag_edge_mismatch_cursor_state_version = snapshot.cursor_state_version;
-            }
-        } else {
-            self.hover_drag_edge_mismatch_updates = 0;
-            self.hover_drag_edge_mismatch_cursor_state_version = snapshot.cursor_state_version;
-        }
-        if self.capture_mode == LocalCaptureMode::HoverAbsolute
-            && controller_state_allows_input(snapshot.controller_state)
-            && self.pointer_buttons & drag_buttons != 0
-            && (hidden_cursor_relative_drag
-                || self.hover_drag_edge_mismatch_updates >= HOVER_EDGE_MISMATCH_UPDATES_THRESHOLD)
-        {
-            if let Some(pos) = pointer_pos
-                .filter(|pos| video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos))
-            {
-                self.hover_cursor_pos = Some(clamp_pos_to_video_rect(
-                    pos,
-                    video_rect,
-                    ctx.pixels_per_point(),
-                ));
-            } else if self.hover_cursor_pos.is_none() {
-                // Don't fall back to center — skip the transition until we
-                // have a real pointer position to anchor the drag.
-                self.hover_drag_edge_mismatch_updates = 0;
-            }
-            if self.hover_cursor_pos.is_some() {
-                self.capture_mode = LocalCaptureMode::CapturedRelative;
-                self.resume_hover_after_relative_drag = true;
-                self.hover_cursor_resync_pending = false;
-                self.hover_drag_edge_mismatch_updates = 0;
-                self.hover_drag_edge_mismatch_cursor_state_version = snapshot.cursor_state_version;
-                ctx.request_repaint();
-            }
-        }
+        let _ = clicked_video;
 
         if previous_capture_mode != self.capture_mode && self.capture_mode == LocalCaptureMode::Idle
         {
             self.clear_remote_keyboard();
         }
 
-        if previous_capture_mode != LocalCaptureMode::CapturedRelative
-            && self.capture_mode == LocalCaptureMode::CapturedRelative
-            && !self.resume_hover_after_relative_drag
-            && snapshot.capabilities.separate_cursor
-            && snapshot.cursor_state.visible
-        {
-            // In relative mode the server cursor metadata is the source of truth;
-            // the local pointer only decides when capture starts or escapes.
-            let remote_pos = self.mapped_server_cursor_video_pos(&snapshot, video_rect);
-            let local_pos = pointer_pos
-                .filter(|pos| video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos));
-            if let Some(anchor_pos) = relative_capture_entry_anchor(remote_pos, local_pos) {
-                let clamped = clamp_pos_to_video_rect(
-                    anchor_pos,
-                    video_rect,
-                    ctx.pixels_per_point(),
-                );
-                self.hover_cursor_pos = Some(clamped);
-                // Anchor was local — send a one-shot warp so the server
-                // cursor catches up to where the overlay now sits.  After
-                // this, normal delta accumulation keeps both aligned.
-                if local_pos.is_some() {
-                    if let Some(client_id) = snapshot.client_id {
-                        self.send_relative_warp_to_local(
-                            client_id,
-                            clamped,
-                            video_rect,
-                            &snapshot,
-                        );
-                    }
-                }
-                ctx.request_repaint();
-            }
-        }
-
-        if self.capture_mode == LocalCaptureMode::HoverAbsolute
-            && controller_state_allows_input(snapshot.controller_state)
-            && self.capture_mode != LocalCaptureMode::ForceReleased
-        {
+        // ---- Desktop absolute send + local cursor tracking -------------------
+        // In Desktop mode the local pointer is the single source of truth: we
+        // record it (to draw the overlay at exactly that spot) and forward it as
+        // an absolute position. The server's reported cursor position is never
+        // read back here, which is what removes the position feedback loop.
+        if self.capture_mode == LocalCaptureMode::HoverAbsolute && controller_ok {
+            // One-shot resync after returning to Desktop hover: force the next
+            // absolute send so the server cursor snaps to the local overlay even
+            // if the pointer is stationary (no PointerMoved to trigger a send).
+            let force_resync = std::mem::take(&mut self.hover_cursor_resync_pending);
             if virtual_hover {
-                let desired_hover_pos = if previous_capture_mode == LocalCaptureMode::HoverAbsolute
-                {
-                    self.hover_cursor_pos
-                        .or(pointer_pos)
-                        .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()))
+                let desired_hover_pos = if previous_capture_mode == LocalCaptureMode::HoverAbsolute {
+                    self.hover_cursor_pos.or(pointer_pos)
                 } else {
-                    actual_pointer_pos
-                        .or(pointer_pos)
-                        .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()))
-                };
+                    actual_pointer_pos.or(pointer_pos)
+                }
+                .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()));
                 if let Some(pos) = desired_hover_pos {
                     self.hover_cursor_pos = Some(pos);
                 }
-
                 if let (Some(client_id), Some(pos)) = (snapshot.client_id, self.hover_cursor_pos) {
-                    self.send_absolute_cursor_if_needed(client_id, pos, video_rect);
+                    let _ = self.send_absolute_cursor(client_id, pos, video_rect, force_resync);
                 }
             } else {
-                // In every branch: clamp into video_rect rather than dropping on
-                // a sub-pixel `contains` miss.  Auto-release (line 1600-1604)
-                // already handles "pointer genuinely outside the rect" by
-                // changing capture_mode away from HoverAbsolute, so when we
-                // reach this branch we know the pointer is over-video; the only
-                // failure mode of the old filter was sub-pixel boundary noise
-                // that toggled hover_cursor_pos between Some and None each
-                // frame, which made the overlay flip between local and server
-                // positions.
-                let hover_pos = if hover_drag_active {
-                    actual_pointer_pos
-                        .or(pointer_pos)
-                        .filter(|pos| !self.pointer_over_local_overlay(*pos))
-                        .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()))
-                } else if self.hover_cursor_resync_pending {
-                    self.hover_cursor_pos
-                        .filter(|pos| !self.pointer_over_local_overlay(*pos))
-                        .or_else(|| {
-                            actual_pointer_pos
-                                .or(pointer_pos)
-                                .filter(|pos| !self.pointer_over_local_overlay(*pos))
-                        })
-                        .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()))
-                } else {
-                    actual_pointer_pos
-                        .or(pointer_pos)
-                        .filter(|pos| !self.pointer_over_local_overlay(*pos))
-                        .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()))
-                };
+                let hover_pos = actual_pointer_pos
+                    .or(pointer_pos)
+                    .filter(|pos| !self.pointer_over_local_overlay(*pos))
+                    .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()));
                 self.hover_cursor_pos = hover_pos;
                 if let (Some(client_id), Some(pos)) = (snapshot.client_id, hover_pos) {
-                    self.send_absolute_cursor_if_needed(client_id, pos, video_rect);
+                    let _ = self.send_absolute_cursor(client_id, pos, video_rect, force_resync);
                 } else {
                     self.last_sent_absolute_cursor = None;
                 }
             }
-        } else if self.capture_mode == LocalCaptureMode::CapturedRelative
-            && snapshot.capabilities.separate_cursor
-            && snapshot.cursor_state.visible
-        {
-            let local_entry_pos = if previous_capture_mode != LocalCaptureMode::CapturedRelative
-                && !self.resume_hover_after_relative_drag
-            {
-                pointer_pos.filter(|pos| {
-                    video_rect.contains(*pos) && !self.pointer_over_local_overlay(*pos)
-                })
-            } else {
-                None
-            };
-            let remote_pos = self.mapped_server_cursor_video_pos(&snapshot, video_rect);
-            let local_prediction = self.hover_cursor_pos.map(|pos| {
-                previous_video_rect
-                    .filter(|previous_rect| *previous_rect != video_rect)
-                    .map(|previous_rect| {
-                        remap_pos_between_video_rects(pos, previous_rect, video_rect)
-                    })
-                    .unwrap_or(pos)
-            });
-            let local_prediction_recent = self
-                .last_local_cursor_prediction_at
-                .map(|at| at.elapsed() <= LOCAL_CURSOR_PREDICTION_HOLD)
-                .unwrap_or(false);
-            let entering_relative = previous_capture_mode != LocalCaptureMode::CapturedRelative
-                && !self.resume_hover_after_relative_drag;
-            let predicted_pos = if entering_relative {
-                relative_capture_entry_anchor(remote_pos, local_entry_pos)
-            } else {
-                relative_capture_tracking_anchor(
-                    remote_pos,
-                    local_prediction,
-                    local_prediction_recent,
-                )
-            };
-            self.hover_cursor_pos = predicted_pos
-                .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()));
-        } else if !self.resume_hover_after_relative_drag {
+        } else if self.capture_mode != LocalCaptureMode::CapturedRelative {
+            // Idle / ForceReleased: nothing local-driven. (Game mode draws from
+            // the server position and does not use hover_cursor_pos.)
             self.hover_cursor_pos = None;
             self.last_sent_absolute_cursor = None;
         }
@@ -1991,6 +1934,11 @@ impl StreamApp {
         }
 
         let snapshot = self.shared_input.snapshot();
+        // A single draw path: if we have a remote cursor shape and a position
+        // for it (local pointer in Desktop, server position in Game), draw it.
+        // Otherwise nothing is drawn and the native OS cursor stays visible
+        // (apply_pointer_capture_mode keeps them in sync), so there is always
+        // exactly one cursor on screen.
         if let Some(geometry) = self.compute_cursor_overlay_geometry(ctx, &snapshot) {
             egui::Area::new(egui::Id::new("remote_cursor_overlay"))
                 .order(egui::Order::Tooltip)
@@ -2001,57 +1949,7 @@ impl StreamApp {
                         egui::load::SizedTexture::new(geometry.texture_id, geometry.rect.size());
                     ui.image(sized);
                 });
-            return;
         }
-
-        let Some(video_rect) = self.current_video_rect(ctx).or(self.last_video_rect) else {
-            return;
-        };
-        if self.capture_mode != LocalCaptureMode::HoverAbsolute
-            || !controller_state_has_separate_cursor(snapshot.controller_state)
-            || !snapshot.capabilities.hover_capture
-        {
-            return;
-        }
-        // Same reasoning as compute_cursor_overlay_geometry: in HoverAbsolute
-        // the client owns the cursor, so don't gate the placeholder on
-        // cursor_state.visible — that flag flickers on some compositors and
-        // we'd otherwise leave the OS cursor hidden with nothing drawn.
-        // Active local pos wins; fall back to server cursor_state only when
-        // no local pos is available so the placeholder doesn't disappear
-        // while overlay_cursor_active hides the OS cursor.
-        let pos = self
-            .hover_cursor_pos
-            .filter(|pos| video_rect.contains(*pos))
-            .or_else(|| {
-                let stream_size = self.cursor_space_size()?;
-                if stream_size.x <= 0.0 || stream_size.y <= 0.0 {
-                    return None;
-                }
-                let scale_x = video_rect.width() / stream_size.x;
-                let scale_y = video_rect.height() / stream_size.y;
-                let server = self.server_cursor_stream_top_left(&snapshot);
-                let pos = egui::pos2(
-                    video_rect.left() + server.x * scale_x,
-                    video_rect.top() + server.y * scale_y,
-                );
-                Some(pos).filter(|pos| video_rect.contains(*pos))
-            });
-        let Some(pos) = pos else {
-            return;
-        };
-
-        egui::Area::new(egui::Id::new("remote_cursor_fallback_overlay"))
-            .order(egui::Order::Tooltip)
-            .interactable(false)
-            .fixed_pos(video_rect.min)
-            .show(ctx, |ui| {
-                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, video_rect.size());
-                let local_pos = pos - video_rect.min.to_vec2();
-                let painter = ui.painter().with_clip_rect(rect);
-                painter.circle_filled(local_pos, 5.0, egui::Color32::WHITE);
-                painter.circle_stroke(local_pos, 5.0, egui::Stroke::new(1.5, egui::Color32::BLACK));
-            });
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -5440,14 +5338,6 @@ fn pointer_escape_position(
     }
 }
 
-fn pos_near_video_edge(pos: egui::Pos2, rect: egui::Rect, pixels_per_point: f32) -> bool {
-    let margin = (24.0 / pixels_per_point.max(1.0)).max(12.0);
-    pos.x <= rect.left() + margin
-        || pos.x >= rect.right() - margin
-        || pos.y <= rect.top() + margin
-        || pos.y >= rect.bottom() - margin
-}
-
 fn remap_pos_between_video_rects(
     pos: egui::Pos2,
     old_rect: egui::Rect,
@@ -6397,60 +6287,10 @@ impl eframe::App for StreamApp {
                             self.await_pointer_exit_after_auto_release = false;
                         }
                     }
-                    if !snapshot.capabilities.hover_capture
-                        && snapshot.capabilities.mouse_relative
-                        && snapshot.capabilities.separate_cursor
-                        && snapshot.cursor_state.visible
-                        && controller_state_allows_input(snapshot.controller_state)
-                        && self.capture_mode != LocalCaptureMode::CapturedRelative
-                        && self.capture_mode != LocalCaptureMode::ForceReleased
-                        && !self.await_pointer_exit_after_auto_release
-                    {
-                        if let Some(rect) = video_rect {
-                            if rect.contains(pos) && !self.pointer_over_local_overlay(pos) {
-                                let local_pos =
-                                    clamp_pos_to_video_rect(pos, rect, ctx.pixels_per_point());
-                                // Render at the local pointer position so the
-                                // overlay does not teleport to the server's
-                                // cursor on entry.  The matching warp delta
-                                // below tells the server to bring its cursor
-                                // here so subsequent relative deltas keep both
-                                // in sync and clicks land correctly.
-                                let anchor_pos =
-                                    self.mapped_server_cursor_video_pos(&snapshot, rect);
-                                self.capture_mode = LocalCaptureMode::CapturedRelative;
-                                self.resume_hover_after_relative_drag = false;
-                                self.hover_cursor_resync_pending = false;
-                                let clamped = clamp_pos_to_video_rect(
-                                    relative_capture_entry_anchor(anchor_pos, Some(local_pos))
-                                        .unwrap_or(local_pos),
-                                    rect,
-                                    ctx.pixels_per_point(),
-                                );
-                                self.hover_cursor_pos = Some(clamped);
-                                self.send_relative_warp_to_local(
-                                    client_id,
-                                    clamped,
-                                    rect,
-                                    &snapshot,
-                                );
-                                self.suppress_mouse_delta = true;
-                                ctx.request_repaint();
-                            }
-                        }
-                    }
-                    if self.capture_mode == LocalCaptureMode::HoverAbsolute
-                        && self.hover_cursor_resync_pending
-                        && self.suppress_pointer_pos_frames == 0
-                    {
-                        if let Some(rect) = video_rect {
-                            self.hover_cursor_pos =
-                                Some(clamp_pos_to_video_rect(pos, rect, ctx.pixels_per_point()));
-                        } else {
-                            self.hover_cursor_pos = Some(pos);
-                        }
-                        self.hover_cursor_resync_pending = false;
-                    }
+                    // Desktop (HoverAbsolute): the local pointer drives the
+                    // cursor 1:1 and is forwarded as an absolute position. If it
+                    // moves onto the HUD or out of the video, hand control back
+                    // to the local machine immediately.
                     if !virtual_hover
                         && self.capture_mode == LocalCaptureMode::HoverAbsolute
                         && controller_state_allows_input(snapshot.controller_state)

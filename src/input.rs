@@ -5,6 +5,28 @@ use st_protocol::{
 };
 use std::sync::Mutex;
 
+/// The client runs a Parsec-style two-mode cursor model. Only two modes
+/// actually forward input; the other two are transient "hands off" states.
+///
+/// * [`Idle`](Self::Idle) — not forwarding. The local OS cursor is the real
+///   local cursor: the user is driving their own machine (pointer outside the
+///   video, over the HUD, or we do not own control). No overlay.
+/// * [`HoverAbsolute`](Self::HoverAbsolute) — **Desktop mode**. The pointer is
+///   over the video and we own control. The local pointer moves freely; on
+///   every move we send the absolute normalized position and draw the remote
+///   cursor *at the exact local pointer position* (1:1). The server cursor
+///   follows via true absolute injection; its reported position is never read
+///   back to place the local overlay. Move out of the video or onto the HUD
+///   and we drop straight back to local control — no explicit release.
+/// * [`CapturedRelative`](Self::CapturedRelative) — **Game mode**. The OS
+///   cursor is locked + hidden and we send raw relative deltas (mouselook).
+///   Entered automatically when the server reports the cursor hidden (a game
+///   grabbed the pointer), or by click-to-capture on relative-only backends.
+///   Exited when the server shows the cursor again, or via the force-release
+///   shortcut.
+/// * [`ForceReleased`](Self::ForceReleased) — the user pressed the force
+///   release shortcut. Stays hands-off (like Idle) until they click back into
+///   the video.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalCaptureMode {
     Idle,
