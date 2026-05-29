@@ -343,11 +343,17 @@ impl Clone for WindowsD3d11Frame {
 #[derive(Clone, Debug, Default)]
 pub struct FrameDebugTiming {
     pub frame_id: u32,
+    /// Server wall-clock micros (compared to client wall clock via clock sync).
     pub server_capture_micros: u64,
     pub server_send_micros: u64,
+    /// Client wall-clock micros at reassembly — paired with server times for the
+    /// cross-machine `send→assemble` / `total` latency stages.
     pub client_assembled_micros: u64,
-    pub client_decode_start_micros: u64,
-    pub client_decode_done_micros: u64,
+    /// Client monotonic-clock micros for the client-only stages, so an NTP step
+    /// on the wall clock can't corrupt decode/queue/present durations.
+    pub client_assembled_mono: u64,
+    pub client_decode_start_mono: u64,
+    pub client_decode_done_mono: u64,
 }
 
 pub struct VideoFrameBuffer {

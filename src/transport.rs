@@ -273,8 +273,13 @@ pub struct AudioPacket {
 }
 
 pub enum ReceivedData {
-    /// A fully assembled video frame (one or more packets reassembled).
-    Video(CompletedFrame),
+    /// A fully assembled video frame (one or more packets reassembled), paired
+    /// with the client `(wall, monotonic)` micros at which reassembly completed.
+    /// The timestamp is captured here — when the final packet lands — rather than
+    /// later at decode time, so the "send→assemble" latency stage reflects the
+    /// real network + reassembly cost instead of also absorbing queue delay.
+    /// Wall feeds the cross-machine stage; monotonic feeds the client-only ones.
+    Video(CompletedFrame, u64, u64),
     /// A single audio packet (raw Opus data).
     Audio(AudioPacket),
 }
@@ -750,7 +755,9 @@ impl PacketProcessor {
         }
         if let Some(frame) = outcome.completed {
             self.feedback.completed_frames = self.feedback.completed_frames.saturating_add(1);
-            return Some(ReceivedData::Video(frame));
+            let assembled_wall = crate::debug_state::unix_time_micros();
+            let assembled_mono = crate::debug_state::mono_micros();
+            return Some(ReceivedData::Video(frame, assembled_wall, assembled_mono));
         }
         None
     }

@@ -1,4 +1,4 @@
-use crate::debug_state::{unix_time_micros, ConnectionDebugState};
+use crate::debug_state::{mono_micros, ConnectionDebugState};
 use crate::decode::VideoDecoder;
 use crate::transport::{AudioPacket, MediaReceiver, ReceivedData, TransportWindowStats};
 use crate::video_frame::{FrameDebugTiming, NativeSurfaceControl, VideoFrameBuffer};
@@ -222,20 +222,24 @@ fn recycle_video_frame(recycled_frames: &mut Vec<VideoFrameBuffer>, mut frame: V
     recycled_frames.push(frame);
 }
 
+/// Presents the newest due frame and recycles any it superseded. Returns the
+/// number of decoded frames the playout buffer dropped (skipped before display)
+/// so the caller can surface playout/jitter churn in the debug HUD.
 fn present_due_video_frames(
     playout: &mut VideoPlayoutBuffer,
     recycled_frames: &mut Vec<VideoFrameBuffer>,
     frame_buf: &Arc<Mutex<VideoFrameBuffer>>,
     ctx: &egui::Context,
     repaint_pacer: &mut RepaintPacer,
-) {
+) -> usize {
     let due = playout.take_due_frames();
+    let dropped_count = due.dropped.len();
     for dropped in due.dropped {
         recycle_video_frame(recycled_frames, dropped);
     }
 
     let Some(mut frame) = due.present else {
-        return;
+        return dropped_count;
     };
 
     let mut fb = frame_buf.lock().unwrap();
@@ -243,6 +247,7 @@ fn present_due_video_frames(
     fb.dirty = true;
     recycle_video_frame(recycled_frames, frame);
     repaint_pacer.request(ctx);
+    dropped_count
 }
 
 pub fn run_receive_pipeline(
@@ -314,13 +319,16 @@ pub fn run_receive_pipeline(
 
         match data {
             None => {
-                present_due_video_frames(
+                let drops = present_due_video_frames(
                     &mut playout,
                     &mut recycled_frames,
                     &frame_buf,
                     &ctx,
                     &mut repaint_pacer,
                 );
+                if drops > 0 && debug_enabled.load(Ordering::Relaxed) {
+                    debug_state.record_playout_drop(drops as u32);
+                }
                 // Block briefly on the socket instead of spinning: wakes as soon
                 // as a datagram arrives (Linux poll) or after a 2ms timeout so
                 // stats/recovery/shutdown checks still get a turn.
@@ -332,7 +340,7 @@ pub fn run_receive_pipeline(
                     let _ = audio_tx.try_send(opus);
                 }
             }
-            Some(ReceivedData::Video(completed)) => {
+            Some(ReceivedData::Video(completed, assembled_micros, assembled_mono)) => {
                 if trace && trace_completed_logged < 12 {
                     eprintln!(
                         "[trace][client] assembled video unit #{}: frame_id={} bytes={} capture_ts={} send_ts={}",
@@ -345,7 +353,8 @@ pub fn run_receive_pipeline(
                 }
                 // Keep decoder input in-order. We can present only the newest decoded
                 // frame, but we must not drop inter-frame video packets before decode.
-                let mut pending_video = vec![completed];
+                // Carry each unit's assembly timestamp so latency stages stay accurate.
+                let mut pending_video = vec![(completed, assembled_micros, assembled_mono)];
                 let drain_deadline = Instant::now() + Duration::from_millis(2);
                 let mut drained = 0usize;
                 loop {
@@ -353,7 +362,9 @@ pub fn run_receive_pipeline(
                         break;
                     }
                     match receiver.try_receive() {
-                        Some(ReceivedData::Video(newer)) => pending_video.push(newer),
+                        Some(ReceivedData::Video(newer, newer_wall, newer_mono)) => {
+                            pending_video.push((newer, newer_wall, newer_mono))
+                        }
                         Some(ReceivedData::Audio(opus)) => {
                             if audio_enabled.load(Ordering::Relaxed) {
                                 let _ = audio_tx.try_send(opus);
@@ -366,9 +377,8 @@ pub fn run_receive_pipeline(
 
                 let mut latest_timing = None;
                 let mut produced_frame = false;
-                for completed in pending_video {
-                    let assembled_micros = unix_time_micros();
-                    let decode_start_micros = unix_time_micros();
+                for (completed, assembled_micros, assembled_mono) in pending_video {
+                    let decode_start_mono = mono_micros();
                     let decoded = match decoder.decode_into(
                         &completed.data,
                         completed.frame_id,
@@ -425,7 +435,7 @@ pub fn run_receive_pipeline(
                             "stale decoder output",
                         );
                     }
-                    let decode_done_micros = unix_time_micros();
+                    let decode_done_mono = mono_micros();
 
                     if trace && trace_completed_logged < 12 {
                         eprintln!(
@@ -444,8 +454,9 @@ pub fn run_receive_pipeline(
                             server_capture_micros: completed.timing.capture_ts_micros,
                             server_send_micros: completed.timing.send_ts_micros,
                             client_assembled_micros: assembled_micros,
-                            client_decode_start_micros: decode_start_micros,
-                            client_decode_done_micros: decode_done_micros,
+                            client_assembled_mono: assembled_mono,
+                            client_decode_start_mono: decode_start_mono,
+                            client_decode_done_mono: decode_done_mono,
                         });
                     }
                 }
@@ -460,16 +471,23 @@ pub fn run_receive_pipeline(
                     }
                     let mut queued_frame = recycled_frames.pop().unwrap_or_default();
                     std::mem::swap(&mut queued_frame, &mut decoded_frame);
+                    let debug_on = debug_enabled.load(Ordering::Relaxed);
                     if let Some(dropped) = playout.enqueue(queued_frame) {
+                        if debug_on {
+                            debug_state.record_playout_drop(1);
+                        }
                         recycle_video_frame(&mut recycled_frames, dropped);
                     }
-                    present_due_video_frames(
+                    let drops = present_due_video_frames(
                         &mut playout,
                         &mut recycled_frames,
                         &frame_buf,
                         &ctx,
                         &mut repaint_pacer,
                     );
+                    if drops > 0 && debug_on {
+                        debug_state.record_playout_drop(drops as u32);
+                    }
                 }
             }
         }
