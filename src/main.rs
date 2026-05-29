@@ -216,6 +216,12 @@ struct StreamApp {
     await_pointer_exit_after_auto_release: bool,
     applied_cursor_visible: Option<bool>,
     applied_cursor_grab: Option<egui::CursorGrab>,
+    /// Frames to wait after requesting the OS cursor be hidden before painting
+    /// the remote-cursor overlay. The compositor applies `CursorVisible(false)`
+    /// asynchronously (~1 frame late), so drawing the overlay the same frame we
+    /// request the hide briefly shows both the OS cursor and the overlay at a
+    /// HUD/edge→video transition. Deferring one frame keeps exactly one cursor.
+    os_cursor_hide_settle: u8,
     pending_wheel_units: egui::Vec2,
     /// Number of upcoming frames whose `MouseMoved` deltas must be dropped.
     /// Set on every `CursorGrab` change because locking/warping the pointer
@@ -725,6 +731,7 @@ impl StreamApp {
             await_pointer_exit_after_auto_release: false,
             applied_cursor_visible: None,
             applied_cursor_grab: None,
+            os_cursor_hide_settle: 0,
             pending_wheel_units: egui::Vec2::ZERO,
             suppress_mouse_delta: 0,
             suppress_pointer_pos_frames: 0,
@@ -1237,6 +1244,9 @@ impl StreamApp {
         if !cursor_visible && self.applied_cursor_visible != Some(false) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
             self.applied_cursor_visible = Some(false);
+            // Defer the overlay one frame: the hide applies asynchronously, so
+            // painting it now would briefly show both the OS cursor and overlay.
+            self.os_cursor_hide_settle = 1;
         }
         if self.applied_cursor_grab != Some(cursor_grab) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(cursor_grab));
@@ -1942,6 +1952,13 @@ impl StreamApp {
 
     fn draw_remote_cursor_overlay(&self, ctx: &egui::Context) {
         if self.video_texture.occludes_egui_overlay() {
+            return;
+        }
+        // Invariant: the overlay is painted only while the OS cursor is
+        // committed-hidden (and the hide has settled a frame). This guarantees
+        // exactly one cursor across HUD/edge transitions — overlay drawn iff OS
+        // cursor hidden — instead of briefly showing both.
+        if self.applied_cursor_visible != Some(false) || self.os_cursor_hide_settle > 0 {
             return;
         }
 
@@ -5940,6 +5957,7 @@ impl eframe::App for StreamApp {
             .set_active(matches!(state, ConnectionState::Connected));
         self.suppress_pointer_pos_frames = self.suppress_pointer_pos_frames.saturating_sub(1);
         self.suppress_mouse_delta = self.suppress_mouse_delta.saturating_sub(1);
+        self.os_cursor_hide_settle = self.os_cursor_hide_settle.saturating_sub(1);
         self.apply_pointer_capture_mode(ctx);
         self.sync_remote_cursor_texture(ctx);
         self.video_texture.set_windows_overlayless_preferred(
