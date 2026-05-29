@@ -1217,6 +1217,32 @@ impl StreamApp {
             .and_then(|serial| self.remote_cursor_textures.get(&serial))
     }
 
+    /// Local pointer is over the video and not over the local HUD overlay, in
+    /// HoverAbsolute desktop mode. Shared by the overlay-active and
+    /// remote-cursor-hidden checks so both use one definition of "over video".
+    fn hover_pointer_over_video(
+        &self,
+        ctx: &egui::Context,
+        snapshot: &input::SharedInputSnapshot,
+    ) -> bool {
+        let pointer_pos = self.hover_cursor_pos.or_else(|| {
+            if self.uses_virtual_hover_cursor(snapshot) {
+                None
+            } else {
+                ctx.input(|i| i.pointer.latest_pos())
+            }
+        });
+        // 1 logical-pixel tolerance avoids the OS cursor flickering back
+        // on sub-pixel/fractional-DPI boundary frames.
+        pointer_pos
+            .zip(self.current_video_rect(ctx).or(self.last_video_rect))
+            .map(|(pointer_pos, rect)| {
+                rect.expand(1.0).contains(pointer_pos)
+                    && !self.pointer_over_local_overlay(pointer_pos)
+            })
+            .unwrap_or(false)
+    }
+
     /// True when the client is drawing its own remote-cursor overlay this
     /// frame and the OS cursor should therefore be hidden.
     fn overlay_cursor_active(&self, ctx: &egui::Context) -> bool {
@@ -1237,26 +1263,9 @@ impl StreamApp {
         }
 
         match self.capture_mode {
-            LocalCaptureMode::HoverAbsolute => {
-                // Desktop: drawn at the local pointer position. Active whenever
-                // that pointer is over the video and not over the local HUD.
-                let pointer_pos = self.hover_cursor_pos.or_else(|| {
-                    if self.uses_virtual_hover_cursor(&snapshot) {
-                        None
-                    } else {
-                        ctx.input(|i| i.pointer.latest_pos())
-                    }
-                });
-                // 1 logical-pixel tolerance avoids the OS cursor flickering back
-                // on sub-pixel/fractional-DPI boundary frames.
-                pointer_pos
-                    .zip(self.current_video_rect(ctx).or(self.last_video_rect))
-                    .map(|(pointer_pos, rect)| {
-                        rect.expand(1.0).contains(pointer_pos)
-                            && !self.pointer_over_local_overlay(pointer_pos)
-                    })
-                    .unwrap_or(false)
-            }
+            // Desktop: drawn at the local pointer position. Active whenever
+            // that pointer is over the video and not over the local HUD.
+            LocalCaptureMode::HoverAbsolute => self.hover_pointer_over_video(ctx, &snapshot),
             // Game: drawn at the server-reported position, only while the
             // server says the cursor is visible (hidden == mouselook).
             LocalCaptureMode::CapturedRelative => snapshot.cursor_state.visible,
@@ -1276,6 +1285,22 @@ impl StreamApp {
             && self
                 .remote_cursor_texture_for_serial(snapshot.cursor_state.serial)
                 .is_none()
+    }
+
+    /// HoverAbsolute desktop mode where the server owns the cursor and reports
+    /// it hidden while the local pointer is over the video. The OS pointer must
+    /// then be hidden too (with nothing drawn) so the local view matches the
+    /// remote — e.g. a fullscreen video player that auto-hides the cursor.
+    fn hover_remote_cursor_hidden(
+        &self,
+        ctx: &egui::Context,
+        snapshot: &input::SharedInputSnapshot,
+    ) -> bool {
+        self.capture_mode == LocalCaptureMode::HoverAbsolute
+            && controller_state_has_separate_cursor(snapshot.controller_state)
+            && snapshot.capabilities.separate_cursor
+            && !snapshot.cursor_state.visible
+            && self.hover_pointer_over_video(ctx, snapshot)
     }
 
     fn apply_pointer_capture_mode(&mut self, ctx: &egui::Context) {
@@ -1308,7 +1333,14 @@ impl StreamApp {
                     } else {
                         egui::CursorGrab::None
                     };
-                    (!overlay_cursor_active, grab)
+                    // Hide the OS cursor while drawing the overlay, and also when
+                    // the server reports its cursor hidden over the video (e.g.
+                    // fullscreen-video auto-hide): the remote shows no cursor, so
+                    // neither should we. The pointer reappears at the video edges
+                    // / local HUD where hover_pointer_over_video stops matching.
+                    let hide_os =
+                        overlay_cursor_active || self.hover_remote_cursor_hidden(ctx, &snapshot);
+                    (!hide_os, grab)
                 }
             }
             // Idle / ForceReleased: the local OS cursor is the real cursor.
@@ -1557,11 +1589,10 @@ impl StreamApp {
         {
             return None;
         }
-        // In CapturedRelative (Game) the server owns the cursor — honor its
-        // visibility so a mouselook-hidden cursor draws nothing.
-        if self.capture_mode == LocalCaptureMode::CapturedRelative
-            && !input_snapshot.cursor_state.visible
-        {
+        // The server owns cursor visibility in both modes: when it reports the
+        // cursor hidden (mouselook in Game, fullscreen-video auto-hide on the
+        // desktop) we draw nothing, so the local view matches the remote.
+        if !input_snapshot.cursor_state.visible {
             return None;
         }
 
