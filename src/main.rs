@@ -211,7 +211,14 @@ struct StreamApp {
     menu_open: bool,
     menu_button_pos: egui::Pos2,
     menu_button_drag_origin: Option<egui::Pos2>,
+    /// Active set of client-HUD rectangles the pointer can be "over" instead of
+    /// the video. Read by `pointer_over_local_overlay`. Holds the rects
+    /// collected during the *previous* frame (see `pending_overlay_hit_rects`),
+    /// so it is complete regardless of the order overlays render in.
     local_overlay_hit_rects: Vec<egui::Rect>,
+    /// Rects registered by overlays *this* frame via `register_overlay_rect`.
+    /// Swapped into `local_overlay_hit_rects` at the start of the next frame.
+    pending_overlay_hit_rects: Vec<egui::Rect>,
     last_pointer_move: Option<Instant>,
     await_pointer_exit_after_auto_release: bool,
     applied_cursor_visible: Option<bool>,
@@ -727,6 +734,7 @@ impl StreamApp {
             menu_button_pos,
             menu_button_drag_origin: None,
             local_overlay_hit_rects: Vec::new(),
+            pending_overlay_hit_rects: Vec::new(),
             last_pointer_move: None,
             await_pointer_exit_after_auto_release: false,
             applied_cursor_visible: None,
@@ -851,6 +859,7 @@ impl StreamApp {
         self.seen_cursor_shape_version = 0;
         self.menu_open = false;
         self.local_overlay_hit_rects.clear();
+        self.pending_overlay_hit_rects.clear();
         let mut s = self.state.lock().unwrap();
         if matches!(*s, ConnectionState::Connecting | ConnectionState::Connected) {
             *s = ConnectionState::Disconnected;
@@ -887,6 +896,7 @@ impl StreamApp {
         self.menu_open = false;
         self.await_pointer_exit_after_auto_release = false;
         self.local_overlay_hit_rects.clear();
+        self.pending_overlay_hit_rects.clear();
     }
 
     /// Entering relative (game) capture by click on a relative-only backend
@@ -1005,6 +1015,16 @@ impl StreamApp {
         self.local_overlay_hit_rects
             .iter()
             .any(|rect| rect.contains(pos))
+    }
+
+    /// The single rule for "this is HUD, not video": every client overlay
+    /// (menu button, menu popup, file-transfer card, debug overlay, graph
+    /// overlay, and any future one) calls this as it renders. The pointer being
+    /// over any registered rect makes the cursor logic keep the OS cursor shown
+    /// instead of the remote overlay. Rects are collected per frame and promoted
+    /// to the active set next frame, so registration order is irrelevant.
+    fn register_overlay_rect(&mut self, rect: egui::Rect) {
+        self.pending_overlay_hit_rects.push(rect);
     }
 
     fn cursor_space_size(&self) -> Option<egui::Vec2> {
@@ -2928,7 +2948,6 @@ impl StreamApp {
     }
 
     fn render_floating_menu(&mut self, ctx: &egui::Context) -> f32 {
-        self.local_overlay_hit_rects.clear();
         let content_rect = ctx.content_rect();
         self.menu_button_pos = clamp_menu_button_pos(self.menu_button_pos, content_rect);
         let recent_pointer_activity = self
@@ -2989,7 +3008,7 @@ impl StreamApp {
             self.menu_button_pos,
             egui::vec2(FLOATING_MENU_BUTTON_SIZE, FLOATING_MENU_BUTTON_SIZE),
         );
-        self.local_overlay_hit_rects.push(button_rect);
+        self.register_overlay_rect(button_rect);
         if button_response.clicked() {
             self.menu_open = !self.menu_open;
             self.last_pointer_move = Some(Instant::now());
@@ -3052,7 +3071,7 @@ impl StreamApp {
                         });
                 });
             let menu_rect = menu.response.rect;
-            self.local_overlay_hit_rects.push(menu_rect);
+            self.register_overlay_rect(menu_rect);
             overlay_top = menu_rect.bottom() + 10.0;
 
             if audio_toggled {
@@ -3229,7 +3248,7 @@ impl StreamApp {
             });
         });
 
-        self.local_overlay_hit_rects.push(resp.response.rect);
+        self.register_overlay_rect(resp.response.rect);
         ctx.request_repaint();
     }
 }
@@ -5792,7 +5811,7 @@ fn render_debug_overlay(
     top_offset: f32,
     debug_tab: &mut DebugOverlayTab,
     cursor_lines: &[String],
-) {
+) -> egui::Rect {
     let stream_line = input_snapshot
         .stream_config
         .as_ref()
@@ -5922,7 +5941,9 @@ fn render_debug_overlay(
                         }
                     });
                 });
-        });
+        })
+        .response
+        .rect
 }
 
 // ---------------------------------------------------------------------------
@@ -5955,6 +5976,11 @@ impl eframe::App for StreamApp {
         }
         self.keep_awake
             .set_active(matches!(state, ConnectionState::Connected));
+        // Promote the overlay rects collected last frame into the active set and
+        // begin a fresh pending set for this frame. This is what lets the HUD
+        // hit-test cover every overlay regardless of the order they render in
+        // (e.g. the debug/graph overlays draw after the cursor logic).
+        self.local_overlay_hit_rects = std::mem::take(&mut self.pending_overlay_hit_rects);
         self.suppress_pointer_pos_frames = self.suppress_pointer_pos_frames.saturating_sub(1);
         self.suppress_mouse_delta = self.suppress_mouse_delta.saturating_sub(1);
         self.os_cursor_hide_settle = self.os_cursor_hide_settle.saturating_sub(1);
@@ -6182,10 +6208,15 @@ impl eframe::App for StreamApp {
             let snapshot = self.debug_state.snapshot();
             if self.debug_enabled {
                 self.graph_overlay.push(&snapshot);
-                self.graph_overlay.render(ctx);
+                // Register both debug overlays as HUD regions (same rule as the
+                // menu) so the pointer over them keeps the OS cursor, not the
+                // remote overlay. They render after the cursor logic, so the
+                // double-buffer makes their rects available next frame.
+                let graph_rect = self.graph_overlay.render(ctx);
+                self.register_overlay_rect(graph_rect);
                 let input_snapshot = self.shared_input.snapshot();
                 let cursor_lines = self.cursor_debug_lines(ctx, &input_snapshot);
-                render_debug_overlay(
+                let debug_rect = render_debug_overlay(
                     ctx,
                     &snapshot,
                     &input_snapshot,
@@ -6197,6 +6228,7 @@ impl eframe::App for StreamApp {
                     &mut self.debug_overlay_tab,
                     &cursor_lines,
                 );
+                self.register_overlay_rect(debug_rect);
             }
         }
 

@@ -62,7 +62,9 @@ impl GraphOverlay {
         self.samples.push_back(s);
     }
 
-    pub fn render(&self, ctx: &egui::Context) {
+    /// Returns the overlay's screen rect so the caller can register it as a HUD
+    /// hit region (keeps the OS cursor shown when the pointer is over the graph).
+    pub fn render(&self, ctx: &egui::Context) -> egui::Rect {
         let screen = ctx.input(|i| i.content_rect());
         let x = screen.right() - PANEL_WIDTH - 10.0;
 
@@ -118,7 +120,9 @@ impl GraphOverlay {
                             |s| s.loss_pct,
                         );
                     });
-            });
+            })
+            .response
+            .rect
     }
 
     fn render_lane(
