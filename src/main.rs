@@ -57,7 +57,9 @@ use std::time::{Duration, Instant};
 use transport::{AudioPacket, MediaReceiver};
 use video_frame::{NativeSurfaceControl, VideoFrameBuffer};
 
-use crate::debug_state::{unix_time_micros, ConnectionDebugSnapshot, ConnectionDebugState};
+use crate::debug_state::{
+    loss_percent, mono_micros, unix_time_micros, ConnectionDebugSnapshot, ConnectionDebugState,
+};
 
 const DEFAULT_APP_PORT: u16 = 28_480;
 const DISCOVERY_PORT: u16 = 28_481;
@@ -109,7 +111,7 @@ struct DiscoveredServer {
     hostname: String,
     address: String,
     token: String,
-    peer_id: Option<String>,
+    peer_id: String,
     last_seen: Instant,
 }
 
@@ -208,6 +210,11 @@ struct StreamApp {
     seen_cursor_shape_version: u64,
     debug_overlay_tab: DebugOverlayTab,
     graph_overlay: graph_overlay::GraphOverlay,
+    /// Throttled cache for the text overlay's General-tab lines. Rebuilding the
+    /// ~12 `format!`ed lines (and cloning the string-heavy snapshot) every frame
+    /// is wasteful; we refresh them at ~6Hz instead.
+    debug_lines_cache: Vec<String>,
+    debug_lines_built: Instant,
     menu_open: bool,
     menu_button_pos: egui::Pos2,
     menu_button_drag_origin: Option<egui::Pos2>,
@@ -326,18 +333,44 @@ fn is_privateish_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn is_public_addr(addr: &str) -> bool {
-    addr_ip(addr)
-        .map(|ip| !is_privateish_ip(ip))
-        .unwrap_or(false)
+/// Reachability class of a server address, used for the connection-path badge.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathClass {
+    /// Same L2 / private LAN — direct, lowest latency.
+    Lan,
+    /// VPN or CGNAT overlay (10.x, 100.64-127, Tailscale) — direct but routed.
+    Vpn,
+    /// Public internet — reached via NAT hole punch.
+    Public,
 }
 
-fn preferred_api_display_addr(host: &api_client::ApiDiscoveredHost) -> Option<String> {
-    host.candidates
-        .iter()
-        .find(|candidate| is_public_addr(candidate))
-        .cloned()
-        .or_else(|| host.candidates.first().cloned())
+fn classify_path(addr: &str) -> PathClass {
+    match addr_ip(addr) {
+        Some(std::net::IpAddr::V4(v4)) => {
+            let o = v4.octets();
+            if (o[0] == 192 && o[1] == 168)
+                || (o[0] == 172 && (16..=31).contains(&o[1]))
+                || v4.is_link_local()
+                || v4.is_loopback()
+            {
+                PathClass::Lan
+            } else if o[0] == 10 || (o[0] == 100 && (64..=127).contains(&o[1])) {
+                PathClass::Vpn
+            } else {
+                PathClass::Public
+            }
+        }
+        Some(std::net::IpAddr::V6(v6)) => {
+            if v6.is_loopback() || v6.is_unicast_link_local() {
+                PathClass::Lan
+            } else if v6.is_unique_local() {
+                PathClass::Vpn
+            } else {
+                PathClass::Public
+            }
+        }
+        None => PathClass::Public,
+    }
 }
 
 fn allow_hole_punch_fallback(socket_addr: std::net::SocketAddr) -> bool {
@@ -589,15 +622,18 @@ fn start_discovery_listener(discovered: Arc<Mutex<Vec<DiscoveredServer>>>, ctx: 
                 Ok((n, src_addr)) => {
                     let data = String::from_utf8_lossy(&buf[..n]);
                     let lines: Vec<&str> = data.lines().collect();
-                    if lines.len() >= 4 && lines[0] == "ST_DISCOVER" {
+                    // peer_id (line 5) is mandatory: it is the identity used to merge
+                    // a machine's LAN and public variants into one card. A beacon
+                    // without it cannot be deduplicated, so ignore it.
+                    let peer_id = lines
+                        .get(4)
+                        .map(|value| value.trim())
+                        .filter(|value| !value.is_empty());
+                    if lines.len() >= 4 && lines[0] == "ST_DISCOVER" && peer_id.is_some() {
                         let hostname = lines[1].to_string();
                         let port: u16 = lines[2].parse().unwrap_or(DEFAULT_APP_PORT);
                         let token = lines[3].to_string();
-                        let peer_id = lines
-                            .get(4)
-                            .map(|value| value.trim())
-                            .filter(|value| !value.is_empty())
-                            .map(str::to_string);
+                        let peer_id = peer_id.unwrap().to_string();
                         let address = format!("{}:{port}", src_addr.ip());
 
                         let mut servers = discovered.lock().unwrap();
@@ -730,6 +766,8 @@ impl StreamApp {
             seen_cursor_shape_version: 0,
             debug_overlay_tab: DebugOverlayTab::General,
             graph_overlay: graph_overlay::GraphOverlay::new(),
+            debug_lines_cache: Vec::new(),
+            debug_lines_built: Instant::now() - Duration::from_secs(1),
             menu_open: false,
             menu_button_pos,
             menu_button_drag_origin: None,
@@ -2276,161 +2314,179 @@ impl StreamApp {
         // ---- Build unified server list from all sources ----
         const ACCENT_GREEN: egui::Color32 = egui::Color32::from_rgb(80, 200, 120);
 
-        // Collect LAN-discovered servers (token-matched, non-expired).
+        // Collect LAN-discovered servers (token-matched, non-expired). The beacon
+        // parser now requires a peer_id, so every LAN entry can be merged by identity.
         let discovered = self.discovered_servers.lock().unwrap().clone();
         let lan_servers: Vec<&DiscoveredServer> = discovered
             .iter()
             .filter(|d| d.token == self.token && !self.token.is_empty())
             .filter(|d| d.last_seen.elapsed() < DISCOVERY_EXPIRY)
             .collect();
-        let lan_addrs: BTreeSet<String> = lan_servers.iter().map(|d| d.address.clone()).collect();
-        let lan_peer_ids: BTreeSet<String> = lan_servers
-            .iter()
-            .filter_map(|d| d.peer_id.clone())
-            .collect();
 
-        // Collect API-discovered host: prefer a public address for fallback UI,
-        // but suppress the API card entirely when the same peer is already on LAN.
-        let api_host = self.api_discovery.host.lock().unwrap().clone();
-        let api_best: Option<(String, Option<String>, Option<String>)> = api_host
-            .as_ref()
-            .filter(|h| !h.candidates.is_empty() && h.last_seen.elapsed() < Duration::from_secs(15))
-            .and_then(|h| {
-                if h.peer_id
-                    .as_ref()
-                    .map(|peer_id| lan_peer_ids.contains(peer_id))
-                    .unwrap_or(false)
-                {
-                    None
-                } else {
-                    preferred_api_display_addr(h)
-                        .map(|addr| (addr, h.hostname.clone(), h.peer_id.clone()))
-                }
+        // API-discovered host. peer_id is mandatory to merge it against a LAN/saved
+        // variant of the same machine; without it we cannot tell variants apart, so
+        // an identity-less API host is dropped (the server always advertises one).
+        let api_host = self
+            .api_discovery
+            .host
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|h| {
+                !h.candidates.is_empty()
+                    && h.last_seen.elapsed() < Duration::from_secs(15)
+                    && h.peer_id.as_ref().map(|p| !p.is_empty()).unwrap_or(false)
             });
-        // For the empty-check below.
-        let api_candidates: Vec<String> = api_best.iter().map(|(a, _, _)| a.clone()).collect();
+        let any_api = api_host.is_some();
+
+        // Aggregate every reachable variant of a logical server, keyed by peer_id.
+        // The same machine can be seen at once over LAN (beacon) and the public
+        // internet (API candidates); collapse them into one card and pick the best
+        // path, so a public-only card upgrades to LAN in place the moment a beacon
+        // arrives for the same peer_id.
+        #[derive(Default)]
+        struct Variant {
+            lan_addr: Option<String>,
+            api_addr: Option<String>,
+            hostname: Option<String>,
+        }
+        let mut by_peer: BTreeMap<String, Variant> = BTreeMap::new();
+        for d in &lan_servers {
+            let v = by_peer.entry(d.peer_id.clone()).or_default();
+            v.lan_addr = Some(d.address.clone());
+            if v.hostname.is_none() && !d.hostname.is_empty() {
+                v.hostname = Some(d.hostname.clone());
+            }
+        }
+        if let Some(h) = &api_host {
+            let pid = h.peer_id.clone().expect("filtered for non-empty peer_id above");
+            let v = by_peer.entry(pid).or_default();
+            // Candidates are pre-sorted LAN > VPN > public; first is the best path.
+            if v.api_addr.is_none() {
+                v.api_addr = h.candidates.first().cloned();
+            }
+            if v.hostname.is_none() {
+                v.hostname = h.hostname.clone();
+            }
+        }
+
+        // Best address + path for a discovered variant: prefer a confirmed LAN beacon
+        // (we literally received a packet from it) over advertised API candidates.
+        let best_path = |v: &Variant| -> Option<(String, PathClass)> {
+            if let Some(a) = &v.lan_addr {
+                return Some((a.clone(), classify_path(a)));
+            }
+            v.api_addr.as_ref().map(|a| (a.clone(), classify_path(a)))
+        };
 
         // Merged entry for rendering.
         struct MergedServer {
-            address: String,
+            card_key: String, // stable egui id: peer_id when known, else address
+            connect_addr: String,
             display_name: String,
             subtitle: String,
             peer_id: Option<String>,
-            is_lan: bool,
-            is_dynamic: bool, // LAN or API discovered — don't allow delete
+            path: Option<PathClass>, // Some only when a live variant exists
+            is_dynamic: bool,        // currently discovered — don't allow delete
             saved_idx: Option<usize>,
             icon_active: bool,
         }
 
         let mut merged: Vec<MergedServer> = Vec::new();
-        let mut seen_addrs: BTreeSet<String> = BTreeSet::new();
-        let mut seen_peer_ids: BTreeSet<String> = BTreeSet::new();
+        let mut used_peers: BTreeSet<String> = BTreeSet::new();
+        // card_key must be unique — egui persistent ids collide otherwise.
+        let mut seen_keys: BTreeSet<String> = BTreeSet::new();
 
-        // 1) Saved servers (preserve order: most recently connected first).
+        // 1) Saved servers (most recently connected first), upgraded to their live
+        //    variant when one is currently discovered.
         let mut indices: Vec<usize> = (0..self.server_list.len()).collect();
         indices.sort_by(|&a, &b| {
             self.server_list[b]
                 .last_connected
                 .cmp(&self.server_list[a].last_connected)
         });
-        let api_addr = api_best.as_ref().map(|(a, _, _)| a.clone());
-        for idx in &indices {
-            let entry = &self.server_list[*idx];
-            if let Some(peer_id) = entry.peer_id.as_ref() {
-                if lan_peer_ids.contains(peer_id) || seen_peer_ids.contains(peer_id) {
-                    continue;
-                }
+        for idx in indices {
+            let entry = &self.server_list[idx];
+            let card_key = entry
+                .peer_id
+                .clone()
+                .unwrap_or_else(|| entry.address.clone());
+            // Skip a second saved entry that resolves to the same machine.
+            if !seen_keys.insert(card_key.clone()) {
+                continue;
             }
-            let is_lan = lan_addrs.contains(&entry.address);
-            let is_api = api_addr.as_deref() == Some(entry.address.as_str());
-            let display_name = if entry.nickname.is_empty() {
-                entry.address.clone()
-            } else {
-                entry.nickname.clone()
+            let live = entry
+                .peer_id
+                .as_ref()
+                .and_then(|pid| by_peer.get(pid).map(|v| (pid.clone(), v)));
+            let (connect_addr, path, host, online) = match live {
+                Some((pid, v)) => match best_path(v) {
+                    Some((addr, p)) => {
+                        used_peers.insert(pid);
+                        (addr, Some(p), v.hostname.clone(), true)
+                    }
+                    None => (entry.address.clone(), None, None, false),
+                },
+                None => (entry.address.clone(), None, None, false),
             };
-            let subtitle = if !entry.nickname.is_empty() {
+            let display_name = if !entry.nickname.is_empty() {
+                entry.nickname.clone()
+            } else if let Some(h) = host.as_ref().filter(|h| !h.is_empty()) {
+                h.clone()
+            } else {
+                entry.address.clone()
+            };
+            let subtitle = if online {
+                truncate_str(&connect_addr, 24).to_string()
+            } else if !entry.nickname.is_empty() {
                 truncate_str(&entry.address, 24).to_string()
             } else {
                 format_last_connected(entry.last_connected)
             };
-            seen_addrs.insert(entry.address.clone());
-            if let Some(peer_id) = entry.peer_id.as_ref() {
-                seen_peer_ids.insert(peer_id.clone());
-            }
             merged.push(MergedServer {
-                address: entry.address.clone(),
+                card_key,
+                connect_addr,
                 display_name,
                 subtitle,
                 peer_id: entry.peer_id.clone(),
-                is_lan,
-                is_dynamic: is_lan || is_api,
-                saved_idx: Some(*idx),
-                icon_active: entry.last_connected > 0 || is_lan || is_api,
+                path,
+                is_dynamic: online,
+                saved_idx: Some(idx),
+                icon_active: entry.last_connected > 0 || online,
             });
         }
 
-        // 2) LAN-discovered servers not already in the saved list.
-        for srv in &lan_servers {
-            if srv
-                .peer_id
-                .as_ref()
-                .map(|peer_id| seen_peer_ids.contains(peer_id))
-                .unwrap_or(false)
-            {
+        // 2) Discovered servers (LAN and/or API) with no saved entry yet.
+        for (pid, v) in &by_peer {
+            if used_peers.contains(pid) || !seen_keys.insert(pid.clone()) {
                 continue;
             }
-            if !seen_addrs.contains(&srv.address) {
-                seen_addrs.insert(srv.address.clone());
-                if let Some(peer_id) = srv.peer_id.as_ref() {
-                    seen_peer_ids.insert(peer_id.clone());
-                }
-                merged.push(MergedServer {
-                    address: srv.address.clone(),
-                    display_name: srv.hostname.clone(),
-                    subtitle: truncate_str(&srv.address, 24).to_string(),
-                    peer_id: srv.peer_id.clone(),
-                    is_lan: true,
-                    is_dynamic: true,
-                    saved_idx: None,
-                    icon_active: true,
-                });
-            }
-        }
-
-        // 3) API-discovered best candidate (not already shown).
-        if let Some((ref addr, ref hostname, ref peer_id)) = api_best {
-            let peer_seen = peer_id
-                .as_ref()
-                .map(|peer_id| seen_peer_ids.contains(peer_id))
-                .unwrap_or(false);
-            if !peer_seen && !seen_addrs.contains(addr) {
-                seen_addrs.insert(addr.clone());
-                if let Some(peer_id) = peer_id.as_ref() {
-                    seen_peer_ids.insert(peer_id.clone());
-                }
-                let name = hostname.as_deref().unwrap_or(addr.as_str());
-                merged.push(MergedServer {
-                    address: addr.clone(),
-                    display_name: name.to_string(),
-                    subtitle: if hostname.is_some() {
-                        addr.clone()
-                    } else {
-                        String::new()
-                    },
-                    peer_id: peer_id.clone(),
-                    is_lan: false,
-                    is_dynamic: true,
-                    saved_idx: None,
-                    icon_active: true,
-                });
-            }
+            let Some((addr, path)) = best_path(v) else {
+                continue;
+            };
+            let display_name = v
+                .hostname
+                .clone()
+                .filter(|h| !h.is_empty())
+                .unwrap_or_else(|| addr.clone());
+            merged.push(MergedServer {
+                card_key: pid.clone(),
+                connect_addr: addr.clone(),
+                display_name,
+                subtitle: truncate_str(&addr, 24).to_string(),
+                peer_id: Some(pid.clone()),
+                path: Some(path),
+                is_dynamic: true,
+                saved_idx: None,
+                icon_active: true,
+            });
         }
 
         // Filter by search query.
         let query = self.search_query.trim().to_lowercase();
         if !query.is_empty() {
             merged.retain(|m| {
-                m.address.to_lowercase().contains(&query)
+                m.connect_addr.to_lowercase().contains(&query)
                     || m.display_name.to_lowercase().contains(&query)
             });
         }
@@ -2441,10 +2497,7 @@ impl StreamApp {
         if merged.is_empty() {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
-                let msg = if self.server_list.is_empty()
-                    && lan_servers.is_empty()
-                    && api_candidates.is_empty()
-                {
+                let msg = if self.server_list.is_empty() && lan_servers.is_empty() && !any_api {
                     "No computers\nAdd a server address using the bar below."
                 } else {
                     "No matches"
@@ -2483,7 +2536,7 @@ impl StreamApp {
                         }
                         let srv = &merged[card_i];
                         let (_, card_rect) = ui.allocate_space(egui::vec2(CARD_W, CARD_H));
-                        let card_id = ui.make_persistent_id(("server-card", srv.address.as_str()));
+                        let card_id = ui.make_persistent_id(("server-card", srv.card_key.as_str()));
                         let hover = ui
                             .interact(card_rect, card_id, egui::Sense::hover())
                             .hovered();
@@ -2528,8 +2581,16 @@ impl StreamApp {
                             );
                         }
 
-                        // LAN badge
-                        if srv.is_lan {
+                        // Connection-path badge (LAN / VPN / WAN), shown only for a
+                        // live discovered variant. Flips in place as the path upgrades.
+                        if let Some(path) = srv.path {
+                            const ACCENT_VPN: egui::Color32 = egui::Color32::from_rgb(90, 160, 230);
+                            const ACCENT_WAN: egui::Color32 = egui::Color32::from_rgb(220, 170, 90);
+                            let (label, color) = match path {
+                                PathClass::Lan => ("LAN", ACCENT_GREEN),
+                                PathClass::Vpn => ("VPN", ACCENT_VPN),
+                                PathClass::Public => ("WAN", ACCENT_WAN),
+                            };
                             let badge_y = if srv.subtitle.is_empty() {
                                 sub_y
                             } else {
@@ -2538,9 +2599,9 @@ impl StreamApp {
                             painter.text(
                                 egui::pos2(icon_cx, badge_y),
                                 egui::Align2::CENTER_CENTER,
-                                "LAN",
+                                label,
                                 egui::FontId::proportional(9.0),
-                                ACCENT_GREEN,
+                                color,
                             );
                         }
 
@@ -2553,7 +2614,7 @@ impl StreamApp {
                         );
                         let btn_resp = ui.interact(
                             btn_rect,
-                            ui.make_persistent_id(("server-connect", srv.address.as_str())),
+                            ui.make_persistent_id(("server-connect", srv.card_key.as_str())),
                             egui::Sense::click(),
                         );
                         let btn_fill = if btn_resp.hovered() {
@@ -2576,20 +2637,28 @@ impl StreamApp {
                             TEXT_WHITE,
                         );
                         if btn_resp.clicked() {
-                            connect_addr = Some(srv.address.clone());
+                            connect_addr = Some(srv.connect_addr.clone());
+                            // Backfill the saved entry: match by stable peer_id when
+                            // known (the connect address may be a freshly-discovered
+                            // LAN addr that differs from what was saved), else address.
+                            let sl = &mut self.server_list;
+                            let found = srv
+                                .peer_id
+                                .as_ref()
+                                .and_then(|pid| {
+                                    sl.iter().position(|e| e.peer_id.as_deref() == Some(pid))
+                                })
+                                .or_else(|| sl.iter().position(|e| e.address == srv.connect_addr));
                             let mut changed = false;
-                            if let Some(entry) = self
-                                .server_list
-                                .iter_mut()
-                                .find(|e| e.address == srv.address)
-                            {
-                                // Copy hostname as nickname for LAN-discovered entries.
-                                if srv.saved_idx.is_none() {
-                                    if entry.nickname.is_empty() && srv.display_name != srv.address
-                                    {
-                                        entry.nickname = srv.display_name.clone();
-                                        changed = true;
-                                    }
+                            if let Some(i) = found {
+                                let entry = &mut sl[i];
+                                // Copy hostname as nickname for discovered entries.
+                                if srv.saved_idx.is_none()
+                                    && entry.nickname.is_empty()
+                                    && srv.display_name != srv.connect_addr
+                                {
+                                    entry.nickname = srv.display_name.clone();
+                                    changed = true;
                                 }
                                 if entry.peer_id.is_none() {
                                     entry.peer_id = srv.peer_id.clone();
@@ -2609,7 +2678,7 @@ impl StreamApp {
                             );
                             let x_resp = ui.interact(
                                 x_rect,
-                                ui.make_persistent_id(("server-delete", srv.address.as_str())),
+                                ui.make_persistent_id(("server-delete", srv.card_key.as_str())),
                                 egui::Sense::click(),
                             );
                             if hover {
@@ -3019,6 +3088,10 @@ impl StreamApp {
             let mut request_disconnect = false;
             let mut audio_toggled = false;
             let mut debug_toggled = false;
+            let mut selected_output_request: Option<u32> = None;
+            let menu_snapshot = self.shared_input.snapshot();
+            let available_outputs = menu_snapshot.available_outputs.clone();
+            let selected_output = menu_snapshot.selected_output;
             let menu_left = button_rect.left().clamp(
                 content_rect.left(),
                 (content_rect.right() - 190.0).max(content_rect.left()),
@@ -3063,6 +3136,35 @@ impl StreamApp {
                                     debug_toggled = true;
                                 }
 
+                                // Monitor picker — only when the server reports
+                                // more than one capturable output (KMS path).
+                                if available_outputs.len() > 1 {
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                    ui.add_space(4.0);
+                                    ui.label(egui::RichText::new("Monitor").size(12.0).weak());
+                                    for out in &available_outputs {
+                                        let is_selected = selected_output == Some(out.id);
+                                        let label = format!(
+                                            "{}{} ({}×{})",
+                                            if is_selected { "● " } else { "   " },
+                                            out.name,
+                                            out.width,
+                                            out.height
+                                        );
+                                        let mut button = egui::Button::new(label);
+                                        if is_selected {
+                                            button = button
+                                                .fill(egui::Color32::from_rgb(40, 70, 110));
+                                        }
+                                        if ui.add_sized([170.0, 26.0], button).clicked()
+                                            && !is_selected
+                                        {
+                                            selected_output_request = Some(out.id);
+                                        }
+                                    }
+                                }
+
                                 ui.add_space(8.0);
                                 ui.separator();
                                 ui.add_space(8.0);
@@ -3085,6 +3187,14 @@ impl StreamApp {
                 save_debug_enabled(self.debug_enabled);
                 self.debug_enabled_flag
                     .store(self.debug_enabled, Ordering::SeqCst);
+            }
+            if let Some(id) = selected_output_request {
+                if let Some(tx) = &self.control_tx {
+                    let _ = tx.send(ControlMessage::SelectOutput(id));
+                }
+                // Optimistically reflect the choice so the picker highlights it
+                // immediately; the server confirms with a SelectOutput echo.
+                self.shared_input.set_selected_output(id);
             }
             if request_disconnect {
                 self.disconnect();
@@ -3886,6 +3996,14 @@ fn run_connection(
                             shared_input.set_cursor_state(cursor_state);
                             ctx.request_repaint();
                         }
+                        ControlMessage::AvailableOutputs(outputs) => {
+                            shared_input.set_available_outputs(outputs);
+                            ctx.request_repaint();
+                        }
+                        ControlMessage::SelectOutput(id) => {
+                            shared_input.set_selected_output(id);
+                            ctx.request_repaint();
+                        }
                         ControlMessage::StreamStarted => {
                             if trace_enabled() {
                                 eprintln!("[trace][client] received StreamStarted");
@@ -4146,6 +4264,14 @@ fn run_connection(
                         }
                         ControlMessage::CursorState(cursor_state) => {
                             shared_input.set_cursor_state(cursor_state);
+                            ctx.request_repaint();
+                        }
+                        ControlMessage::AvailableOutputs(outputs) => {
+                            shared_input.set_available_outputs(outputs);
+                            ctx.request_repaint();
+                        }
+                        ControlMessage::SelectOutput(id) => {
+                            shared_input.set_selected_output(id);
                             ctx.request_repaint();
                         }
                         ControlMessage::ClipboardText(text) => {
@@ -4469,6 +4595,12 @@ fn run_punched_session(
                     ControlMessage::ControllerState(cs) => {
                         shared_input.set_controller_state(cs);
                     }
+                    ControlMessage::AvailableOutputs(outputs) => {
+                        shared_input.set_available_outputs(outputs);
+                    }
+                    ControlMessage::SelectOutput(id) => {
+                        shared_input.set_selected_output(id);
+                    }
                     _ => {}
                 }
             }
@@ -4727,6 +4859,14 @@ fn run_punched_session(
                                 }
                                 ControlMessage::CursorState(cs) => {
                                     shared_input.set_cursor_state(cs);
+                                    ctx.request_repaint();
+                                }
+                                ControlMessage::AvailableOutputs(outputs) => {
+                                    shared_input.set_available_outputs(outputs);
+                                    ctx.request_repaint();
+                                }
+                                ControlMessage::SelectOutput(id) => {
+                                    shared_input.set_selected_output(id);
                                     ctx.request_repaint();
                                 }
                                 ControlMessage::ClipboardText(text) => {
@@ -5800,18 +5940,21 @@ fn stream_chroma_label(chroma: VideoChromaSampling) -> &'static str {
     }
 }
 
-fn render_debug_overlay(
-    ctx: &egui::Context,
+/// Format an optional millisecond latency stage, dashing out missing samples
+/// (e.g. before clock sync lands, or when a clock skew produced a negative diff).
+fn fmt_ms(v: Option<f32>) -> String {
+    v.map(|x| format!("{x:.1}"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn build_debug_general_lines(
     snapshot: &ConnectionDebugSnapshot,
     input_snapshot: &input::SharedInputSnapshot,
     capture_mode: LocalCaptureMode,
     audio_enabled: bool,
     pointer_buttons: u8,
     pressed_keys: usize,
-    top_offset: f32,
-    debug_tab: &mut DebugOverlayTab,
-    cursor_lines: &[String],
-) -> egui::Rect {
+) -> Vec<String> {
     let stream_line = input_snapshot
         .stream_config
         .as_ref()
@@ -5830,7 +5973,7 @@ fn render_debug_overlay(
         })
         .unwrap_or_else(|| "-".to_string());
 
-    let general_lines = vec![
+    vec![
         format!("server: {}", snapshot.server_addr),
         format!("stream: {stream_line}"),
         format!(
@@ -5915,8 +6058,65 @@ fn render_debug_overlay(
                 snapshot.last_present_path.as_str()
             }
         ),
-    ];
+        format!(
+            "net: {:.0} kbps (video {:.0} / audio {:.0})  target={}",
+            snapshot.received_total_kbps,
+            snapshot.received_video_kbps,
+            snapshot.received_audio_kbps,
+            snapshot
+                .target_bitrate_kbps
+                .map(|b| format!("{b} kbps"))
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        format!(
+            "fps: recv {:.1}  decode {:.1}  present {:.1}",
+            snapshot.receive_fps, snapshot.decode_fps, snapshot.present_fps,
+        ),
+        format!(
+            "packets: rx={} lost={} late={} dropped_frames={} playout_drops={}  loss={:.2}%",
+            snapshot.received_packets,
+            snapshot.lost_packets,
+            snapshot.late_packets,
+            snapshot.dropped_frames,
+            snapshot.playout_drops,
+            loss_percent(
+                snapshot.received_packets,
+                snapshot.lost_packets,
+                snapshot.dropped_frames,
+                snapshot.completed_frames,
+            ),
+        ),
+        format!(
+            "latency ms: cap\u{2192}send {} | send\u{2192}asm {} | asm\u{2192}dec {} | decode {} | dec\u{2192}present {} | total {}",
+            fmt_ms(snapshot.capture_to_send_ms),
+            fmt_ms(snapshot.send_to_assemble_ms),
+            fmt_ms(snapshot.assemble_to_decode_ms),
+            fmt_ms(snapshot.decode_work_ms),
+            fmt_ms(snapshot.decode_to_present_ms),
+            fmt_ms(snapshot.total_latency_ms),
+        ),
+        format!(
+            "latency total ms: avg {} | p95 {} | max {}  (last 3s)",
+            fmt_ms(snapshot.total_latency_ms),
+            fmt_ms(snapshot.latency_p95_ms),
+            fmt_ms(snapshot.latency_max_ms),
+        ),
+        format!(
+            "clock: rtt={} ms  server_ahead={} ms  fb_window={} ms",
+            fmt_ms(snapshot.clock_rtt_ms),
+            fmt_ms(snapshot.server_clock_ahead_ms),
+            snapshot.transport_interval_ms,
+        ),
+    ]
+}
 
+fn render_debug_overlay(
+    ctx: &egui::Context,
+    general_lines: &[String],
+    cursor_lines: &[String],
+    top_offset: f32,
+    debug_tab: &mut DebugOverlayTab,
+) -> egui::Rect {
     let max_width = (ctx.content_rect().width() - 20.0).clamp(260.0, 560.0);
 
     egui::Area::new(egui::Id::new("debug_overlay"))
@@ -5933,7 +6133,7 @@ fn render_debug_overlay(
                     ui.separator();
                     ui.vertical(|ui| {
                         let lines: &[String] = match *debug_tab {
-                            DebugOverlayTab::General => &general_lines,
+                            DebugOverlayTab::General => general_lines,
                             DebugOverlayTab::Cursor => cursor_lines,
                         };
                         for line in lines {
@@ -6030,8 +6230,11 @@ impl eframe::App for StreamApp {
                 None
             } else if self.video_texture.stage_direct_frame(&self.upload_frame) {
                 if self.debug_enabled {
-                    self.debug_state
-                        .record_present(&self.upload_frame, unix_time_micros());
+                    self.debug_state.record_present(
+                        &self.upload_frame,
+                        unix_time_micros(),
+                        mono_micros(),
+                    );
                 }
                 None
             } else {
@@ -6042,8 +6245,11 @@ impl eframe::App for StreamApp {
                 ) {
                     Ok(()) => {
                         if self.debug_enabled {
-                            self.debug_state
-                                .record_present(&self.upload_frame, unix_time_micros());
+                            self.debug_state.record_present(
+                                &self.upload_frame,
+                                unix_time_micros(),
+                                mono_micros(),
+                            );
                         }
                         None
                     }
@@ -6204,32 +6410,46 @@ impl eframe::App for StreamApp {
             }
         });
 
-        if state == ConnectionState::Connected {
-            let snapshot = self.debug_state.snapshot();
-            if self.debug_enabled {
-                self.graph_overlay.push(&snapshot);
-                // Register both debug overlays as HUD regions (same rule as the
-                // menu) so the pointer over them keeps the OS cursor, not the
-                // remote overlay. They render after the cursor logic, so the
-                // double-buffer makes their rects available next frame.
-                let graph_rect = self.graph_overlay.render(ctx);
-                self.register_overlay_rect(graph_rect);
-                let input_snapshot = self.shared_input.snapshot();
-                let cursor_lines = self.cursor_debug_lines(ctx, &input_snapshot);
-                let debug_rect = render_debug_overlay(
-                    ctx,
+        if state == ConnectionState::Connected && self.debug_enabled {
+            // Graph: feed it the cheap Copy metrics view every frame (no String
+            // clones). It self-throttles its own sampling to ~6Hz internally.
+            let metrics = self.debug_state.metrics();
+            self.graph_overlay.push(&metrics);
+            // Register both debug overlays as HUD regions (same rule as the
+            // menu) so the pointer over them keeps the OS cursor, not the
+            // remote overlay. They render after the cursor logic, so the
+            // double-buffer makes their rects available next frame.
+            let graph_rect = self.graph_overlay.render(ctx);
+            self.register_overlay_rect(graph_rect);
+
+            let input_snapshot = self.shared_input.snapshot();
+            let cursor_lines = self.cursor_debug_lines(ctx, &input_snapshot);
+
+            // Text overlay: rebuilding the lines (and cloning the string-heavy
+            // full snapshot) every frame is wasteful, so refresh at ~6Hz.
+            if self.debug_lines_cache.is_empty()
+                || self.debug_lines_built.elapsed() >= Duration::from_millis(150)
+            {
+                let snapshot = self.debug_state.snapshot();
+                self.debug_lines_cache = build_debug_general_lines(
                     &snapshot,
                     &input_snapshot,
                     self.capture_mode,
                     self.audio_enabled,
                     self.pointer_buttons,
                     self.keyboard_state.pressed_count(),
-                    debug_top,
-                    &mut self.debug_overlay_tab,
-                    &cursor_lines,
                 );
-                self.register_overlay_rect(debug_rect);
+                self.debug_lines_built = Instant::now();
             }
+
+            let debug_rect = render_debug_overlay(
+                ctx,
+                &self.debug_lines_cache,
+                &cursor_lines,
+                debug_top,
+                &mut self.debug_overlay_tab,
+            );
+            self.register_overlay_rect(debug_rect);
         }
 
         self.apply_pointer_capture_mode(ctx);

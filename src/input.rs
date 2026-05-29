@@ -1,7 +1,7 @@
 use eframe::egui;
 use st_protocol::{
-    ControllerState, CursorShape, CursorState, InputCapabilities, KeyboardKey, StreamConfig,
-    KEYBOARD_STATE_BYTES,
+    control::OutputInfo, ControllerState, CursorShape, CursorState, InputCapabilities, KeyboardKey,
+    StreamConfig, KEYBOARD_STATE_BYTES,
 };
 use std::sync::Mutex;
 
@@ -62,6 +62,12 @@ pub struct SharedInputSnapshot {
     pub cursor_state: CursorState,
     pub cursor_shape_version: u64,
     pub cursor_state_version: u64,
+    /// Monitors the server can capture. Empty when the server can't enumerate
+    /// (portal fallback) — the picker stays hidden.
+    pub available_outputs: Vec<OutputInfo>,
+    /// The output currently captured (`OutputInfo::id`), as reported by the
+    /// server. `None` until the server tells us.
+    pub selected_output: Option<u32>,
 }
 
 impl Default for SharedInputSnapshot {
@@ -75,6 +81,8 @@ impl Default for SharedInputSnapshot {
             cursor_state: CursorState::default(),
             cursor_shape_version: 0,
             cursor_state_version: 0,
+            available_outputs: Vec::new(),
+            selected_output: None,
         }
     }
 }
@@ -124,6 +132,14 @@ impl SharedInputState {
         let mut inner = self.inner.lock().unwrap();
         inner.cursor_state = cursor_state;
         inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
+    }
+
+    pub fn set_available_outputs(&self, outputs: Vec<OutputInfo>) {
+        self.inner.lock().unwrap().available_outputs = outputs;
+    }
+
+    pub fn set_selected_output(&self, id: u32) {
+        self.inner.lock().unwrap().selected_output = Some(id);
     }
 }
 
