@@ -61,7 +61,10 @@ impl GraphOverlay {
             fps: m.present_fps,
             // Plot the recent *peak* latency, not the smoothed mean, so a brief
             // hitch between sample ticks still shows up as a spike.
-            latency_ms: m.latency_recent_max_ms.or(m.total_latency_ms).unwrap_or(0.0),
+            latency_ms: m
+                .latency_recent_max_ms
+                .or(m.total_latency_ms)
+                .unwrap_or(0.0),
             decode_ms: m.decode_work_ms.unwrap_or(0.0),
             rtt_ms: m.clock_rtt_ms.unwrap_or(0.0),
             loss_pct: loss_percent(
@@ -230,7 +233,10 @@ impl GraphOverlay {
             // Average line (faint, lane-colored).
             let avg_y = y_for(avg);
             painter.line_segment(
-                [egui::pos2(graph_left, avg_y), egui::pos2(graph_right, avg_y)],
+                [
+                    egui::pos2(graph_left, avg_y),
+                    egui::pos2(graph_right, avg_y),
+                ],
                 egui::Stroke::new(
                     0.5,
                     egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 90),
@@ -253,7 +259,9 @@ impl GraphOverlay {
                 .samples
                 .iter()
                 .enumerate()
-                .map(|(i, s)| egui::pos2(graph_left + x_offset + i as f32 * step, y_for(extract(s))))
+                .map(|(i, s)| {
+                    egui::pos2(graph_left + x_offset + i as f32 * step, y_for(extract(s)))
+                })
                 .collect();
 
             let line_color = if warn { WARN_COLOR } else { color };

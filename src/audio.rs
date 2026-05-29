@@ -206,8 +206,9 @@ pub fn run_audio_pipeline(
                             }
                             // Slot immediately before the primary is also
                             // recoverable from the primary's in-band LBRR FEC.
-                            if !decoded && distance_from_primary == 1 {
-                                if decode_and_enqueue(
+                            if !decoded
+                                && distance_from_primary == 1
+                                && decode_and_enqueue(
                                     &mut decoder,
                                     &packet.data,
                                     true,
@@ -217,13 +218,12 @@ pub fn run_audio_pipeline(
                                     max_buffer_samples,
                                 )
                                 .is_ok()
-                                {
-                                    via_fec += 1;
-                                    decoded = true;
-                                }
+                            {
+                                via_fec += 1;
+                                decoded = true;
                             }
-                            if !decoded {
-                                if decode_and_enqueue(
+                            if !decoded
+                                && decode_and_enqueue(
                                     &mut decoder,
                                     &[],
                                     false,
@@ -233,9 +233,8 @@ pub fn run_audio_pipeline(
                                     max_buffer_samples,
                                 )
                                 .is_ok()
-                                {
-                                    via_plc += 1;
-                                }
+                            {
+                                via_plc += 1;
                             }
                         }
 
@@ -310,6 +309,7 @@ fn configured_audio_buffer_samples(var: &str, default_ms: usize) -> usize {
     (SAMPLE_RATE as usize * CHANNELS as usize * buffer_ms) / 1000
 }
 
+#[allow(clippy::too_many_arguments)]
 fn trim_packet_backlog(
     opus_rx: &Receiver<AudioPacket>,
     latest_packet: &mut AudioPacket,
@@ -407,9 +407,9 @@ fn apply_crossfade_ramp(chunk: &mut [f32], anchor: f32) {
     if len == 0 {
         return;
     }
-    for i in 0..len {
+    for (i, sample) in chunk.iter_mut().take(len).enumerate() {
         let t = (i + 1) as f32 / len as f32;
-        chunk[i] = anchor * (1.0 - t) + chunk[i] * t;
+        *sample = anchor * (1.0 - t) + *sample * t;
     }
 }
 

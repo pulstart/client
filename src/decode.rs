@@ -176,6 +176,17 @@ fn frame_id_is_newer(candidate: u32, previous: u32) -> bool {
     delta > 0 && delta < 0x8000_0000
 }
 
+/// Returns true when `current` is discontinuous from `previous` in a way that
+/// means one or more encoded units were lost (a forward jump greater than one).
+/// `delta == 1` is the normal contiguous case, `delta == 0` is a duplicate, and
+/// a backward delta (`>= 2^31` under wrapping) is a stale/reordered older unit —
+/// none of those are gaps. Wrapping arithmetic keeps this correct across the
+/// u32 frame-id wraparound.
+fn frame_id_indicates_gap(previous: u32, current: u32) -> bool {
+    let delta = current.wrapping_sub(previous);
+    delta != 0 && delta != 1 && delta < 0x8000_0000
+}
+
 fn decoded_frame_id(frame: &VideoFrame) -> Option<u32> {
     frame
         .timestamp()
@@ -202,6 +213,16 @@ pub struct VideoDecoder {
     consecutive_failures: u32,
     waiting_for_recovery: bool,
     last_output_frame_id: Option<u32>,
+    // Frame id of the last encoded unit actually fed to the decoder. The server
+    // assigns strictly contiguous (+1, wrapping) frame ids per emitted access
+    // unit with no B-frame reordering, so a jump here means one or more units
+    // were lost. Feeding the inter-frames that follow a gap would decode against
+    // references we never received and produce macroblock corruption, so a gap
+    // deterministically triggers recovery — regardless of when (or whether) the
+    // transport layer flagged the loss. This is the single source of truth for
+    // recovery; it cannot desync from the receive/drain loop the way a shared
+    // "pending recovery" flag did.
+    last_input_frame_id: Option<u32>,
     decoder_name: String,
     hardware_accelerated: bool,
 }
@@ -637,6 +658,7 @@ impl VideoDecoder {
             consecutive_failures: 0,
             waiting_for_recovery: false,
             last_output_frame_id: None,
+            last_input_frame_id: None,
             decoder_name: name.to_string(),
             hardware_accelerated: true,
         })
@@ -670,6 +692,7 @@ impl VideoDecoder {
             consecutive_failures: 0,
             waiting_for_recovery: false,
             last_output_frame_id: None,
+            last_input_frame_id: None,
             decoder_name: name.to_string(),
             hardware_accelerated: false,
         })
@@ -686,6 +709,21 @@ impl VideoDecoder {
     ) -> Result<DecodeOutput, String> {
         self.refresh_native_surface_capabilities();
         let has_recovery_point = packet_has_recovery_point(self.codec_id, nal_data);
+
+        // Deterministic gap detection (see `last_input_frame_id`): a jump in the
+        // input frame id means encoded units were lost. The inter-frames after
+        // the gap reference data we never decoded, so decoding them paints
+        // macroblock corruption until the next keyframe. Enter recovery instead
+        // and wait for a recovery point. Recovery points reset the reference
+        // chain, so they are exempt from the gap check.
+        if !has_recovery_point && !self.waiting_for_recovery {
+            if let Some(prev) = self.last_input_frame_id {
+                if frame_id_indicates_gap(prev, packet_frame_id) {
+                    self.enter_recovery_mode("input frame id gap");
+                }
+            }
+        }
+
         if self.waiting_for_recovery && !has_recovery_point {
             return Ok(DecodeOutput::default());
         }
@@ -694,6 +732,11 @@ impl VideoDecoder {
                 ffmpeg::sys::avcodec_flush_buffers(self.decoder.as_mut_ptr());
             }
         }
+        // Committed to feeding this unit: record it as the continuity baseline.
+        // Skipped units (early-returned above) intentionally leave the baseline
+        // untouched so the next accepted unit is still compared to the last one
+        // we actually decoded.
+        self.last_input_frame_id = Some(packet_frame_id);
         let pkt = StampedBorrowedPacket::new(nal_data, Some(packet_frame_id));
 
         if let Err(e) = self.decoder.send_packet(&pkt) {
@@ -1330,8 +1373,61 @@ fn packet_has_recovery_point(codec: VideoCodec, data: &[u8]) -> bool {
     match codec {
         VideoCodec::H264 => h264_has_recovery_nal(data),
         VideoCodec::Hevc => hevc_has_recovery_nal(data),
-        VideoCodec::Av1 => true,
+        VideoCodec::Av1 => av1_has_recovery_nal(data),
     }
+}
+
+/// Detect an AV1 recovery point by walking the low-overhead OBU stream and
+/// looking for a sequence-header OBU (type 1) — the encoder only emits one at a
+/// keyframe / start of a coded video sequence, so it is the AV1 analogue of
+/// H.264 SPS/PPS. When the bitstream is not size-delimited (no `obu_has_size`
+/// field) or is truncated/malformed, parsing is inconclusive and we fall back
+/// to the conservative legacy behavior (treat as a recovery point) so AV1 can
+/// never get permanently stuck waiting for a recovery frame that we failed to
+/// recognize.
+fn av1_has_recovery_nal(data: &[u8]) -> bool {
+    const OBU_SEQUENCE_HEADER: u8 = 1;
+    let mut i = 0usize;
+    while i < data.len() {
+        let header = data[i];
+        let obu_type = (header >> 3) & 0x0f;
+        let extension_flag = (header >> 2) & 0x01;
+        let has_size_field = (header >> 1) & 0x01;
+        i += 1;
+        if obu_type == OBU_SEQUENCE_HEADER {
+            return true;
+        }
+        if extension_flag == 1 {
+            if i >= data.len() {
+                return true; // truncated extension header — inconclusive
+            }
+            i += 1;
+        }
+        if has_size_field == 0 {
+            // Can't locate the next OBU. A sequence header is conventionally
+            // first, so if we have not seen one, stay conservative.
+            return true;
+        }
+        let mut size: u64 = 0;
+        let mut shift = 0u32;
+        loop {
+            if i >= data.len() {
+                return true; // truncated LEB128 — inconclusive
+            }
+            let b = data[i];
+            i += 1;
+            size |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift >= 56 {
+                return true; // malformed LEB128 — inconclusive
+            }
+        }
+        i = i.saturating_add(size as usize);
+    }
+    false
 }
 
 fn h264_has_recovery_nal(data: &[u8]) -> bool {
@@ -1348,7 +1444,7 @@ fn hevc_has_recovery_nal(data: &[u8]) -> bool {
     })
 }
 
-fn annex_b_nal_units<'a>(data: &'a [u8]) -> impl Iterator<Item = &'a [u8]> {
+fn annex_b_nal_units(data: &[u8]) -> impl Iterator<Item = &[u8]> {
     let mut units = Vec::new();
     let mut cursor = 0usize;
     while let Some((start, prefix_len)) = find_start_code(data, cursor) {
@@ -2378,3 +2474,48 @@ const EMBEDDED_TEST_AV1: &[u8] = &[
     0x17, 0x10, 0x00, 0x83, 0xe0, 0x02, 0x08, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x28, 0xd2, 0x17,
     0x10, 0xe2, 0x15, 0xde, 0x13, 0x7f, 0x59, 0x04,
 ];
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn frame_id_gap_detects_only_real_forward_jumps() {
+        assert!(!frame_id_indicates_gap(10, 11)); // contiguous
+        assert!(!frame_id_indicates_gap(10, 10)); // duplicate
+        assert!(!frame_id_indicates_gap(10, 9)); // stale/reordered (backward)
+        assert!(frame_id_indicates_gap(10, 12)); // one unit lost
+        assert!(frame_id_indicates_gap(10, 50)); // many units lost
+    }
+
+    #[test]
+    fn frame_id_gap_handles_u32_wraparound() {
+        assert!(!frame_id_indicates_gap(u32::MAX, 0)); // contiguous across wrap
+        assert!(frame_id_indicates_gap(u32::MAX, 1)); // gap across wrap (lost 0)
+        assert!(!frame_id_indicates_gap(0, u32::MAX)); // backward across wrap, not a gap
+    }
+
+    #[test]
+    fn av1_recovery_point_detected_in_keyframe_with_sequence_header() {
+        // The embedded probe bitstream starts with a temporal delimiter followed
+        // by an OBU_SEQUENCE_HEADER (type 1) — a keyframe / recovery point.
+        assert!(av1_has_recovery_nal(EMBEDDED_TEST_AV1));
+    }
+
+    #[test]
+    fn av1_inter_frame_without_sequence_header_is_not_a_recovery_point() {
+        // OBU_TEMPORAL_DELIMITER (type 2, size 0) + OBU_FRAME (type 6, size 3).
+        // No sequence header => not a recovery point.
+        let inter = [0x12u8, 0x00, 0x32, 0x03, 0xAA, 0xBB, 0xCC];
+        assert!(!av1_has_recovery_nal(&inter));
+    }
+
+    #[test]
+    fn av1_without_size_field_falls_back_to_recovery_point() {
+        // OBU_FRAME (type 6) with obu_has_size_field == 0: we cannot walk the
+        // stream, so we conservatively treat it as a recovery point rather than
+        // risk getting stuck waiting forever.
+        let no_size = [0x30u8];
+        assert!(av1_has_recovery_nal(&no_size));
+    }
+}

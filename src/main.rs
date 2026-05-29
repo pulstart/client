@@ -174,6 +174,12 @@ struct StreamApp {
     native_surfaces: Arc<NativeSurfaceControl>,
     disconnect_flag: Arc<AtomicBool>,
     connection_epoch: Arc<AtomicU64>,
+    // Auto-reconnect on unexpected connection loss (network drop, server
+    // restart, transient unreachable). Terminal errors (auth rejected, explicit
+    // server rejection) are excluded so we never hammer a server that said no.
+    // Connection-level only — adds no latency to the live media path.
+    auto_reconnect_attempts: u32,
+    next_reconnect_at: Option<Instant>,
     shared_input: Arc<SharedInputState>,
     control_tx: Option<crossbeam_channel::Sender<ControlMessage>>,
     input_tx: Option<crossbeam_channel::Sender<InputPacket>>,
@@ -556,7 +562,7 @@ fn ensure_server_in_list(list: &mut Vec<ServerEntry>, addr: &str) -> bool {
     true
 }
 
-fn touch_server_connected(list: &mut Vec<ServerEntry>, addr: &str) {
+fn touch_server_connected(list: &mut [ServerEntry], addr: &str) {
     let normalized = normalize_server_addr(addr);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -629,11 +635,12 @@ fn start_discovery_listener(discovered: Arc<Mutex<Vec<DiscoveredServer>>>, ctx: 
                         .get(4)
                         .map(|value| value.trim())
                         .filter(|value| !value.is_empty());
-                    if lines.len() >= 4 && lines[0] == "ST_DISCOVER" && peer_id.is_some() {
+                    let discover_valid = lines.len() >= 4 && lines[0] == "ST_DISCOVER";
+                    if let Some(peer_id) = peer_id.filter(|_| discover_valid) {
                         let hostname = lines[1].to_string();
                         let port: u16 = lines[2].parse().unwrap_or(DEFAULT_APP_PORT);
                         let token = lines[3].to_string();
-                        let peer_id = peer_id.unwrap().to_string();
+                        let peer_id = peer_id.to_string();
                         let address = format!("{}:{port}", src_addr.ip());
 
                         let mut servers = discovered.lock().unwrap();
@@ -747,6 +754,8 @@ impl StreamApp {
             native_surfaces,
             disconnect_flag: Arc::new(AtomicBool::new(false)),
             connection_epoch: Arc::new(AtomicU64::new(0)),
+            auto_reconnect_attempts: 0,
+            next_reconnect_at: None,
             shared_input: Arc::new(SharedInputState::new()),
             control_tx: None,
             input_tx: None,
@@ -792,6 +801,11 @@ impl StreamApp {
     fn connect(&mut self, ctx: egui::Context) {
         let saved_addr = self.server_addr.trim().to_string();
         touch_server_connected(&mut self.server_list, &saved_addr);
+        // A reconnect attempt is now in flight; clear the pending schedule so the
+        // update loop doesn't double-fire. `auto_reconnect_attempts` is reset on
+        // a successful connection (state reaches Connected), not here, so backoff
+        // keeps growing across a run of failures.
+        self.next_reconnect_at = None;
 
         self.disconnect_flag.store(true, Ordering::SeqCst);
         let disconnect_flag = Arc::new(AtomicBool::new(false));
@@ -874,6 +888,9 @@ impl StreamApp {
     }
 
     fn disconnect(&mut self) {
+        // User-initiated teardown cancels any pending auto-reconnect.
+        self.auto_reconnect_attempts = 0;
+        self.next_reconnect_at = None;
         self.disconnect_flag.store(true, Ordering::SeqCst);
         self.connection_epoch.fetch_add(1, Ordering::SeqCst);
         self.clear_remote_keyboard();
@@ -952,8 +969,8 @@ impl StreamApp {
         let Some(client_id) = snapshot.client_id else {
             return;
         };
-        let local = pointer_pos
-            .map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()));
+        let local =
+            pointer_pos.map(|pos| clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point()));
         let remote = self.mapped_server_cursor_video_pos(snapshot, video_rect);
         if let Some(anchor) = relative_capture_entry_anchor(remote, local) {
             self.hover_cursor_pos = Some(anchor);
@@ -1036,7 +1053,11 @@ impl StreamApp {
     }
 
     fn send_remote_wheel(&mut self, client_id: u32, delta: egui::Vec2, unit: egui::MouseWheelUnit) {
-        self.pending_wheel_units += delta * wheel_unit_scale(unit);
+        let mut scaled = delta * wheel_unit_scale(unit);
+        if scroll_should_invert() {
+            scaled = -scaled;
+        }
+        self.pending_wheel_units += scaled;
         let delta_x = take_wheel_units(&mut self.pending_wheel_units.x);
         let delta_y = take_wheel_units(&mut self.pending_wheel_units.y);
         if delta_x != 0 || delta_y != 0 {
@@ -1891,7 +1912,10 @@ impl StreamApp {
                 // video: enter relative mouselook capture.
                 self.capture_mode = LocalCaptureMode::CapturedRelative;
                 ctx.request_repaint();
-            } else if hover_supported && pointer_over_video && !self.await_pointer_exit_after_auto_release {
+            } else if hover_supported
+                && pointer_over_video
+                && !self.await_pointer_exit_after_auto_release
+            {
                 // Desktop passthrough: automatic free-cursor control while the
                 // pointer is over the video.
                 self.capture_mode = LocalCaptureMode::HoverAbsolute;
@@ -1944,12 +1968,7 @@ impl StreamApp {
                     self.capture_mode = LocalCaptureMode::HoverAbsolute;
                 } else if relative_ok {
                     self.capture_mode = LocalCaptureMode::CapturedRelative;
-                    self.anchor_relative_capture_to_local(
-                        ctx,
-                        video_rect,
-                        pointer_pos,
-                        &snapshot,
-                    );
+                    self.anchor_relative_capture_to_local(ctx, video_rect, pointer_pos, &snapshot);
                 }
             }
             self.await_pointer_exit_after_auto_release = false;
@@ -1974,7 +1993,8 @@ impl StreamApp {
             // if the pointer is stationary (no PointerMoved to trigger a send).
             let force_resync = std::mem::take(&mut self.hover_cursor_resync_pending);
             if virtual_hover {
-                let desired_hover_pos = if previous_capture_mode == LocalCaptureMode::HoverAbsolute {
+                let desired_hover_pos = if previous_capture_mode == LocalCaptureMode::HoverAbsolute
+                {
                     self.hover_cursor_pos.or(pointer_pos)
                 } else {
                     actual_pointer_pos.or(pointer_pos)
@@ -2326,17 +2346,11 @@ impl StreamApp {
         // API-discovered host. peer_id is mandatory to merge it against a LAN/saved
         // variant of the same machine; without it we cannot tell variants apart, so
         // an identity-less API host is dropped (the server always advertises one).
-        let api_host = self
-            .api_discovery
-            .host
-            .lock()
-            .unwrap()
-            .clone()
-            .filter(|h| {
-                !h.candidates.is_empty()
-                    && h.last_seen.elapsed() < Duration::from_secs(15)
-                    && h.peer_id.as_ref().map(|p| !p.is_empty()).unwrap_or(false)
-            });
+        let api_host = self.api_discovery.host.lock().unwrap().clone().filter(|h| {
+            !h.candidates.is_empty()
+                && h.last_seen.elapsed() < Duration::from_secs(15)
+                && h.peer_id.as_ref().map(|p| !p.is_empty()).unwrap_or(false)
+        });
         let any_api = api_host.is_some();
 
         // Aggregate every reachable variant of a logical server, keyed by peer_id.
@@ -2359,7 +2373,10 @@ impl StreamApp {
             }
         }
         if let Some(h) = &api_host {
-            let pid = h.peer_id.clone().expect("filtered for non-empty peer_id above");
+            let pid = h
+                .peer_id
+                .clone()
+                .expect("filtered for non-empty peer_id above");
             let v = by_peer.entry(pid).or_default();
             // Candidates are pre-sorted LAN > VPN > public; first is the best path.
             if v.api_addr.is_none() {
@@ -2507,7 +2524,7 @@ impl StreamApp {
         } else {
             let avail_w = ui.available_width();
             let cols = ((avail_w + 12.0) / (CARD_W + 12.0)).floor().max(1.0) as usize;
-            let total_rows = (merged.len() + cols - 1) / cols;
+            let total_rows = merged.len().div_ceil(cols);
             let row_height = CARD_H + CARD_ROW_SPACING;
             let content_top = ui.max_rect().top();
             let viewport_min_y = (ui.clip_rect().top() - content_top).max(0.0);
@@ -3154,8 +3171,8 @@ impl StreamApp {
                                         );
                                         let mut button = egui::Button::new(label);
                                         if is_selected {
-                                            button = button
-                                                .fill(egui::Color32::from_rgb(40, 70, 110));
+                                            button =
+                                                button.fill(egui::Color32::from_rgb(40, 70, 110));
                                         }
                                         if ui.add_sized([170.0, 26.0], button).clicked()
                                             && !is_selected
@@ -3378,6 +3395,7 @@ struct MediaThreads {
     decode_started_rx: crossbeam_channel::Receiver<()>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_media_threads(
     socket_addr: std::net::SocketAddr,
     frame_buf: Arc<Mutex<VideoFrameBuffer>>,
@@ -3459,6 +3477,7 @@ fn start_media_threads(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_punched_media_threads(
     frame_buf: Arc<Mutex<VideoFrameBuffer>>,
     debug_state: Arc<ConnectionDebugState>,
@@ -3563,6 +3582,7 @@ fn advertised_video_codec_support(
     filter_advertised_video_codec_support(report, yuv444_enabled, true, !cfg!(target_os = "macos"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_connection(
     addr: String,
     token: String,
@@ -3684,6 +3704,11 @@ fn run_connection(
         }
     };
     let _ = tcp.set_nodelay(true);
+    // Detect a silently-dead server (machine/network vanished without a TCP
+    // RST) in ~11s instead of the OS default of ~2h, so the control read errors
+    // out and the session tears down into the auto-reconnect path. Without this,
+    // a frozen frame could sit on screen indefinitely.
+    configure_tcp_keepalive(&tcp);
 
     // --- Authentication handshake ---
     let _ = tcp.write_all(&ControlMessage::Authenticate(token).serialize());
@@ -4398,7 +4423,12 @@ fn run_connection(
             *s,
             ConnectionState::Error(_) | ConnectionState::Disconnected
         ) {
-            *s = ConnectionState::Disconnected;
+            // Reaching here with a live (Connected/Connecting) state and a still-
+            // current session means the connection dropped unexpectedly (the
+            // user-initiated path bumps the epoch and returns above). Mark it as
+            // a retriable error so the UI auto-reconnects instead of silently
+            // dropping to the home screen with a frozen frame.
+            *s = ConnectionState::Error("Connection lost".into());
         }
     }
     ctx.request_repaint();
@@ -5011,7 +5041,16 @@ fn run_punched_session(
             *s,
             ConnectionState::Error(_) | ConnectionState::Disconnected
         ) {
-            *s = ConnectionState::Disconnected;
+            // Unexpected loss (not a user-initiated teardown, which bumps the
+            // epoch / sets the disconnect flag) → retriable error so the UI
+            // auto-reconnects.
+            if session_is_current(connection_epoch.as_ref(), session_epoch)
+                && !disconnect.load(Ordering::SeqCst)
+            {
+                *s = ConnectionState::Error("Connection lost".into());
+            } else {
+                *s = ConnectionState::Disconnected;
+            }
         }
     }
     ctx.request_repaint();
@@ -5039,6 +5078,31 @@ fn session_is_current(connection_epoch: &AtomicU64, session_epoch: u64) -> bool 
     connection_epoch.load(Ordering::SeqCst) == session_epoch
 }
 
+/// A terminal error is one where reconnecting would just fail again the same
+/// way, so auto-reconnect must NOT retry it: the server explicitly rejected us
+/// (bad token / server-side error). Everything else — network drops, timeouts,
+/// "server unreachable", "server shut down" (restart/auto-update) — is transient
+/// and worth retrying. Matched on the stable message prefixes produced by the
+/// `set_error` call sites.
+fn connection_error_is_terminal(msg: &str) -> bool {
+    msg.starts_with("Authentication failed") || msg.starts_with("Server error:")
+}
+
+/// Exponential backoff for auto-reconnect: 0.5s, 1s, 2s, 4s, capped at 8s. The
+/// first retry is near-immediate so a brief blip recovers fast; the cap keeps a
+/// genuinely-down server from being hammered while still recovering promptly
+/// once it returns.
+fn reconnect_backoff(attempts: u32) -> Duration {
+    let secs = match attempts {
+        0 => return Duration::from_millis(500),
+        1 => 1,
+        2 => 2,
+        3 => 4,
+        _ => 8,
+    };
+    Duration::from_secs(secs)
+}
+
 fn session_cancelled(
     disconnect: &AtomicBool,
     connection_epoch: &AtomicU64,
@@ -5046,6 +5110,64 @@ fn session_cancelled(
 ) -> bool {
     disconnect.load(Ordering::SeqCst) || !session_is_current(connection_epoch, session_epoch)
 }
+
+/// Enable aggressive TCP keepalive on the control socket so a dead peer is
+/// detected in ~11s (idle 5s, then 3 probes 2s apart) rather than the OS
+/// default (~2h on Linux). When the peer is truly gone the probes fail, the
+/// blocking/timeout read returns an error, and the session tears down into the
+/// auto-reconnect path. Best-effort: failures to set the options are ignored.
+#[cfg(unix)]
+fn configure_tcp_keepalive(tcp: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let fd = tcp.as_raw_fd();
+    unsafe {
+        let on: libc::c_int = 1;
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            &on as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        // TCP_KEEPIDLE/INTVL/CNT exist on Linux; macOS uses TCP_KEEPALIVE for
+        // idle time. Set what each platform supports; ignore the rest.
+        #[cfg(target_os = "linux")]
+        {
+            let idle: libc::c_int = 5;
+            let intvl: libc::c_int = 2;
+            let cnt: libc::c_int = 3;
+            for (opt, val) in [
+                (libc::TCP_KEEPIDLE, idle),
+                (libc::TCP_KEEPINTVL, intvl),
+                (libc::TCP_KEEPCNT, cnt),
+            ] {
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    opt,
+                    &val as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // TCP_KEEPALIVE (idle seconds) — constant value 0x10 on Darwin.
+            const TCP_KEEPALIVE: libc::c_int = 0x10;
+            let idle: libc::c_int = 5;
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                TCP_KEEPALIVE,
+                &idle as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_tcp_keepalive(_tcp: &TcpStream) {}
 
 fn is_timeout(e: &std::io::Error) -> bool {
     // `Interrupted` (EINTR) is not a timeout but must be retried the same way.
@@ -5626,6 +5748,26 @@ fn should_return_to_hover_after_relative_button_drag(
         && pointer_buttons & drag_buttons == 0
 }
 
+/// Whether to flip the scroll-wheel direction before sending it to the server.
+///
+/// macOS "natural scrolling" (the default) reports wheel deltas with the
+/// opposite sign to the traditional wheel direction that the Linux/Windows
+/// uinput/SendInput injection expects (`REL_WHEEL` positive = scroll up), so an
+/// un-normalized macOS client scrolls the remote backwards while a Linux/Windows
+/// client does not. Default to inverting on macOS so the wire direction is
+/// canonical across clients. Escape hatch for macOS users who turned natural
+/// scrolling off (or anyone who wants to force a direction): `ST_SCROLL_INVERT`
+/// = `1`/`true`/`yes`/`on` to force-invert, `0`/`false`/`no`/`off` to force-keep.
+fn scroll_should_invert() -> bool {
+    use std::sync::OnceLock;
+    static INVERT: OnceLock<bool> = OnceLock::new();
+    *INVERT.get_or_init(|| match std::env::var("ST_SCROLL_INVERT").ok().as_deref() {
+        Some("1") | Some("true") | Some("yes") | Some("on") => true,
+        Some("0") | Some("false") | Some("no") | Some("off") => false,
+        _ => cfg!(target_os = "macos"),
+    })
+}
+
 fn wheel_unit_scale(unit: egui::MouseWheelUnit) -> f32 {
     match unit {
         // Trackpads often deliver small point deltas; keep them and convert
@@ -6073,12 +6215,13 @@ fn build_debug_general_lines(
             snapshot.receive_fps, snapshot.decode_fps, snapshot.present_fps,
         ),
         format!(
-            "packets: rx={} lost={} late={} dropped_frames={} playout_drops={}  loss={:.2}%",
+            "packets: rx={} lost={} late={} dropped_frames={} playout_drops={} jitter_buf={:.0}ms  loss={:.2}%",
             snapshot.received_packets,
             snapshot.lost_packets,
             snapshot.late_packets,
             snapshot.dropped_frames,
             snapshot.playout_drops,
+            snapshot.jitter_delay_ms,
             loss_percent(
                 snapshot.received_packets,
                 snapshot.lost_packets,
@@ -6173,6 +6316,39 @@ impl eframe::App for StreamApp {
         {
             self.connect(ctx.clone());
             return;
+        }
+        // Auto-reconnect on unexpected connection loss (network drop, transient
+        // unreachable, server restart/auto-update). Terminal rejections (bad
+        // token / explicit server error) are excluded so we never hammer a
+        // server that refused us. Backoff grows across consecutive failures and
+        // resets once a live session is re-established.
+        match &state {
+            ConnectionState::Connected => {
+                self.auto_reconnect_attempts = 0;
+                self.next_reconnect_at = None;
+            }
+            ConnectionState::Error(msg)
+                if !connection_error_is_terminal(msg) && !self.server_addr.trim().is_empty() =>
+            {
+                let now = Instant::now();
+                match self.next_reconnect_at {
+                    None => {
+                        let delay = reconnect_backoff(self.auto_reconnect_attempts);
+                        self.next_reconnect_at = Some(now + delay);
+                        ctx.request_repaint_after(delay);
+                    }
+                    Some(at) if now >= at => {
+                        self.auto_reconnect_attempts =
+                            self.auto_reconnect_attempts.saturating_add(1);
+                        self.connect(ctx.clone());
+                        return;
+                    }
+                    Some(at) => {
+                        ctx.request_repaint_after(at.saturating_duration_since(now));
+                    }
+                }
+            }
+            _ => {}
         }
         self.keep_awake
             .set_active(matches!(state, ConnectionState::Connected));
@@ -6375,25 +6551,59 @@ impl eframe::App for StreamApp {
                 let rect = ui.max_rect();
                 ui.painter()
                     .rect_filled(rect, 0.0, egui::Color32::from_rgb(26, 30, 38));
+                // Retriable errors are being auto-reconnected: show a recovering
+                // screen instead of a dead "Connection Failed" so a network blip
+                // self-heals without the user touching anything. Terminal
+                // rejections keep the explicit failure screen.
+                let reconnecting =
+                    !connection_error_is_terminal(msg) && !self.server_addr.trim().is_empty();
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() / 3.0);
-                    ui.label(
-                        egui::RichText::new("Connection Failed")
-                            .size(20.0)
-                            .strong()
-                            .color(egui::Color32::from_rgb(230, 233, 240)),
-                    );
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(msg)
-                            .size(13.0)
-                            .color(egui::Color32::from_rgb(220, 100, 100)),
-                    );
+                    if reconnecting {
+                        ui.spinner();
+                        ui.add_space(12.0);
+                        ui.label(
+                            egui::RichText::new("Connection lost — reconnecting…")
+                                .size(16.0)
+                                .color(egui::Color32::from_rgb(230, 233, 240)),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(msg)
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(138, 142, 150)),
+                        );
+                        if self.auto_reconnect_attempts > 0 {
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "attempt {}",
+                                    self.auto_reconnect_attempts + 1
+                                ))
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(110, 114, 122)),
+                            );
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Connection Failed")
+                                .size(20.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(230, 233, 240)),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(msg)
+                                .size(13.0)
+                                .color(egui::Color32::from_rgb(220, 100, 100)),
+                        );
+                    }
                     ui.add_space(20.0);
+                    let button_label = if reconnecting { "Cancel" } else { "Back" };
                     if ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new("Back")
+                                egui::RichText::new(button_label)
                                     .size(13.0)
                                     .color(egui::Color32::from_rgb(230, 233, 240)),
                             )
@@ -6403,6 +6613,8 @@ impl eframe::App for StreamApp {
                         )
                         .clicked()
                     {
+                        // Cancel auto-reconnect and return home.
+                        self.disconnect();
                         self.video_texture.clear_frame();
                         *self.state.lock().unwrap() = ConnectionState::Disconnected;
                     }
@@ -6565,10 +6777,10 @@ impl eframe::App for StreamApp {
                     if !virtual_hover {
                         last_pointer_pos = Some(pos);
                     }
-                    if self.await_pointer_exit_after_auto_release {
-                        if video_rect.map(|rect| !rect.contains(pos)).unwrap_or(true) {
-                            self.await_pointer_exit_after_auto_release = false;
-                        }
+                    if self.await_pointer_exit_after_auto_release
+                        && video_rect.map(|rect| !rect.contains(pos)).unwrap_or(true)
+                    {
+                        self.await_pointer_exit_after_auto_release = false;
                     }
                     // Desktop (HoverAbsolute): the local pointer drives the
                     // cursor 1:1 and is forwarded as an absolute position. If it
@@ -6988,6 +7200,137 @@ fn is_force_release_shortcut(modifiers: &egui::Modifiers) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+/// Choose the best present mode we can *safely* request at surface config
+/// time. `Mailbox` is a wgpu validation error on surfaces that only support
+/// `Fifo`, which in practice covers software fallbacks (Mesa llvmpipe,
+/// Microsoft Basic Render Driver). We probe the adapter list cheaply and
+/// downgrade to `Fifo` if we only see software adapters.
+fn pick_wgpu_present_mode() -> eframe::wgpu::PresentMode {
+    use eframe::wgpu;
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..Default::default()
+    });
+    let adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all());
+    if adapters.is_empty() {
+        return wgpu::PresentMode::Fifo;
+    }
+    let has_hw = adapters.iter().any(|a| {
+        let info = a.get_info();
+        !matches!(info.device_type, wgpu::DeviceType::Cpu)
+    });
+    if has_hw {
+        wgpu::PresentMode::Mailbox
+    } else {
+        eprintln!(
+            "[main] No hardware wgpu adapter available (Mesa software fallback?); \
+             using PresentMode::Fifo. Likely fix: add your user to the 'render' group \
+             so /dev/dri/renderD* is accessible: sudo usermod -aG render $USER"
+        );
+        wgpu::PresentMode::Fifo
+    }
+}
+
+fn main() {
+    match updater::maybe_run_apply_update_from_args() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(err) => {
+            eprintln!("[updater] {err}");
+            // Exit cleanly to avoid triggering Windows Error Reporting dialogs.
+            std::process::exit(0);
+        }
+    }
+    updater::cleanup_old_update_files();
+
+    #[cfg(target_os = "macos")]
+    let viewport = egui::ViewportBuilder::default()
+        .with_title("Stream Client")
+        .with_inner_size([1280.0, 720.0])
+        .with_transparent(true);
+    #[cfg(not(target_os = "macos"))]
+    let viewport = egui::ViewportBuilder::default()
+        .with_title("Stream Client")
+        .with_inner_size([1280.0, 720.0]);
+
+    // Renderer default: on Linux we default to wgpu because DMA-BUF zero-copy
+    // import is validated end-to-end and wgpu additionally gets us
+    // PresentMode::Mailbox + desired_maximum_frame_latency=1 for lower
+    // compositor latency. On macOS and Windows we stay on Glow because the
+    // VideoToolbox/IOSurface and D3D11 interop zero-copy paths are still
+    // Glow-only — flipping to wgpu there would be a silent perf regression
+    // until those platform-specific `wgpu_hal` external-memory imports land.
+    // `ST_RENDERER=glow` forces the old default on any platform.
+    let renderer_pref = std::env::var("ST_RENDERER")
+        .unwrap_or_default()
+        .to_lowercase();
+    let default_to_wgpu = cfg!(target_os = "linux");
+    let use_wgpu = match renderer_pref.as_str() {
+        "wgpu" | "wgpu-min-latency" => true,
+        "glow" => false,
+        "" => default_to_wgpu,
+        other => {
+            eprintln!("[main] unknown ST_RENDERER={other:?}; falling back to default");
+            default_to_wgpu
+        }
+    };
+    // Mailbox gives us lower-latency compositor handoff than Fifo, but it's
+    // not guaranteed to be supported — llvmpipe / software Vulkan surfaces
+    // only expose Fifo, which makes `Surface::configure(Mailbox)` panic.
+    // Probe the adapter type before committing and fall back to Fifo when
+    // we're clearly on software rendering. Common failure mode: the user
+    // isn't in the `render` group, so mesa can't open /dev/dri/renderD*
+    // and silently falls back to llvmpipe.
+    let wgpu_present_mode = if use_wgpu {
+        pick_wgpu_present_mode()
+    } else {
+        eframe::wgpu::PresentMode::Fifo
+    };
+
+    if use_wgpu {
+        eprintln!(
+            "[main] wgpu renderer active ({:?} + max_frame_latency=1). \
+             On Linux, DMA-BUF zero-copy import auto-enables when the Vulkan adapter \
+             advertises VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf. \
+             Force Glow with ST_RENDERER=glow.",
+            wgpu_present_mode,
+        );
+    }
+
+    let options = if use_wgpu {
+        let wgpu_cfg = eframe::egui_wgpu::WgpuConfiguration {
+            desired_maximum_frame_latency: Some(1),
+            present_mode: wgpu_present_mode,
+            ..Default::default()
+        };
+        eframe::NativeOptions {
+            viewport,
+            renderer: eframe::Renderer::Wgpu,
+            wgpu_options: wgpu_cfg,
+            vsync: display::vsync_enabled(),
+            ..Default::default()
+        }
+    } else {
+        eframe::NativeOptions {
+            viewport,
+            renderer: eframe::Renderer::Glow,
+            vsync: display::vsync_enabled(),
+            ..Default::default()
+        }
+    };
+
+    eframe::run_native(
+        "Stream Client",
+        options,
+        Box::new(|cc| Ok(Box::new(StreamApp::new(cc)))),
+    )
+    .expect("Failed to run eframe");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7214,133 +7557,4 @@ mod tests {
             Some(remote)
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
-/// Choose the best present mode we can *safely* request at surface config
-/// time. `Mailbox` is a wgpu validation error on surfaces that only support
-/// `Fifo`, which in practice covers software fallbacks (Mesa llvmpipe,
-/// Microsoft Basic Render Driver). We probe the adapter list cheaply and
-/// downgrade to `Fifo` if we only see software adapters.
-fn pick_wgpu_present_mode() -> eframe::wgpu::PresentMode {
-    use eframe::wgpu;
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::all(),
-        ..Default::default()
-    });
-    let adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all());
-    if adapters.is_empty() {
-        return wgpu::PresentMode::Fifo;
-    }
-    let has_hw = adapters.iter().any(|a| {
-        let info = a.get_info();
-        !matches!(info.device_type, wgpu::DeviceType::Cpu)
-    });
-    if has_hw {
-        wgpu::PresentMode::Mailbox
-    } else {
-        eprintln!(
-            "[main] No hardware wgpu adapter available (Mesa software fallback?); \
-             using PresentMode::Fifo. Likely fix: add your user to the 'render' group \
-             so /dev/dri/renderD* is accessible: sudo usermod -aG render $USER"
-        );
-        wgpu::PresentMode::Fifo
-    }
-}
-
-fn main() {
-    match updater::maybe_run_apply_update_from_args() {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(err) => {
-            eprintln!("[updater] {err}");
-            // Exit cleanly to avoid triggering Windows Error Reporting dialogs.
-            std::process::exit(0);
-        }
-    }
-    updater::cleanup_old_update_files();
-
-    #[cfg(target_os = "macos")]
-    let viewport = egui::ViewportBuilder::default()
-        .with_title("Stream Client")
-        .with_inner_size([1280.0, 720.0])
-        .with_transparent(true);
-    #[cfg(not(target_os = "macos"))]
-    let viewport = egui::ViewportBuilder::default()
-        .with_title("Stream Client")
-        .with_inner_size([1280.0, 720.0]);
-
-    // Renderer default: on Linux we default to wgpu because DMA-BUF zero-copy
-    // import is validated end-to-end and wgpu additionally gets us
-    // PresentMode::Mailbox + desired_maximum_frame_latency=1 for lower
-    // compositor latency. On macOS and Windows we stay on Glow because the
-    // VideoToolbox/IOSurface and D3D11 interop zero-copy paths are still
-    // Glow-only — flipping to wgpu there would be a silent perf regression
-    // until those platform-specific `wgpu_hal` external-memory imports land.
-    // `ST_RENDERER=glow` forces the old default on any platform.
-    let renderer_pref = std::env::var("ST_RENDERER")
-        .unwrap_or_default()
-        .to_lowercase();
-    let default_to_wgpu = cfg!(target_os = "linux");
-    let use_wgpu = match renderer_pref.as_str() {
-        "wgpu" | "wgpu-min-latency" => true,
-        "glow" => false,
-        "" => default_to_wgpu,
-        other => {
-            eprintln!("[main] unknown ST_RENDERER={other:?}; falling back to default");
-            default_to_wgpu
-        }
-    };
-    // Mailbox gives us lower-latency compositor handoff than Fifo, but it's
-    // not guaranteed to be supported — llvmpipe / software Vulkan surfaces
-    // only expose Fifo, which makes `Surface::configure(Mailbox)` panic.
-    // Probe the adapter type before committing and fall back to Fifo when
-    // we're clearly on software rendering. Common failure mode: the user
-    // isn't in the `render` group, so mesa can't open /dev/dri/renderD*
-    // and silently falls back to llvmpipe.
-    let wgpu_present_mode = if use_wgpu {
-        pick_wgpu_present_mode()
-    } else {
-        eframe::wgpu::PresentMode::Fifo
-    };
-
-    if use_wgpu {
-        eprintln!(
-            "[main] wgpu renderer active ({:?} + max_frame_latency=1). \
-             On Linux, DMA-BUF zero-copy import auto-enables when the Vulkan adapter \
-             advertises VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf. \
-             Force Glow with ST_RENDERER=glow.",
-            wgpu_present_mode,
-        );
-    }
-
-    let options = if use_wgpu {
-        let mut wgpu_cfg = eframe::egui_wgpu::WgpuConfiguration::default();
-        wgpu_cfg.desired_maximum_frame_latency = Some(1);
-        wgpu_cfg.present_mode = wgpu_present_mode;
-        eframe::NativeOptions {
-            viewport,
-            renderer: eframe::Renderer::Wgpu,
-            wgpu_options: wgpu_cfg,
-            vsync: display::vsync_enabled(),
-            ..Default::default()
-        }
-    } else {
-        eframe::NativeOptions {
-            viewport,
-            renderer: eframe::Renderer::Glow,
-            vsync: display::vsync_enabled(),
-            ..Default::default()
-        }
-    };
-
-    eframe::run_native(
-        "Stream Client",
-        options,
-        Box::new(|cc| Ok(Box::new(StreamApp::new(cc)))),
-    )
-    .expect("Failed to run eframe");
 }

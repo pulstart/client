@@ -27,18 +27,13 @@ use std::sync::Mutex;
 /// * [`ForceReleased`](Self::ForceReleased) — the user pressed the force
 ///   release shortcut. Stays hands-off (like Idle) until they click back into
 ///   the video.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum LocalCaptureMode {
+    #[default]
     Idle,
     HoverAbsolute,
     CapturedRelative,
     ForceReleased,
-}
-
-impl Default for LocalCaptureMode {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 impl LocalCaptureMode {

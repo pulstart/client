@@ -302,6 +302,9 @@ pub struct PacketReceiver {
     inner: PacketProcessor,
 }
 
+// Boxing a variant would add heap indirection on the per-packet receive hot
+// path; the enum is held once per session, so the size difference is harmless.
+#[allow(clippy::large_enum_variant)]
 pub enum MediaReceiver {
     Udp(UdpReceiver),
     Packets(PacketReceiver),
@@ -333,7 +336,12 @@ impl TransportWindowStats {
     }
 
     pub fn needs_recovery_keyframe(self) -> bool {
-        self.lost_packets > 0 || self.dropped_frames > 0
+        // Only a real, unrecoverable frame gap warrants forcing a fresh IDR.
+        // A single lost packet is routinely recovered by the parity packet (or
+        // the duplicated FrameStart) without dropping a frame, and forcing an
+        // IDR for every lost packet creates a keyframe storm: each large IDR
+        // bursts the pacing budget, causing more loss and yet another IDR.
+        self.dropped_frames > 0
     }
 }
 
@@ -439,10 +447,6 @@ impl UdpReceiver {
         self.inner.take_stats()
     }
 
-    pub fn take_pending_recovery(&mut self) -> bool {
-        self.inner.take_pending_recovery()
-    }
-
     #[cfg(target_os = "linux")]
     fn refill_pending(&mut self) {
         use std::os::fd::AsRawFd;
@@ -471,7 +475,7 @@ impl UdpReceiver {
                         let end = (offset + seg_size).min(total_len);
                         let segment = &mut msg.data[offset..end];
                         let raw: Option<&[u8]> = if let Some(ref crypto) = self.crypto {
-                            crypto.decrypt_in_place(segment).map(|pt| &*pt)
+                            crypto.decrypt_in_place(segment)
                         } else {
                             Some(&*segment)
                         };
@@ -484,7 +488,7 @@ impl UdpReceiver {
                     }
                 } else {
                     let raw: Option<&[u8]> = if let Some(ref crypto) = self.crypto {
-                        crypto.decrypt_in_place(msg.data).map(|pt| &*pt)
+                        crypto.decrypt_in_place(msg.data)
                     } else {
                         Some(&*msg.data)
                     };
@@ -515,7 +519,7 @@ impl UdpReceiver {
                                 let end = (offset + seg_size).min(total_len);
                                 let segment = &mut msg.data[offset..end];
                                 let raw: Option<&[u8]> = if let Some(ref crypto) = self.crypto {
-                                    crypto.decrypt_in_place(segment).map(|pt| &*pt)
+                                    crypto.decrypt_in_place(segment)
                                 } else {
                                     Some(&*segment)
                                 };
@@ -528,7 +532,7 @@ impl UdpReceiver {
                             }
                         } else {
                             let raw: Option<&[u8]> = if let Some(ref crypto) = self.crypto {
-                                crypto.decrypt_in_place(msg.data).map(|pt| &*pt)
+                                crypto.decrypt_in_place(msg.data)
                             } else {
                                 Some(&*msg.data)
                             };
@@ -607,10 +611,6 @@ impl PacketReceiver {
     pub fn take_stats(&mut self) -> Option<TransportWindowStats> {
         self.inner.take_stats()
     }
-
-    pub fn take_pending_recovery(&mut self) -> bool {
-        self.inner.take_pending_recovery()
-    }
 }
 
 impl MediaReceiver {
@@ -645,19 +645,11 @@ impl MediaReceiver {
             Self::Packets(receiver) => receiver.take_stats(),
         }
     }
-
-    pub fn take_pending_recovery(&mut self) -> bool {
-        match self {
-            Self::Udp(receiver) => receiver.take_pending_recovery(),
-            Self::Packets(receiver) => receiver.take_pending_recovery(),
-        }
-    }
 }
 
 struct PacketProcessor {
     assembler: FrameAssembler,
     feedback: FeedbackWindow,
-    pending_recovery: bool,
     trace_packets_logged: usize,
 }
 
@@ -666,7 +658,6 @@ impl Default for PacketProcessor {
         Self {
             assembler: FrameAssembler::new(),
             feedback: FeedbackWindow::default(),
-            pending_recovery: false,
             trace_packets_logged: 0,
         }
     }
@@ -705,11 +696,8 @@ impl PacketProcessor {
                 if raw_len > HEADER_SIZE {
                     let payload = &raw[HEADER_SIZE..];
                     let (data, redundant_prev) = if let Some(view) = parse_audio_packet(payload) {
-                        let redundant_prev = view
-                            .redundant
-                            .iter()
-                            .map(|chunk| chunk.to_vec())
-                            .collect();
+                        let redundant_prev =
+                            view.redundant.iter().map(|chunk| chunk.to_vec()).collect();
                         (view.primary.to_vec(), redundant_prev)
                     } else {
                         (payload.to_vec(), Vec::new())
@@ -750,7 +738,10 @@ impl PacketProcessor {
             .dropped_frames
             .saturating_add(outcome.feedback.dropped_frames);
         if outcome.feedback.lost_packets > 0 || outcome.feedback.dropped_frames > 0 {
-            self.pending_recovery = true;
+            // Flush the feedback window early so the server can react to loss
+            // (drop bitrate / send a recovery keyframe) without waiting for the
+            // full window. Decode recovery itself is handled by the decoder's
+            // frame-id continuity check, not by this transport flag.
             self.feedback.urgent = true;
         }
         if let Some(frame) = outcome.completed {
@@ -764,10 +755,6 @@ impl PacketProcessor {
 
     fn take_stats(&mut self) -> Option<TransportWindowStats> {
         self.feedback.take_if_due()
-    }
-
-    fn take_pending_recovery(&mut self) -> bool {
-        std::mem::take(&mut self.pending_recovery)
     }
 }
 

@@ -994,13 +994,15 @@ mod tests {
         let height = 64u32;
         let chroma_w = width / 2;
         let chroma_h = height / 2;
-        let mut video = VideoFrameBuffer::default();
-        video.width = width;
-        video.height = height;
-        video.format = VideoFormat::Yuv420p8;
-        video.plane0 = vec![128u8; (width * height) as usize];
-        video.plane1 = vec![128u8; (chroma_w * chroma_h) as usize];
-        video.plane2 = vec![128u8; (chroma_w * chroma_h) as usize];
+        let video = VideoFrameBuffer {
+            width,
+            height,
+            format: VideoFormat::Yuv420p8,
+            plane0: vec![128u8; (width * height) as usize],
+            plane1: vec![128u8; (chroma_w * chroma_h) as usize],
+            plane2: vec![128u8; (chroma_w * chroma_h) as usize],
+            ..Default::default()
+        };
 
         let mut pipeline = PipelineState::new(&device, &queue).expect("pipeline");
         pipeline.ensure_output(&device, width, height);
@@ -1029,12 +1031,14 @@ mod tests {
         let height = 64u32;
         let chroma_w = width / 2;
         let chroma_h = height / 2;
-        let mut video = VideoFrameBuffer::default();
-        video.width = width;
-        video.height = height;
-        video.format = VideoFormat::Nv12;
-        video.plane0 = vec![128u8; (width * height) as usize];
-        video.plane1 = vec![128u8; (chroma_w * chroma_h * 2) as usize];
+        let video = VideoFrameBuffer {
+            width,
+            height,
+            format: VideoFormat::Nv12,
+            plane0: vec![128u8; (width * height) as usize],
+            plane1: vec![128u8; (chroma_w * chroma_h * 2) as usize],
+            ..Default::default()
+        };
 
         let mut pipeline = PipelineState::new(&device, &queue).expect("pipeline");
         pipeline.ensure_output(&device, width, height);
@@ -1062,13 +1066,15 @@ mod tests {
         };
         let width = 64u32;
         let height = 64u32;
-        let mut video = VideoFrameBuffer::default();
-        video.width = width;
-        video.height = height;
-        video.format = VideoFormat::Yuv444p8;
-        video.plane0 = vec![128u8; (width * height) as usize];
-        video.plane1 = vec![128u8; (width * height) as usize];
-        video.plane2 = vec![128u8; (width * height) as usize];
+        let video = VideoFrameBuffer {
+            width,
+            height,
+            format: VideoFormat::Yuv444p8,
+            plane0: vec![128u8; (width * height) as usize],
+            plane1: vec![128u8; (width * height) as usize],
+            plane2: vec![128u8; (width * height) as usize],
+            ..Default::default()
+        };
 
         let mut pipeline = PipelineState::new(&device, &queue).expect("pipeline");
         pipeline.ensure_output(&device, width, height);
@@ -1099,11 +1105,13 @@ mod tests {
         for _ in 0..(width * height) {
             rgba.extend_from_slice(&[255, 0, 0, 255]);
         }
-        let mut video = VideoFrameBuffer::default();
-        video.width = width;
-        video.height = height;
-        video.format = VideoFormat::Rgba8;
-        video.plane0 = rgba;
+        let video = VideoFrameBuffer {
+            width,
+            height,
+            format: VideoFormat::Rgba8,
+            plane0: rgba,
+            ..Default::default()
+        };
 
         let mut pipeline = PipelineState::new(&device, &queue).expect("pipeline");
         pipeline.ensure_output(&device, width, height);
@@ -1134,13 +1142,15 @@ mod tests {
         {
             let (w, h) = (64u32, 64u32);
             let (cw, ch) = (w / 2, h / 2);
-            let mut video = VideoFrameBuffer::default();
-            video.width = w;
-            video.height = h;
-            video.format = VideoFormat::Yuv420p8;
-            video.plane0 = vec![128u8; (w * h) as usize];
-            video.plane1 = vec![128u8; (cw * ch) as usize];
-            video.plane2 = vec![128u8; (cw * ch) as usize];
+            let video = VideoFrameBuffer {
+                width: w,
+                height: h,
+                format: VideoFormat::Yuv420p8,
+                plane0: vec![128u8; (w * h) as usize],
+                plane1: vec![128u8; (cw * ch) as usize],
+                plane2: vec![128u8; (cw * ch) as usize],
+                ..Default::default()
+            };
             pipeline.ensure_output(&device, w, h);
             pipeline
                 .upload_and_render(&device, &queue, &video)
@@ -1155,13 +1165,15 @@ mod tests {
         {
             let (w, h) = (128u32, 96u32);
             let (cw, ch) = (w / 2, h / 2);
-            let mut video = VideoFrameBuffer::default();
-            video.width = w;
-            video.height = h;
-            video.format = VideoFormat::Yuv420p8;
-            video.plane0 = vec![128u8; (w * h) as usize];
-            video.plane1 = vec![128u8; (cw * ch) as usize];
-            video.plane2 = vec![128u8; (cw * ch) as usize];
+            let video = VideoFrameBuffer {
+                width: w,
+                height: h,
+                format: VideoFormat::Yuv420p8,
+                plane0: vec![128u8; (w * h) as usize],
+                plane1: vec![128u8; (cw * ch) as usize],
+                plane2: vec![128u8; (cw * ch) as usize],
+                ..Default::default()
+            };
             pipeline.ensure_output(&device, w, h);
             pipeline
                 .upload_and_render(&device, &queue, &video)
@@ -1190,13 +1202,15 @@ mod tests {
         let height = 64u32;
         let cw = width / 2;
         let ch = height / 2;
-        let mut video = VideoFrameBuffer::default();
-        video.width = width;
-        video.height = height;
-        video.format = VideoFormat::Yuv420p8;
-        video.plane0 = vec![63u8; (width * height) as usize];
-        video.plane1 = vec![102u8; (cw * ch) as usize];
-        video.plane2 = vec![240u8; (cw * ch) as usize];
+        let video = VideoFrameBuffer {
+            width,
+            height,
+            format: VideoFormat::Yuv420p8,
+            plane0: vec![63u8; (width * height) as usize],
+            plane1: vec![102u8; (cw * ch) as usize],
+            plane2: vec![240u8; (cw * ch) as usize],
+            ..Default::default()
+        };
 
         let mut pipeline = PipelineState::new(&device, &queue).expect("pipeline");
         pipeline.ensure_output(&device, width, height);

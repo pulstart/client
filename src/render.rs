@@ -8,6 +8,9 @@ use crate::render_wgpu::WgpuVideoTexture;
 use crate::video_frame::{NativeSurfaceCapabilities, NativeSurfaceControl, VideoFrameBuffer};
 use eframe::egui;
 
+// One instance per session, dispatched on the per-frame paint path; boxing a
+// variant would add heap indirection there for no real memory benefit.
+#[allow(clippy::large_enum_variant)]
 pub enum VideoTexture {
     Glow(NativeVideoTexture),
     Wgpu(WgpuVideoTexture),

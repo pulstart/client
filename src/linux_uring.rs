@@ -77,10 +77,10 @@ pub fn uring_trace_enabled() -> bool {
 /// escape hatch that forces the `recvmmsg`/`UDP_GRO` fallback. The empty
 /// value or any unrecognized setting stays on the io_uring path.
 pub fn io_uring_requested() -> bool {
-    match std::env::var("ST_IO_URING").ok().as_deref() {
-        Some("0") | Some("false") | Some("no") | Some("off") => false,
-        _ => true,
-    }
+    !matches!(
+        std::env::var("ST_IO_URING").ok().as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    )
 }
 
 pub struct ReceivedMsg<'a> {
@@ -220,7 +220,7 @@ impl UringRecv {
         self.ring
             .submit()
             .map(|_| ())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("uring submit: {e}")))
+            .map_err(|e| io::Error::other(format!("uring submit: {e}")))
     }
 
     /// Drain all currently-ready completions without blocking. Returns the
@@ -232,7 +232,7 @@ impl UringRecv {
         {
             let mut cq = self.ring.completion();
             cq.sync();
-            while let Some(cqe) = cq.next() {
+            for cqe in cq {
                 staged.push((cqe.user_data(), cqe.result()));
             }
         }
@@ -363,6 +363,26 @@ fn extract_udp_gro_segment_size(hdr: &libc::msghdr) -> usize {
         }
     }
     0
+}
+
+fn sockaddr_to_socket_addr(sa: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    unsafe {
+        match sa.ss_family as i32 {
+            libc::AF_INET => {
+                let s = &*(sa as *const _ as *const libc::sockaddr_in);
+                let ip = Ipv4Addr::from(u32::from_be(s.sin_addr.s_addr));
+                let port = u16::from_be(s.sin_port);
+                Some(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+            }
+            libc::AF_INET6 => {
+                let s = &*(sa as *const _ as *const libc::sockaddr_in6);
+                let ip = Ipv6Addr::from(s.sin6_addr.s6_addr);
+                let port = u16::from_be(s.sin6_port);
+                Some(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -798,25 +818,5 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), total as usize);
-    }
-}
-
-fn sockaddr_to_socket_addr(sa: &libc::sockaddr_storage) -> Option<SocketAddr> {
-    unsafe {
-        match sa.ss_family as i32 {
-            libc::AF_INET => {
-                let s = &*(sa as *const _ as *const libc::sockaddr_in);
-                let ip = Ipv4Addr::from(u32::from_be(s.sin_addr.s_addr));
-                let port = u16::from_be(s.sin_port);
-                Some(SocketAddr::V4(SocketAddrV4::new(ip, port)))
-            }
-            libc::AF_INET6 => {
-                let s = &*(sa as *const _ as *const libc::sockaddr_in6);
-                let ip = Ipv6Addr::from(s.sin6_addr.s6_addr);
-                let port = u16::from_be(s.sin6_port);
-                Some(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)))
-            }
-            _ => None,
-        }
     }
 }

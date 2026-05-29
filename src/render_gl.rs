@@ -213,8 +213,10 @@ struct LinuxDirectVideoPresenterState {
 #[cfg(target_os = "linux")]
 impl LinuxDirectVideoPresenter {
     fn new() -> Self {
-        let mut state = LinuxDirectVideoPresenterState::default();
-        state.enabled = true;
+        let state = LinuxDirectVideoPresenterState {
+            enabled: true,
+            ..Default::default()
+        };
         Self {
             inner: Arc::new(Mutex::new(state)),
         }
@@ -1104,6 +1106,7 @@ impl YuvPipeline {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_textures(
         &mut self,
         gl: &glow::Context,
@@ -1432,6 +1435,7 @@ fn upload_rgba(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn upload_plane_texture(
     gl: &glow::Context,
     texture: glow::Texture,
@@ -1531,11 +1535,8 @@ fn pbo_upload_supported(gl: &glow::Context) -> bool {
 
 fn ensure_yuv_gl_support(gl: &glow::Context) -> Result<(), String> {
     let version = gl.version();
-    let supported = if version.is_embedded {
-        version.major >= 3
-    } else {
-        version.major >= 3
-    };
+    // Desktop GL 3.0+ and GLES 3.0+ both expose the YUV sampling path.
+    let supported = version.major >= 3;
     if supported {
         Ok(())
     } else {

@@ -44,6 +44,7 @@ pub struct ConnectionDebugSnapshot {
     pub latency_p95_ms: Option<f32>,
     pub latency_max_ms: Option<f32>,
     pub playout_drops: u32,
+    pub jitter_delay_ms: f32,
     pub last_frame_id: Option<u32>,
     pub last_video_format: String,
     pub last_present_path: String,
@@ -94,6 +95,7 @@ struct ConnectionDebugInner {
     clock_offset_filter: ClockOffsetFilter,
     latency_window: VecDeque<(Instant, f32)>,
     playout_drops: u32,
+    jitter_delay_ms: f32,
 }
 
 #[derive(Default)]
@@ -183,9 +185,7 @@ impl ConnectionDebugState {
             clock_rtt_ms: s.clock_rtt_ms,
             decode_work_ms: s.decode_work_ms,
             total_latency_ms: s.total_latency_ms,
-            latency_recent_max_ms: inner
-                .latency_recent_max()
-                .or(s.total_latency_ms),
+            latency_recent_max_ms: inner.latency_recent_max().or(s.total_latency_ms),
             received_packets: s.received_packets,
             lost_packets: s.lost_packets,
             dropped_frames: s.dropped_frames,
@@ -258,6 +258,13 @@ impl ConnectionDebugState {
         inner.playout_drops = 0;
     }
 
+    /// Current effective adaptive playout/jitter delay (latest-value gauge).
+    pub fn set_jitter_delay(&self, ms: f32) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.jitter_delay_ms = ms;
+        inner.snapshot.jitter_delay_ms = ms;
+    }
+
     /// Record video frames the playout/jitter buffer discarded (decoded but
     /// superseded before display) — smoothness churn distinct from network loss.
     pub fn record_playout_drop(&self, count: u32) {
@@ -280,9 +287,10 @@ impl ConnectionDebugState {
         // by decode_work_ms) and make the two stages report the same number.
         // Both endpoints are monotonic-clock micros (client-only delta), so an
         // NTP step on the wall clock can't corrupt them.
-        if let Some(sample) =
-            micros_diff_ms(timing.client_assembled_mono, timing.client_decode_start_mono)
-        {
+        if let Some(sample) = micros_diff_ms(
+            timing.client_assembled_mono,
+            timing.client_decode_start_mono,
+        ) {
             let value = inner.assemble_to_decode_ms.update(sample);
             inner.snapshot.assemble_to_decode_ms = Some(value);
         }
@@ -292,9 +300,10 @@ impl ConnectionDebugState {
             let value = inner.capture_to_send_ms.update(sample);
             inner.snapshot.capture_to_send_ms = Some(value);
         }
-        if let Some(sample) =
-            micros_diff_ms(timing.client_decode_start_mono, timing.client_decode_done_mono)
-        {
+        if let Some(sample) = micros_diff_ms(
+            timing.client_decode_start_mono,
+            timing.client_decode_done_mono,
+        ) {
             let value = inner.decode_work_ms.update(sample);
             inner.snapshot.decode_work_ms = Some(value);
         }
@@ -327,9 +336,7 @@ impl ConnectionDebugState {
         inner.snapshot.last_present_path = present_path_label(frame).to_string();
 
         // Client-only stage → monotonic clock.
-        if let Some(sample) =
-            micros_diff_ms(timing.client_decode_done_mono, present_mono_micros)
-        {
+        if let Some(sample) = micros_diff_ms(timing.client_decode_done_mono, present_mono_micros) {
             let value = inner.decode_to_present_ms.update(sample);
             inner.snapshot.decode_to_present_ms = Some(value);
         }
@@ -370,7 +377,9 @@ impl ConnectionDebugInner {
             .rev()
             .take_while(|(t, _)| now.duration_since(*t) <= LATENCY_RECENT_WINDOW)
             .map(|(_, v)| *v)
-            .fold(None, |acc: Option<f32>, v| Some(acc.map_or(v, |m| m.max(v))))
+            .fold(None, |acc: Option<f32>, v| {
+                Some(acc.map_or(v, |m| m.max(v)))
+            })
     }
 
     /// (p95, max) end-to-end latency over the full ~3s window (text readout).

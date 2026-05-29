@@ -165,7 +165,9 @@ impl ApiDiscoveryShared {
     /// Local port that the punch socket is bound to, if known.
     pub fn punch_socket_port(&self) -> Option<u16> {
         let guard = self.punch_socket.lock().unwrap();
-        guard.as_ref().and_then(|s| s.local_addr().ok().map(|a| a.port()))
+        guard
+            .as_ref()
+            .and_then(|s| s.local_addr().ok().map(|a| a.port()))
     }
 
     /// Append the router-mapped external `ip:port` to the candidate list
@@ -269,7 +271,7 @@ fn retry_interval(consecutive_failures: u32) -> Duration {
 
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
@@ -321,11 +323,6 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Spawn a background thread that:
-/// 1. Registers as "client" with the API server.
-/// 2. Polls for the host to appear.
-/// 3. Performs X25519 key exchange when the host is online.
-/// 4. Stores the derived shared key and partner candidates.
 /// Spawn a background thread that maintains a PCP/NAT-PMP UDP port mapping
 /// for the punch socket. When the client's router supports either protocol,
 /// this gives the server a directly-reachable `ip:port` regardless of the
