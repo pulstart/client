@@ -494,6 +494,7 @@ pub fn run_receive_pipeline(
                     let decoded = match decoder.decode_into(
                         &completed.data,
                         completed.frame_id,
+                        completed.frame_type,
                         &mut decoded_frame,
                     ) {
                         Ok(frame) => frame,

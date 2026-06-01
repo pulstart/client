@@ -214,7 +214,7 @@ impl ConnectionDebugState {
         let t4 = client_recv_micros as i128;
 
         let server_clock_ahead = ((t2 - t1) + (t3 - t4)) / 2;
-        let rtt = (t4 - t1) - (t3 - t2);
+        let rtt = clock_sync_rtt_micros(t1, t2, t3, t4) as i128;
 
         // Filter the raw per-pong offset through a min-RTT window so latency
         // stages that depend on it stay stable instead of jittering with RTT.
@@ -527,4 +527,37 @@ pub fn unix_time_micros() -> u64 {
         .unwrap_or_default()
         .as_micros()
         .min(u64::MAX as u128) as u64
+}
+
+/// Network round-trip time in microseconds from a clock-sync exchange, clamped
+/// to ≥0. `t1`=client send, `t2`=server receive, `t3`=server send, `t4`=client
+/// receive. Subtracting `(t3−t2)` removes the server's processing dwell, and the
+/// client/server clock offset cancels, so the result is the pure network RTT
+/// regardless of unsynchronized clocks. Single source for the debug overlay and
+/// the B1 `TransportFeedback.rtt_ms` wire field.
+pub fn clock_sync_rtt_micros(t1: i128, t2: i128, t3: i128, t4: i128) -> i64 {
+    ((t4 - t1) - (t3 - t2)).max(0).min(i64::MAX as i128) as i64
+}
+
+#[cfg(test)]
+mod clock_sync_tests {
+    use super::clock_sync_rtt_micros;
+
+    #[test]
+    fn rtt_excludes_server_dwell_and_clock_offset() {
+        // Client clock is 1_000_000 µs behind the server, RTT is 20 ms split
+        // 10 ms each way, server dwells 5 ms. t in µs.
+        // t1 client-send=0; packet reaches server (server clock +1_000_000)
+        // 10 ms later → t2=1_010_000; server dwells 5 ms → t3=1_015_000;
+        // reply reaches client 10 ms later → t4 (client clock)=25_000.
+        let rtt = clock_sync_rtt_micros(0, 1_010_000, 1_015_000, 25_000);
+        // (25_000 − 0) − (1_015_000 − 1_010_000) = 25_000 − 5_000 = 20_000 µs.
+        assert_eq!(rtt, 20_000);
+    }
+
+    #[test]
+    fn negative_clamps_to_zero() {
+        // Pathological/jittered samples must never produce a negative RTT.
+        assert_eq!(clock_sync_rtt_micros(100, 0, 0, 0), 0);
+    }
 }

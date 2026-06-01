@@ -58,7 +58,8 @@ use transport::{AudioPacket, MediaReceiver};
 use video_frame::{NativeSurfaceControl, VideoFrameBuffer};
 
 use crate::debug_state::{
-    loss_percent, mono_micros, unix_time_micros, ConnectionDebugSnapshot, ConnectionDebugState,
+    clock_sync_rtt_micros, loss_percent, mono_micros, unix_time_micros, ConnectionDebugSnapshot,
+    ConnectionDebugState,
 };
 
 const DEFAULT_APP_PORT: u16 = 28_480;
@@ -3490,8 +3491,11 @@ fn start_media_threads(
     });
 
     let (audio_stop_tx, audio_stop_rx) = crossbeam_channel::bounded(1);
+    let audio_packet_duration_ms = stream_config.packet_duration_ms as u32;
     let audio_thread = std::thread::spawn(move || {
-        if let Err(e) = audio::run_audio_pipeline(audio_data_rx, audio_stop_rx) {
+        if let Err(e) =
+            audio::run_audio_pipeline(audio_data_rx, audio_stop_rx, audio_packet_duration_ms)
+        {
             eprintln!("[audio] {e}");
         }
     });
@@ -3553,8 +3557,11 @@ fn start_punched_media_threads(
     });
 
     let (audio_stop_tx, audio_stop_rx) = crossbeam_channel::bounded(1);
+    let audio_packet_duration_ms = stream_config.packet_duration_ms as u32;
     let audio_thread = std::thread::spawn(move || {
-        if let Err(e) = audio::run_audio_pipeline(audio_data_rx, audio_stop_rx) {
+        if let Err(e) =
+            audio::run_audio_pipeline(audio_data_rx, audio_stop_rx, audio_packet_duration_ms)
+        {
             eprintln!("[audio] {e}");
         }
     });
@@ -3892,9 +3899,13 @@ fn run_connection(
             hardware_video_codecs: effective_hardware,
             supported_yuv444_video_codecs: effective_yuv444,
             hardware_yuv444_video_codecs: effective_hardware_yuv444,
+            hdr_display: client_hdr_display_supported(),
         })
         .serialize(),
     );
+    if let Some(max_kbps) = client_bitrate_preference_kbps() {
+        let _ = tcp.write_all(&ControlMessage::ClientBitratePreference(max_kbps).serialize());
+    }
 
     // Wait for stream config, start the UDP media path, then wait for StreamStarted.
     let mut buf = [0u8; 1024];
@@ -4194,6 +4205,8 @@ fn run_connection(
     let mut last_audio_state = initial_audio;
     let mut last_debug_enabled = debug_enabled.load(Ordering::SeqCst);
     let mut next_clock_ping = Instant::now();
+    // B1: last clock-sync RTT (ms) stamped onto outgoing TransportFeedback.
+    let mut last_rtt_ms: u32 = 0;
     let mut startup_decode_ok = false;
     let startup_deadline = Instant::now() + STARTUP_DECODE_TIMEOUT;
     loop {
@@ -4236,7 +4249,10 @@ fn run_connection(
         while decode_started_rx.try_recv().is_ok() {
             startup_decode_ok = true;
         }
-        while let Ok(feedback) = feedback_rx.try_recv() {
+        while let Ok(mut feedback) = feedback_rx.try_recv() {
+            // B1: stamp the latest clock-sync RTT so the wire field is live
+            // (telemetry; the server-side CC consumer is a separate step).
+            feedback.rtt_ms = last_rtt_ms;
             if tcp
                 .write_all(&ControlMessage::TransportFeedback(feedback).serialize())
                 .is_err()
@@ -4260,7 +4276,9 @@ fn run_connection(
             stop_media_threads(media_threads);
             return;
         }
-        if current_debug_enabled && Instant::now() >= next_clock_ping {
+        // Clock-sync ping runs always (not only with the debug overlay) so the
+        // RTT stamped onto TransportFeedback (B1) stays fresh — 16 B every 2 s.
+        if Instant::now() >= next_clock_ping {
             let ping = ControlMessage::ClockSyncPing(ClockSyncPing {
                 client_send_micros: unix_time_micros(),
             });
@@ -4282,8 +4300,19 @@ fn run_connection(
                             debug_state.set_session_info(info);
                         }
                         ControlMessage::ClockSyncPong(pong) => {
+                            // B1: always derive RTT for the feedback field; the
+                            // overlay update stays gated on the debug toggle.
+                            let now = unix_time_micros();
+                            last_rtt_ms = (clock_sync_rtt_micros(
+                                pong.client_send_micros as i128,
+                                pong.server_recv_micros as i128,
+                                pong.server_send_micros as i128,
+                                now as i128,
+                            ) / 1000)
+                                .min(u32::MAX as i64)
+                                as u32;
                             if current_debug_enabled {
-                                debug_state.update_clock_sync(pong, unix_time_micros());
+                                debug_state.update_clock_sync(pong, now);
                             }
                         }
                         ControlMessage::InputSession(session) => {
@@ -4627,8 +4656,13 @@ fn run_punched_session(
         hardware_video_codecs: effective_hardware,
         supported_yuv444_video_codecs: effective_yuv444,
         hardware_yuv444_video_codecs: effective_hardware_yuv444,
+        hdr_display: client_hdr_display_supported(),
     };
     let _ = punched.send_control(&ControlMessage::ClientDisplayInfo(display_info).serialize());
+    if let Some(max_kbps) = client_bitrate_preference_kbps() {
+        let _ =
+            punched.send_control(&ControlMessage::ClientBitratePreference(max_kbps).serialize());
+    }
 
     // --- Wait for StreamConfig and startup bundle ---
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -4738,6 +4772,8 @@ fn run_punched_session(
     let mut last_audio_state = initial_audio;
     let mut last_debug_enabled = debug_enabled.load(Ordering::SeqCst);
     let mut next_clock_ping = Instant::now();
+    // B1: last clock-sync RTT (ms) stamped onto outgoing TransportFeedback.
+    let mut last_rtt_ms: u32 = 0;
     let mut input_seq: u16 = 0;
     let mut mouse_heartbeat = MouseInputHeartbeat::default();
     let mut keyboard_heartbeat = KeyboardInputHeartbeat::default();
@@ -4852,8 +4888,10 @@ fn run_punched_session(
         }
 
         // Forward transport feedback.
-        while let Ok(fb) = media.feedback_rx.try_recv() {
+        while let Ok(mut fb) = media.feedback_rx.try_recv() {
             did_work = true;
+            // B1: stamp the latest clock-sync RTT onto the wire field.
+            fb.rtt_ms = last_rtt_ms;
             let _ = punched.send_control(&ControlMessage::TransportFeedback(fb).serialize());
         }
 
@@ -4862,7 +4900,8 @@ fn run_punched_session(
             did_work = true;
             let _ = punched.send_control(&ctrl.serialize());
         }
-        if current_debug_enabled && Instant::now() >= next_clock_ping {
+        // Clock-sync ping runs always (B1) so RTT on feedback stays fresh.
+        if Instant::now() >= next_clock_ping {
             let ping = ControlMessage::ClockSyncPing(ClockSyncPing {
                 client_send_micros: unix_time_micros(),
             });
@@ -4900,8 +4939,19 @@ fn run_punched_session(
                                     debug_state.set_session_info(info);
                                 }
                                 ControlMessage::ClockSyncPong(pong) => {
+                                    // B1: always derive RTT for the feedback
+                                    // field; overlay update stays debug-gated.
+                                    let now = unix_time_micros();
+                                    last_rtt_ms = (clock_sync_rtt_micros(
+                                        pong.client_send_micros as i128,
+                                        pong.server_recv_micros as i128,
+                                        pong.server_send_micros as i128,
+                                        now as i128,
+                                    ) / 1000)
+                                        .min(u32::MAX as i64)
+                                        as u32;
                                     if current_debug_enabled {
-                                        debug_state.update_clock_sync(pong, unix_time_micros());
+                                        debug_state.update_clock_sync(pong, now);
                                     }
                                 }
                                 ControlMessage::InputSession(session) => {
@@ -5574,6 +5624,30 @@ fn format_refresh(refresh_millihz: Option<u32>) -> String {
     refresh_millihz
         .map(|value| format!("{:.2} Hz", value as f32 / 1000.0))
         .unwrap_or_else(|| "-".to_string())
+}
+
+/// Client-declared max bitrate ceiling in kbps (B4), from `ST_CLIENT_MAX_BITRATE`.
+/// Sent to the server right after the display info so the ABR prober is seeded
+/// with the client's known link ceiling instead of probing up blindly. Unset =
+/// no client-side cap (server uses its own max).
+fn client_bitrate_preference_kbps() -> Option<u32> {
+    std::env::var("ST_CLIENT_MAX_BITRATE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|kbps| *kbps > 0)
+}
+
+/// Whether this client can correctly present an HDR (BT.2020 + PQ) stream (D2).
+/// The server AND-gates HDR on this flag, so we must only advertise it once the
+/// client genuinely has a 10-bit decode + tone-map/HDR render path. That path
+/// (D3) is not implemented yet, so this is `false` for now — `ST_HDR_DISPLAY=1`
+/// is an opt-in override for testing. Advertising `true` prematurely would get a
+/// washed-out image with no SDR fallback.
+fn client_hdr_display_supported() -> bool {
+    matches!(
+        std::env::var("ST_HDR_DISPLAY").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+    )
 }
 
 fn codec_support_summary(support: VideoCodecSupport) -> String {

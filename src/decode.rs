@@ -705,10 +705,19 @@ impl VideoDecoder {
         &mut self,
         nal_data: &[u8],
         packet_frame_id: u32,
+        wire_frame_type: u8,
         frame_out: &mut VideoFrameBuffer,
     ) -> Result<DecodeOutput, String> {
         self.refresh_native_surface_capabilities();
-        let has_recovery_point = packet_has_recovery_point(self.codec_id, nal_data);
+        // A4: the server's explicit frame-type marker is authoritative for "this
+        // unit resets the reference chain" — an IDR, or an intra-refresh recovery
+        // frame (A3). OR it with the bitstream parse so a parity-recovered
+        // FrameStart still exits recovery even if its NALs were truncated.
+        let has_recovery_point = packet_has_recovery_point(self.codec_id, nal_data)
+            || matches!(
+                wire_frame_type,
+                st_protocol::packet::frame_type::IDR | st_protocol::packet::frame_type::RECOVERY
+            );
 
         // Deterministic gap detection (see `last_input_frame_id`): a jump in the
         // input frame id means encoded units were lost. The inter-frames after
@@ -1433,15 +1442,84 @@ fn av1_has_recovery_nal(data: &[u8]) -> bool {
 fn h264_has_recovery_nal(data: &[u8]) -> bool {
     annex_b_nal_units(data).any(|nal| {
         let nal_type = nal[0] & 0x1f;
-        matches!(nal_type, 5 | 7 | 8)
+        // IDR (5), SPS (7), PPS (8) reset the reference chain. NAL 6 is SEI —
+        // an intra-refresh recovery point (A3) is signalled by a recovery_point
+        // SEI (payloadType 6), not an IDR, so parse it explicitly.
+        matches!(nal_type, 5 | 7 | 8) || (nal_type == 6 && sei_has_recovery_point(&nal[1..]))
     })
 }
 
 fn hevc_has_recovery_nal(data: &[u8]) -> bool {
     annex_b_nal_units(data).any(|nal| {
         let nal_type = (nal[0] >> 1) & 0x3f;
+        // IDR/CRA/BLA (16..=23), VPS/SPS/PPS (32/33/34), or a recovery_point SEI
+        // in a prefix/suffix SEI NAL (39/40) for intra-refresh recovery (A3).
         matches!(nal_type, 16..=23 | 32 | 33 | 34)
+            || (matches!(nal_type, 39 | 40) && nal.len() > 2 && sei_has_recovery_point(&nal[2..]))
     })
+}
+
+/// True if a raw SEI RBSP (after the NAL header) contains a `recovery_point`
+/// message (payloadType 6). Strips emulation-prevention bytes first, then walks
+/// the SEI message headers (`payloadType`/`payloadSize` are 0xFF-extended
+/// little-endian byte sums per H.264/HEVC Annex). Robust to trailing bits and
+/// multiple SEI messages in one NAL.
+fn sei_has_recovery_point(rbsp: &[u8]) -> bool {
+    const SEI_RECOVERY_POINT: u32 = 6;
+    let bytes = strip_emulation_prevention(rbsp);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // payloadType (sum of 0xFF run + final byte).
+        let mut payload_type: u32 = 0;
+        while i < bytes.len() && bytes[i] == 0xFF {
+            payload_type += 255;
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        payload_type += bytes[i] as u32;
+        i += 1;
+        // payloadSize (same encoding).
+        let mut payload_size: usize = 0;
+        while i < bytes.len() && bytes[i] == 0xFF {
+            payload_size += 255;
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        payload_size += bytes[i] as usize;
+        i += 1;
+        if payload_type == SEI_RECOVERY_POINT {
+            return true;
+        }
+        i = i.saturating_add(payload_size);
+        // rbsp_trailing_bits: a lone 0x80 terminates the SEI NAL.
+        if i < bytes.len() && bytes[i] == 0x80 {
+            break;
+        }
+    }
+    false
+}
+
+/// Remove H.264/HEVC emulation-prevention bytes (`00 00 03` → `00 00`).
+fn strip_emulation_prevention(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut zeros = 0usize;
+    for &b in data {
+        if zeros >= 2 && b == 0x03 {
+            zeros = 0;
+            continue;
+        }
+        if b == 0 {
+            zeros += 1;
+        } else {
+            zeros = 0;
+        }
+        out.push(b);
+    }
+    out
 }
 
 fn annex_b_nal_units(data: &[u8]) -> impl Iterator<Item = &[u8]> {
@@ -2517,5 +2595,101 @@ mod recovery_tests {
         // risk getting stuck waiting forever.
         let no_size = [0x30u8];
         assert!(av1_has_recovery_nal(&no_size));
+    }
+
+    #[test]
+    fn h264_recovery_point_sei_detected() {
+        // Annex-B: start code, SEI NAL (type 6), recovery_point message
+        // (payloadType=6, payloadSize=2, two payload bytes), rbsp_trailing 0x80.
+        let stream = [
+            0x00, 0x00, 0x00, 0x01, // start code
+            0x06, // forbidden_zero=0, nal_ref_idc=0, type=6 (SEI)
+            0x06, // payloadType = 6 (recovery_point)
+            0x02, // payloadSize = 2
+            0x10, 0x00, // payload bytes
+            0x80, // rbsp_trailing_bits
+        ];
+        assert!(h264_has_recovery_nal(&stream));
+        assert!(packet_has_recovery_point(VideoCodec::H264, &stream));
+    }
+
+    #[test]
+    fn h264_non_recovery_sei_not_detected() {
+        // SEI NAL carrying only a buffering_period (payloadType=0) message — not
+        // a recovery point, and no IDR/SPS/PPS present.
+        let stream = [
+            0x00, 0x00, 0x00, 0x01, 0x06, // SEI NAL
+            0x00, // payloadType = 0
+            0x01, // payloadSize = 1
+            0xAA, // payload
+            0x80,
+        ];
+        assert!(!h264_has_recovery_nal(&stream));
+    }
+
+    #[test]
+    fn h264_recovery_point_sei_with_emulation_prevention() {
+        // payloadType=6, payloadSize=3, payload 00 00 00 — encoder inserts an
+        // emulation-prevention 03 after the two zero bytes, which we must strip
+        // before walking the message.
+        let stream = [
+            0x00, 0x00, 0x00, 0x01, 0x06, // SEI NAL
+            0x06, // payloadType = 6
+            0x03, // payloadSize = 3
+            0x00, 0x00, 0x03, 0x00, // 00 00 (03 EPB) 00
+            0x80,
+        ];
+        assert!(h264_has_recovery_nal(&stream));
+    }
+
+    #[test]
+    fn hevc_recovery_point_sei_detected() {
+        // HEVC prefix SEI NAL (type 39) has a 2-byte NAL header.
+        let stream = [
+            0x00, 0x00, 0x00, 0x01, //
+            0x4E, 0x01, // type=39 (PREFIX_SEI), layer=0, tid=1
+            0x06, // payloadType = 6 (recovery_point)
+            0x01, // payloadSize = 1
+            0x00, // payload
+            0x80,
+        ];
+        assert!(hevc_has_recovery_nal(&stream));
+        assert!(packet_has_recovery_point(VideoCodec::Hevc, &stream));
+    }
+
+    // --- Live-captured encoder SEI (A3 validation, RTX 4080 + libx264) ---
+    //
+    // Captured 2026-06-01 from real encoder output to close the A3 "probe ≠
+    // correctness" gap: confirm the parser fires on a genuine recovery_point
+    // SEI and stays silent on a genuine pic_timing SEI.
+    //
+    // Live finding: `h264_nvenc -intra-refresh 1` on an RTX 4080 does NOT emit
+    // recovery_point — its SEIs were buffering_period (0) + pic_timing (1)
+    // only, because FFmpeg's h264_nvenc does not expose NVENC's
+    // `outputRecoveryPointSEI`. `libx264 -x264opts intra-refresh=1:keyint=15`
+    // DOES emit recovery_point. So intra-refresh recovery via in-band SEI works
+    // on the software path; NVENC recovery relies on the wire frame_type byte
+    // (A4) / IDR until an NVENC SDK-direct path sets outputRecoveryPointSEI.
+
+    /// Real recovery_point SEI NAL emitted by libx264 intra-refresh
+    /// (payloadType=6, payloadSize=2). Bytes verbatim from the encoder.
+    #[test]
+    fn h264_real_x264_recovery_point_sei_detected() {
+        let nal = [0x06, 0x06, 0x02, 0x09, 0x44, 0x80];
+        let mut stream = vec![0x00, 0x00, 0x00, 0x01];
+        stream.extend_from_slice(&nal);
+        assert!(h264_has_recovery_nal(&stream));
+        assert!(packet_has_recovery_point(VideoCodec::H264, &stream));
+    }
+
+    /// Real pic_timing SEI NAL emitted by RTX 4080 h264_nvenc (payloadType=1).
+    /// Must NOT be mistaken for a recovery point.
+    #[test]
+    fn h264_real_nvenc_pic_timing_sei_not_recovery() {
+        let nal = [0x06, 0x01, 0x04, 0x00, 0x00, 0x10, 0x10, 0x80];
+        let mut stream = vec![0x00, 0x00, 0x00, 0x01];
+        stream.extend_from_slice(&nal);
+        assert!(!h264_has_recovery_nal(&stream));
+        assert!(!packet_has_recovery_point(VideoCodec::H264, &stream));
     }
 }

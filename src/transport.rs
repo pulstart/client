@@ -321,10 +321,24 @@ pub struct TransportWindowStats {
     pub received_bytes: u64,
     pub received_video_bytes: u64,
     pub received_audio_bytes: u64,
+    /// One-way-delay trend over the window in microseconds (B1): the change in
+    /// the window's minimum observed (arrival − server-send) delay vs the prior
+    /// window. The constant client/server clock offset cancels out, so a
+    /// sustained positive value means the bottleneck queue is filling.
+    pub owd_trend_us: i32,
 }
 
 impl TransportWindowStats {
     pub fn feedback(self) -> TransportFeedback {
+        // recv_video_kbps is derivable here and now (B1 capacity clamp); the
+        // lost-frame range + rtt + owd-trend fields are populated by the
+        // congestion-control layer before send. Default 0 = no signal yet.
+        let recv_video_kbps = if self.interval_ms > 0 {
+            (self.received_video_bytes.saturating_mul(8) / self.interval_ms as u64)
+                .min(u32::MAX as u64) as u32
+        } else {
+            0
+        };
         TransportFeedback {
             interval_ms: self.interval_ms,
             received_packets: self.received_packets,
@@ -332,6 +346,9 @@ impl TransportWindowStats {
             late_packets: self.late_packets,
             completed_frames: self.completed_frames,
             dropped_frames: self.dropped_frames,
+            recv_video_kbps,
+            owd_trend_us: self.owd_trend_us,
+            ..Default::default()
         }
     }
 
@@ -748,6 +765,9 @@ impl PacketProcessor {
             self.feedback.completed_frames = self.feedback.completed_frames.saturating_add(1);
             let assembled_wall = crate::debug_state::unix_time_micros();
             let assembled_mono = crate::debug_state::mono_micros();
+            // B1: feed the one-way-delay trend estimator.
+            self.feedback
+                .record_owd(assembled_wall, frame.timing.send_ts_micros);
             return Some(ReceivedData::Video(frame, assembled_wall, assembled_mono));
         }
         None
@@ -770,6 +790,10 @@ struct FeedbackWindow {
     received_bytes: u64,
     received_video_bytes: u64,
     received_audio_bytes: u64,
+    /// Minimum (arrival − server-send) delay seen this window, in micros (B1).
+    min_owd_micros: Option<i64>,
+    /// The previous window's minimum OWD, for computing the trend.
+    prev_min_owd_micros: Option<i64>,
 }
 
 impl Default for FeedbackWindow {
@@ -785,17 +809,38 @@ impl Default for FeedbackWindow {
             received_bytes: 0,
             received_video_bytes: 0,
             received_audio_bytes: 0,
+            min_owd_micros: None,
+            prev_min_owd_micros: None,
         }
     }
 }
 
 impl FeedbackWindow {
+    /// Record the one-way delay of a completed frame: `arrival_wall_micros`
+    /// (client clock) minus the server's `send_ts_micros`. The absolute value is
+    /// meaningless (clocks differ), but its per-window minimum tracks queueing.
+    fn record_owd(&mut self, arrival_wall_micros: u64, send_ts_micros: u64) {
+        if send_ts_micros == 0 {
+            return;
+        }
+        let owd = arrival_wall_micros as i64 - send_ts_micros as i64;
+        self.min_owd_micros = Some(match self.min_owd_micros {
+            Some(cur) => cur.min(owd),
+            None => owd,
+        });
+    }
+
     fn take_if_due(&mut self) -> Option<TransportWindowStats> {
         let elapsed = self.started_at.elapsed();
         let urgent_due = self.urgent && elapsed >= URGENT_FEEDBACK_MIN_INTERVAL;
         if elapsed < FEEDBACK_INTERVAL && !urgent_due {
             return None;
         }
+
+        let owd_trend_us = match (self.min_owd_micros, self.prev_min_owd_micros) {
+            (Some(cur), Some(prev)) => (cur - prev).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+            _ => 0,
+        };
 
         let stats = TransportWindowStats {
             interval_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
@@ -807,8 +852,14 @@ impl FeedbackWindow {
             received_bytes: self.received_bytes,
             received_video_bytes: self.received_video_bytes,
             received_audio_bytes: self.received_audio_bytes,
+            owd_trend_us,
         };
 
+        // Carry this window's min OWD forward only when we actually saw a frame,
+        // so a silent window doesn't spuriously reset the trend baseline.
+        if self.min_owd_micros.is_some() {
+            self.prev_min_owd_micros = self.min_owd_micros;
+        }
         self.started_at = Instant::now();
         self.urgent = false;
         self.received_packets = 0;
@@ -819,6 +870,7 @@ impl FeedbackWindow {
         self.received_bytes = 0;
         self.received_video_bytes = 0;
         self.received_audio_bytes = 0;
+        self.min_owd_micros = None;
         Some(stats)
     }
 }

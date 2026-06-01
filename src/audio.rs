@@ -14,9 +14,12 @@ const SAMPLE_RATE: u32 = 48000;
 const CHANNELS: u32 = 2;
 /// Maximum Opus frame size at 48kHz (120ms frame).
 const MAX_OPUS_FRAME_SAMPLES: usize = 5760;
-/// Conceal up to 60ms of consecutive missing packets before resyncing.
-const MAX_CONCEALED_AUDIO_PACKETS: usize = 3;
-const AUDIO_PACKET_DURATION_MS: usize = 20;
+/// Conceal up to this many ms of consecutive missing packets before resyncing.
+/// Expressed in ms (not packets) so it stays a fixed time budget regardless of
+/// the negotiated Opus frame duration (E1: 5 ms frames → a higher packet cap).
+const MAX_CONCEALED_AUDIO_MS: usize = 60;
+/// Fallback Opus frame duration when the server doesn't declare one.
+const DEFAULT_AUDIO_PACKET_DURATION_MS: usize = 20;
 /// Steady-state playback buffer. Two packets of jitter cushion on top of the
 /// 20ms producer cadence. Tuned for game-streaming latency, not studio audio.
 const DEFAULT_TARGET_BUFFER_MS: usize = 60;
@@ -47,11 +50,33 @@ struct PlaybackBuffer {
     needs_crossfade: bool,
 }
 
+/// E1: derive per-packet audio timing from the negotiated Opus frame duration.
+/// `packet_duration_ms == 0` (server declared none) falls back to the default.
+/// Returns `(effective_ms, max_concealed_packets, packet_samples)`. Kept pure so
+/// the 5 ms-frame sequence-gap / concealment math is unit-tested without cpal.
+fn audio_timing(packet_duration_ms: u32) -> (usize, usize, usize) {
+    let ms = if packet_duration_ms == 0 {
+        DEFAULT_AUDIO_PACKET_DURATION_MS
+    } else {
+        packet_duration_ms as usize
+    };
+    let max_concealed_packets = (MAX_CONCEALED_AUDIO_MS / ms.max(1)).max(1);
+    let packet_samples = (SAMPLE_RATE as usize * CHANNELS as usize * ms) / 1000;
+    (ms, max_concealed_packets, packet_samples)
+}
+
 pub fn run_audio_pipeline(
     opus_rx: Receiver<AudioPacket>,
     shutdown_rx: Receiver<()>,
+    packet_duration_ms: u32,
 ) -> Result<(), String> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    // E1: derive the per-packet timing from the negotiated Opus frame duration
+    // rather than a hardcoded 20 ms, so 5 ms frames keep correct sequence-gap /
+    // concealment math (and a proportionally higher concealment packet cap).
+    let (_packet_duration_ms, max_concealed_packets, packet_samples) =
+        audio_timing(packet_duration_ms);
 
     let target_buffer_samples =
         configured_audio_buffer_samples("ST_CLIENT_AUDIO_BUFFER_MS", DEFAULT_TARGET_BUFFER_MS);
@@ -144,7 +169,8 @@ pub fn run_audio_pipeline(
     // Decode loop: receive Opus packets from pipeline, decode, push to ring
     let mut pcm_buf = vec![0.0f32; MAX_OPUS_FRAME_SAMPLES * CHANNELS as usize];
     let mut expected_seq = None::<u16>;
-    let packet_samples = audio_packet_samples();
+    // `packet_samples` and `max_concealed_packets` are derived above from the
+    // negotiated frame duration (E1).
     let trace = std::env::var_os("ST_TRACE").is_some();
     let mut concealment_logs = 0usize;
     let mut backlog_logs = 0usize;
@@ -177,7 +203,7 @@ pub fn run_audio_pipeline(
             if delta != 0 {
                 if delta < 0x8000 {
                     let missing_packets = delta as usize;
-                    if missing_packets <= MAX_CONCEALED_AUDIO_PACKETS {
+                    if missing_packets <= max_concealed_packets {
                         let redundancy_count = packet.redundant_prev.len();
                         let mut via_redundancy = 0usize;
                         let mut via_fec = 0usize;
@@ -294,10 +320,6 @@ pub fn run_audio_pipeline(
     drop(stream);
     eprintln!("[audio] Pipeline stopped");
     Ok(())
-}
-
-fn audio_packet_samples() -> usize {
-    (SAMPLE_RATE as usize * CHANNELS as usize * AUDIO_PACKET_DURATION_MS) / 1000
 }
 
 fn configured_audio_buffer_samples(var: &str, default_ms: usize) -> usize {
@@ -446,4 +468,36 @@ fn decode_and_enqueue(
         playback.samples.drain(..excess);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_timing_derives_from_wire_frame_duration() {
+        // 20 ms (legacy / restore path): 3 concealed packets, 1920 interleaved
+        // samples (960/ch).
+        assert_eq!(audio_timing(20), (20, 3, 1920));
+        // 5 ms (E1 default): proportionally higher packet cap (12), 240 samples/ch
+        // → 480 interleaved stereo samples. The sequence-gap / concealment math
+        // scales correctly instead of silently breaking.
+        assert_eq!(audio_timing(5), (5, 12, 480));
+        // 10 ms: 6 packets, 960 interleaved.
+        assert_eq!(audio_timing(10), (10, 6, 960));
+        // 0 ⇒ server declared none ⇒ fall back to the default duration.
+        assert_eq!(
+            audio_timing(0),
+            (
+                DEFAULT_AUDIO_PACKET_DURATION_MS,
+                MAX_CONCEALED_AUDIO_MS / DEFAULT_AUDIO_PACKET_DURATION_MS,
+                SAMPLE_RATE as usize * CHANNELS as usize * DEFAULT_AUDIO_PACKET_DURATION_MS / 1000
+            )
+        );
+        // Concealment budget stays a fixed 60 ms regardless of frame size.
+        for ms in [5u32, 10, 20] {
+            let (eff, max_concealed, _) = audio_timing(ms);
+            assert_eq!(max_concealed * eff, MAX_CONCEALED_AUDIO_MS);
+        }
+    }
 }
