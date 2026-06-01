@@ -183,6 +183,16 @@ impl VideoPlayoutBuffer {
         self.min_delay.as_secs_f32() * 1000.0
     }
 
+    /// Time until the earliest queued-but-not-yet-due frame becomes due, or
+    /// `None` when the queue is empty. The idle loop caps its socket wait at
+    /// this so a frame scheduled <2ms out isn't held back by a flat poll
+    /// timeout (saturates to zero for an already-due frame).
+    fn next_present_delay(&self, now: Instant) -> Option<Duration> {
+        self.queued
+            .front()
+            .map(|queued| queued.present_at.saturating_duration_since(now))
+    }
+
     fn enqueue(&mut self, frame: VideoFrameBuffer) -> Option<VideoFrameBuffer> {
         let frame_id = frame.debug_timing.as_ref().map(|timing| timing.frame_id);
         if let Some(frame_id) = frame_id {
@@ -356,6 +366,13 @@ fn present_due_video_frames(
     frame_buf: &Arc<Mutex<VideoFrameBuffer>>,
     ctx: &egui::Context,
     repaint_pacer: &mut RepaintPacer,
+    // When this present follows a fresh decode this iteration, repaint
+    // immediately: the frame is brand-new content and the playout buffer +
+    // egui mailbox (`desired_maximum_frame_latency=1`) already bound the real
+    // present rate, so routing it through the refresh-rate pacer only defers a
+    // ready frame by up to one display interval (~16.6ms @60Hz). The pacer is
+    // still used for the idle/no-new-data re-present path.
+    immediate: bool,
 ) -> usize {
     let due = playout.take_due_frames();
     let dropped_count = due.dropped.len();
@@ -371,7 +388,11 @@ fn present_due_video_frames(
     std::mem::swap(&mut *fb, &mut frame);
     fb.dirty = true;
     recycle_video_frame(recycled_frames, frame);
-    repaint_pacer.request(ctx);
+    if immediate {
+        ctx.request_repaint();
+    } else {
+        repaint_pacer.request(ctx);
+    }
     dropped_count
 }
 
@@ -448,14 +469,22 @@ pub fn run_receive_pipeline(
                     &frame_buf,
                     &ctx,
                     &mut repaint_pacer,
+                    false,
                 );
                 if drops > 0 && debug_enabled.load(Ordering::Relaxed) {
                     debug_state.record_playout_drop(drops as u32);
                 }
                 // Block briefly on the socket instead of spinning: wakes as soon
-                // as a datagram arrives (Linux poll) or after a 2ms timeout so
-                // stats/recovery/shutdown checks still get a turn.
-                receiver.wait_for_data(Duration::from_millis(2));
+                // as a datagram arrives (Linux poll) or after a timeout so
+                // stats/recovery/shutdown checks still get a turn. Cap the wait at
+                // the next queued frame's due time (never more than 2ms) so a
+                // frame scheduled <2ms out is presented on time instead of being
+                // held back by a flat poll timeout.
+                let wait = playout
+                    .next_present_delay(Instant::now())
+                    .map(|until| until.min(Duration::from_millis(2)))
+                    .unwrap_or(Duration::from_millis(2));
+                receiver.wait_for_data(wait);
                 continue;
             }
             Some(ReceivedData::Audio(opus)) => {
@@ -611,6 +640,7 @@ pub fn run_receive_pipeline(
                         &frame_buf,
                         &ctx,
                         &mut repaint_pacer,
+                        true,
                     );
                     if drops > 0 && debug_on {
                         debug_state.record_playout_drop(drops as u32);

@@ -9,7 +9,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const FEEDBACK_INTERVAL: Duration = Duration::from_millis(500);
-const URGENT_FEEDBACK_MIN_INTERVAL: Duration = Duration::from_millis(100);
+/// Minimum spacing between *consecutive* urgent feedback flushes. The first loss
+/// after a clean period flushes immediately (server reacts ~10-100ms sooner —
+/// drops bitrate / requests a recovery keyframe); this only debounces a burst of
+/// follow-up loss events so a lossy window can't spam feedback. The server's own
+/// ABR/keyframe logic is separately debounced (~250ms), so the early flush can't
+/// trigger a keyframe storm.
+const URGENT_FEEDBACK_DEBOUNCE: Duration = Duration::from_millis(20);
 const MAX_UDP_DATAGRAM_SIZE: usize = 65_535;
 const DEFAULT_UDP_RECV_BUFFER: i32 = 4 * 1024 * 1024;
 
@@ -782,6 +788,9 @@ impl PacketProcessor {
 struct FeedbackWindow {
     started_at: Instant,
     urgent: bool,
+    /// When the last urgent flush fired, so the first loss after a clean period
+    /// flushes immediately and only a burst of follow-up losses is debounced.
+    last_urgent_flush: Option<Instant>,
     received_packets: u32,
     lost_packets: u32,
     late_packets: u32,
@@ -801,6 +810,7 @@ impl Default for FeedbackWindow {
         Self {
             started_at: Instant::now(),
             urgent: false,
+            last_urgent_flush: None,
             received_packets: 0,
             lost_packets: 0,
             late_packets: 0,
@@ -832,9 +842,18 @@ impl FeedbackWindow {
 
     fn take_if_due(&mut self) -> Option<TransportWindowStats> {
         let elapsed = self.started_at.elapsed();
-        let urgent_due = self.urgent && elapsed >= URGENT_FEEDBACK_MIN_INTERVAL;
+        // First loss after a clean period flushes immediately; a burst of
+        // follow-up losses is spaced by URGENT_FEEDBACK_DEBOUNCE.
+        let urgent_due = self.urgent
+            && self
+                .last_urgent_flush
+                .map(|last| last.elapsed() >= URGENT_FEEDBACK_DEBOUNCE)
+                .unwrap_or(true);
         if elapsed < FEEDBACK_INTERVAL && !urgent_due {
             return None;
+        }
+        if self.urgent {
+            self.last_urgent_flush = Some(Instant::now());
         }
 
         let owd_trend_us = match (self.min_owd_micros, self.prev_min_owd_micros) {
