@@ -95,9 +95,15 @@ impl VideoPlayoutBuffer {
     // Grow the delay immediately on a jitter spike (avoid underrun/stutter) but
     // shrink it slowly when the path calms (avoid collapsing headroom and
     // fast-forwarding). Classic adaptive de-jitter asymmetry.
+    //
+    // Latency-first tuning: 2.5× headroom (was 3×) buys a little less buffer per
+    // unit jitter, and a 1/12 shrink gain (was 1/16) returns to the floor a bit
+    // faster once the path calms — so dec→present settles lower after a transient
+    // (e.g. bufferbloat clearing). Still grow-fast/shrink-slow; the multiplier
+    // stays high enough to cover real jitter without underrunning into stutter.
     const JITTER_GAIN: f64 = 1.0 / 16.0;
-    const DELAY_SHRINK_GAIN: f64 = 1.0 / 16.0;
-    const JITTER_MULTIPLIER: f64 = 3.0;
+    const DELAY_SHRINK_GAIN: f64 = 1.0 / 12.0;
+    const JITTER_MULTIPLIER: f64 = 2.5;
     // Cap a single interarrival sample's contribution so one large legitimate
     // gap (idle → motion, frame_id skip) can't blow up the estimate.
     const MAX_SAMPLE_DEVIATION: Duration = Duration::from_millis(100);
