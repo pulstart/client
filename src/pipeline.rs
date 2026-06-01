@@ -294,11 +294,16 @@ fn configured_video_jitter_delay(stream_fps: u16) -> (Duration, bool) {
     #[cfg(not(target_os = "windows"))]
     {
         if stream_fps == 0 {
-            return (Duration::from_millis(18), true);
+            return (Duration::from_millis(10), true);
         }
 
+        // Latency-first: hold roughly a half-frame baseline rather than a full
+        // frame, letting the adaptive buffer grow from here only when real jitter
+        // appears. Lever-1 (server adaptive fps) keeps the cadence regular so the
+        // buffer stays near this floor; the Stutter graph surfaces any playout
+        // drops if the floor is too tight on a given path.
         (
-            Duration::from_secs_f64((1.0 / f64::from(stream_fps)).clamp(0.012, 0.030)),
+            Duration::from_secs_f64((0.6 / f64::from(stream_fps)).clamp(0.006, 0.020)),
             true,
         )
     }

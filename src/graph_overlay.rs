@@ -1,4 +1,4 @@
-use crate::debug_state::{loss_percent, MetricsSnapshot};
+use crate::debug_state::{loss_percent, stutter_percent, MetricsSnapshot};
 use eframe::egui;
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -9,7 +9,7 @@ const LANE_HEIGHT: f32 = 44.0;
 const PANEL_WIDTH: f32 = 380.0;
 const LABEL_WIDTH: f32 = 70.0;
 const VALUE_WIDTH: f32 = 76.0;
-const NUM_LANES: usize = 6;
+const NUM_LANES: usize = 7;
 
 /// Lane indices — also index into `lane_scales`.
 const LANE_BITRATE: usize = 0;
@@ -18,6 +18,7 @@ const LANE_LATENCY: usize = 2;
 const LANE_DECODE: usize = 3;
 const LANE_RTT: usize = 4;
 const LANE_LOSS: usize = 5;
+const LANE_STUTTER: usize = 6;
 
 const WARN_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 80, 80);
 
@@ -29,6 +30,7 @@ struct Sample {
     decode_ms: f32,
     rtt_ms: f32,
     loss_pct: f32,
+    stutter_pct: f32,
 }
 
 pub struct GraphOverlay {
@@ -73,6 +75,9 @@ impl GraphOverlay {
                 m.dropped_frames,
                 m.completed_frames,
             ),
+            // Frame-level smoothness — catches the hitches packet-loss can't see
+            // (late frames coalesced/dropped at playout on irregular cadence).
+            stutter_pct: stutter_percent(m.completed_frames, m.dropped_frames, m.playout_drops),
         };
 
         if self.samples.len() >= MAX_SAMPLES {
@@ -149,6 +154,15 @@ impl GraphOverlay {
                             LANE_LOSS,
                             Some(1.0),
                             |s| s.loss_pct,
+                        );
+                        self.render_lane(
+                            ui,
+                            "Stutter",
+                            egui::Color32::from_rgb(255, 99, 164),
+                            "%",
+                            LANE_STUTTER,
+                            Some(2.0),
+                            |s| s.stutter_pct,
                         );
                     });
             })

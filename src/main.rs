@@ -203,6 +203,12 @@ struct StreamApp {
     // temporarily promoted Desktop hover into relative capture. On button
     // release we drop straight back to HoverAbsolute instead of staying locked.
     resume_hover_after_relative_drag: bool,
+    // Latched screen->stream delta-scale decision for the duration of a
+    // button-held relative drag. Frozen so a stale CursorState from a dropped
+    // frame (cursor_state.visible flipping mid-drag) can't suddenly amplify or
+    // shrink the relative delta and jolt the remote camera. None when not in a
+    // held drag.
+    relative_drag_scaling: Option<bool>,
     // Set when we re-enter Desktop hover and must force a one-shot absolute
     // resync so the server cursor snaps to the local overlay even if the pointer
     // is stationary (no PointerMoved event to trigger the usual send).
@@ -769,6 +775,7 @@ impl StreamApp {
             hover_cursor_pos: None,
             cursor_hidden_frames: 0,
             resume_hover_after_relative_drag: false,
+            relative_drag_scaling: None,
             hover_cursor_resync_pending: false,
             last_local_cursor_prediction_at: None,
             remote_cursor_textures: BTreeMap::new(),
@@ -1918,7 +1925,14 @@ impl StreamApp {
                 // backend, leave it the moment the server shows the cursor
                 // again (the game released the pointer). Relative-only backends
                 // stay captured until the force-release shortcut.
-                if absolute_ok && !want_game_capture {
+                //
+                // But never leave mid-drag: while a button is held the user is
+                // actively mouselooking. A dropped video frame can deliver a
+                // stale CursorState whose `visible` momentarily flips true,
+                // which would otherwise warp the OS pointer to the stale server
+                // position and switch to absolute — snapping the remote camera.
+                // Defer the exit until the button is released (re-evaluated then).
+                if absolute_ok && !want_game_capture && self.pointer_buttons == 0 {
                     // Warp the local pointer to where the server cursor now is so
                     // Desktop control resumes from the same spot. This is the one
                     // place we read the server position back into a local pos —
@@ -6924,10 +6938,21 @@ impl eframe::App for StreamApp {
                         && controller_state_allows_input(snapshot.controller_state)
                     {
                         let mut input_delta = delta;
-                        if snapshot.capabilities.separate_cursor
+                        // Convert screen-pixel deltas into stream space (keeps a
+                        // visible Desktop cursor 1:1 when the window is smaller
+                        // than the stream). Latch the decision while a button is
+                        // held so a stale CursorState from a dropped frame can't
+                        // toggle scaling mid-drag and jolt the remote camera.
+                        let live_scale = snapshot.capabilities.separate_cursor
                             && snapshot.cursor_state.visible
-                            && !self.resume_hover_after_relative_drag
-                        {
+                            && !self.resume_hover_after_relative_drag;
+                        let scale_enabled = if self.pointer_buttons != 0 {
+                            *self.relative_drag_scaling.get_or_insert(live_scale)
+                        } else {
+                            self.relative_drag_scaling = None;
+                            live_scale
+                        };
+                        if scale_enabled {
                             if let (Some(rect), Some(stream_size)) =
                                 (video_rect, self.cursor_space_size())
                             {

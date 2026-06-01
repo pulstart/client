@@ -70,6 +70,7 @@ pub struct MetricsSnapshot {
     pub lost_packets: u32,
     pub dropped_frames: u32,
     pub completed_frames: u32,
+    pub playout_drops: u32,
 }
 
 pub struct ConnectionDebugState {
@@ -190,6 +191,7 @@ impl ConnectionDebugState {
             lost_packets: s.lost_packets,
             dropped_frames: s.dropped_frames,
             completed_frames: s.completed_frames,
+            playout_drops: inner.playout_drops,
         }
     }
 
@@ -513,6 +515,25 @@ pub fn loss_percent(
     }
 }
 
+/// Fraction of *intended* frames that did not display smoothly this window —
+/// whole frames that never assembled (`dropped_frames`) plus decoded frames the
+/// playout buffer discarded as superseded (`playout_drops`).
+///
+/// Distinct from [`loss_percent`] on purpose: a stream can stutter badly
+/// (irregular server cadence → late frames coalesced/dropped at playout) with
+/// **zero packet loss**. That is exactly why hitches were invisible in the loss
+/// graph — `loss_percent` counts packets, this counts frames that should have
+/// shown but didn't.
+pub fn stutter_percent(completed_frames: u32, dropped_frames: u32, playout_drops: u32) -> f32 {
+    let intended = completed_frames as f32 + dropped_frames as f32;
+    if intended <= 0.0 {
+        return 0.0;
+    }
+    // playout_drops are a subset of completed frames; dropped never completed.
+    let missed = (dropped_frames as f32 + playout_drops as f32).min(intended);
+    missed * 100.0 / intended
+}
+
 /// Monotonic-clock micros since process start. Use this for client-internal
 /// durations (decode, queue, present); it can't jump or run backwards the way
 /// `unix_time_micros` (wall clock) can when NTP steps the system clock.
@@ -537,6 +558,34 @@ pub fn unix_time_micros() -> u64 {
 /// the B1 `TransportFeedback.rtt_ms` wire field.
 pub fn clock_sync_rtt_micros(t1: i128, t2: i128, t3: i128, t4: i128) -> i64 {
     ((t4 - t1) - (t3 - t2)).max(0).min(i64::MAX as i128) as i64
+}
+
+#[cfg(test)]
+mod stutter_tests {
+    use super::{loss_percent, stutter_percent};
+
+    #[test]
+    fn stutter_surfaces_playout_drops_that_loss_misses() {
+        // The reported case: 66 frames completed, 0 dropped, ~10 dropped at
+        // playout, zero packet loss. Loss reads 0% but stutter must not.
+        assert_eq!(loss_percent(1121, 0, 0, 66), 0.0);
+        let s = stutter_percent(66, 0, 10);
+        assert!(s > 0.0, "playout drops must register as stutter");
+        assert!((s - (10.0 / 66.0 * 100.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn stutter_zero_when_smooth() {
+        assert_eq!(stutter_percent(120, 0, 0), 0.0);
+        assert_eq!(stutter_percent(0, 0, 0), 0.0);
+    }
+
+    #[test]
+    fn stutter_counts_dropped_frames_too() {
+        // 50 completed + 10 whole frames never assembled → 10/60.
+        let s = stutter_percent(50, 10, 0);
+        assert!((s - (10.0 / 60.0 * 100.0)).abs() < 0.01);
+    }
 }
 
 #[cfg(test)]
