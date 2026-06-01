@@ -74,6 +74,14 @@ const INPUT_STATE_REPAIR_WINDOW: Duration = Duration::from_millis(200);
 /// single `visible=false` pulse from the compositor does not lock the pointer
 /// during ordinary desktop use.
 const CURSOR_HIDDEN_CAPTURE_FRAMES: u8 = 4;
+/// Exit hysteresis (symmetric to the entry guard above): the server cursor must
+/// be continuously *shown* for this many frames before we drop game (relative)
+/// capture. Without it, a single stale/blipped `CursorState{visible=true}` — a
+/// server-game hitch, or a stutter delivering one old frame — would instantly
+/// flip the grab `Locked→None`, the OS warps the pointer to re-center, and that
+/// warp delta jumps the remote camera. A genuine release (game shows the desktop
+/// cursor) persists well past this, so the ~150-200ms debounce is imperceptible.
+const CURSOR_SHOWN_RELEASE_FRAMES: u8 = 10;
 /// How long a locally-predicted cursor position is trusted for the relative
 /// (game) overlay before it re-anchors to the server-reported position. Long
 /// enough to bridge the gap between consecutive mouse-move events at low poll
@@ -199,6 +207,10 @@ struct StreamApp {
     // Consecutive frames the server has reported the cursor hidden. Drives the
     // automatic Desktop -> Game (relative mouselook) capture transition.
     cursor_hidden_frames: u8,
+    // Exit-side counterpart: consecutive frames the server cursor has been shown.
+    // Drives the release hysteresis so a single blipped CursorState can't drop
+    // game capture and warp/jump the camera (see CURSOR_SHOWN_RELEASE_FRAMES).
+    cursor_shown_frames: u8,
     // Game (CapturedRelative) sub-state: true while a hidden-cursor button drag
     // temporarily promoted Desktop hover into relative capture. On button
     // release we drop straight back to HoverAbsolute instead of staying locked.
@@ -255,6 +267,11 @@ struct StreamApp {
     /// makes the OS emit a spurious recentering delta that can land one or two
     /// frames late; a single-frame skip is not enough to catch it.
     suppress_mouse_delta: u8,
+    // Wall-clock backstop for the warp suppression above. The frame counter
+    // alone slips when a frame hitches: the OS recenter delta can land a few ms
+    // after the 2-frame window expired, sail through, and jump the camera. A
+    // short time window survives hitches regardless of frame cadence.
+    suppress_mouse_delta_until: Option<Instant>,
     suppress_pointer_pos_frames: u8,
     excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
     file_transfer_state: file_transfer::SharedTransferState,
@@ -774,6 +791,7 @@ impl StreamApp {
             last_sent_absolute_cursor: None,
             hover_cursor_pos: None,
             cursor_hidden_frames: 0,
+            cursor_shown_frames: 0,
             resume_hover_after_relative_drag: false,
             relative_drag_scaling: None,
             hover_cursor_resync_pending: false,
@@ -797,6 +815,7 @@ impl StreamApp {
             os_cursor_hide_settle: 0,
             pending_wheel_units: egui::Vec2::ZERO,
             suppress_mouse_delta: 0,
+            suppress_mouse_delta_until: None,
             suppress_pointer_pos_frames: 0,
             excluded_video_codecs: Arc::new(Mutex::new(st_protocol::VideoCodecSupport::empty())),
             file_transfer_state: file_transfer::new_shared_state(),
@@ -1370,6 +1389,10 @@ impl StreamApp {
         if self.applied_cursor_grab != Some(cursor_grab) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(cursor_grab));
             self.suppress_mouse_delta = 2;
+            // Wall-clock backstop: the recenter delta can land after the 2-frame
+            // window when a frame hitches. 80ms covers the OS warp latency on any
+            // cadence; the cost is a tiny input deadzone right at the transition.
+            self.suppress_mouse_delta_until = Some(Instant::now() + Duration::from_millis(80));
             self.suppress_pointer_pos_frames = 2;
             self.applied_cursor_grab = Some(cursor_grab);
         }
@@ -1910,8 +1933,10 @@ impl StreamApp {
             && !snapshot.cursor_state.visible;
         if server_cursor_hidden {
             self.cursor_hidden_frames = self.cursor_hidden_frames.saturating_add(1);
+            self.cursor_shown_frames = 0;
         } else {
             self.cursor_hidden_frames = 0;
+            self.cursor_shown_frames = self.cursor_shown_frames.saturating_add(1);
         }
         let want_game_capture =
             relative_ok && self.cursor_hidden_frames >= CURSOR_HIDDEN_CAPTURE_FRAMES;
@@ -1922,17 +1947,21 @@ impl StreamApp {
         if controller_ok && self.capture_mode != LocalCaptureMode::ForceReleased {
             if self.capture_mode == LocalCaptureMode::CapturedRelative {
                 // Currently in Game/relative capture. On an absolute-capable
-                // backend, leave it the moment the server shows the cursor
-                // again (the game released the pointer). Relative-only backends
-                // stay captured until the force-release shortcut.
+                // backend, leave it once the server has shown the cursor again
+                // for a *sustained* run (the game genuinely released the pointer).
+                // Relative-only backends stay captured until force-release.
                 //
-                // But never leave mid-drag: while a button is held the user is
-                // actively mouselooking. A dropped video frame can deliver a
-                // stale CursorState whose `visible` momentarily flips true,
-                // which would otherwise warp the OS pointer to the stale server
-                // position and switch to absolute — snapping the remote camera.
-                // Defer the exit until the button is released (re-evaluated then).
-                if absolute_ok && !want_game_capture && self.pointer_buttons == 0 {
+                // The sustained requirement (cursor_shown_frames) is the fix for
+                // the camera jump: a single stale/blipped CursorState{visible} —
+                // from a server-game hitch or a stutter delivering one old frame —
+                // must NOT flip the grab, warp the OS pointer, and snap the camera.
+                // Entry already debounces (cursor_hidden_frames); this makes exit
+                // symmetric. Still also deferred while a button is held (active
+                // mouselook drag) so a release mid-drag can't switch to absolute.
+                if absolute_ok
+                    && self.cursor_shown_frames >= CURSOR_SHOWN_RELEASE_FRAMES
+                    && self.pointer_buttons == 0
+                {
                     // Warp the local pointer to where the server cursor now is so
                     // Desktop control resumes from the same spot. This is the one
                     // place we read the server position back into a local pos —
@@ -6931,7 +6960,11 @@ impl eframe::App for StreamApp {
                     }
                 }
                 egui::Event::MouseMoved(delta) => {
-                    if self.suppress_mouse_delta > 0 {
+                    if self.suppress_mouse_delta > 0
+                        || self
+                            .suppress_mouse_delta_until
+                            .is_some_and(|until| Instant::now() < until)
+                    {
                         continue;
                     }
                     if self.capture_mode == LocalCaptureMode::CapturedRelative
