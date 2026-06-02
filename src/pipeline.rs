@@ -7,7 +7,7 @@ use eframe::egui;
 use st_protocol::{ControlMessage, StreamConfig, TransportFeedback};
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
@@ -406,6 +406,10 @@ pub fn run_receive_pipeline(
     audio_tx: Sender<AudioPacket>,
     feedback_tx: Sender<TransportFeedback>,
     decode_started_tx: Sender<()>,
+    // B1: bumped on every received video unit so the connection loop can detect
+    // a mid-session media stall (TCP alive but UDP video dead — wifi switch /
+    // NAT rebind) and trigger reconnect instead of freezing on the last frame.
+    video_arrival: Arc<AtomicU64>,
     audio_enabled: Arc<AtomicBool>,
     native_surfaces: Arc<NativeSurfaceControl>,
     control_tx: Sender<ControlMessage>,
@@ -493,6 +497,8 @@ pub fn run_receive_pipeline(
                 }
             }
             Some(ReceivedData::Video(completed, assembled_micros, assembled_mono)) => {
+                // B1: signal liveness to the connection loop's media watchdog.
+                video_arrival.fetch_add(1, Ordering::Relaxed);
                 if trace && trace_completed_logged < 12 {
                     eprintln!(
                         "[trace][client] assembled video unit #{}: frame_id={} bytes={} capture_ts={} send_ts={}",

@@ -1,8 +1,25 @@
 use st_protocol::tunnel::{CryptoContext, TunnelKeys};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Shared ureq agent for all signaling calls. The default ureq agent has no
+/// read timeout, so a black-holed or slow API host would hang the registration
+/// thread forever — and, worse, `prepare_punch_attempt` runs inline on the
+/// connect thread, so an unbounded request stalls the whole connect. Bound
+/// connect/read/write so every signaling call fails fast and the caller can
+/// fall back (direct-only / retry).
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(5))
+            .timeout_read(Duration::from_secs(10))
+            .timeout_write(Duration::from_secs(10))
+            .build()
+    })
+}
 
 #[derive(Clone, Debug)]
 pub struct ApiDiscoveredHost {
@@ -418,7 +435,8 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
                 "candidates": local_candidates,
             })
             .to_string();
-            let ok = ureq::post(&format!("{url}/api/register"))
+            let ok = http_agent()
+                .post(&format!("{url}/api/register"))
                 .set("Content-Type", "application/json")
                 .send_string(&reg_body)
                 .is_ok();
@@ -451,7 +469,8 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
                 "public_key": shared.public_key_b64(),
             })
             .to_string();
-            match ureq::post(&format!("{url}/api/key"))
+            match http_agent()
+                .post(&format!("{url}/api/key"))
                 .set("Content-Type", "application/json")
                 .send_string(&key_body)
             {
@@ -476,7 +495,8 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
                 "candidates": local_candidates,
             })
             .to_string();
-            match ureq::post(&format!("{url}/api/candidates"))
+            match http_agent()
+                .post(&format!("{url}/api/candidates"))
                 .set("Content-Type", "application/json")
                 .send_string(&cand_body)
             {
@@ -502,9 +522,11 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
                 Err(_) => shared.partner_candidates.lock().unwrap().clear(),
             }
 
-            // 4. Poll session status for UI.
-            let session_body = format!(r#"{{"token":"{token}"}}"#);
-            let changed = match ureq::post(&format!("{url}/api/session"))
+            // 4. Poll session status for UI. Send our role so the API refreshes
+            // our last_seen (polling = liveness) and we don't age out mid-setup.
+            let session_body = format!(r#"{{"token":"{token}","role":"client"}}"#);
+            let changed = match http_agent()
+                .post(&format!("{url}/api/session"))
                 .set("Content-Type", "application/json")
                 .send_string(&session_body)
             {
@@ -558,7 +580,8 @@ pub fn prepare_punch_attempt(
         "candidates": local_candidates,
     })
     .to_string();
-    ureq::post(&format!("{url}/api/register"))
+    http_agent()
+        .post(&format!("{url}/api/register"))
         .set("Content-Type", "application/json")
         .send_string(&reg_body)
         .map_err(|e| format!("register with API: {e}"))?;
@@ -569,7 +592,8 @@ pub fn prepare_punch_attempt(
         "public_key": shared.public_key_b64(),
     })
     .to_string();
-    let key_resp = ureq::post(&format!("{url}/api/key"))
+    let key_resp = http_agent()
+        .post(&format!("{url}/api/key"))
         .set("Content-Type", "application/json")
         .send_string(&key_body)
         .map_err(|e| format!("exchange tunnel key: {e}"))?;
@@ -589,7 +613,8 @@ pub fn prepare_punch_attempt(
         "candidates": local_candidates,
     })
     .to_string();
-    let cand_resp = ureq::post(&format!("{url}/api/candidates"))
+    let cand_resp = http_agent()
+        .post(&format!("{url}/api/candidates"))
         .set("Content-Type", "application/json")
         .send_string(&cand_body)
         .map_err(|e| format!("refresh punch candidates: {e}"))?;
@@ -618,7 +643,8 @@ pub fn prepare_punch_attempt(
         "nonce": punch_nonce,
     })
     .to_string();
-    ureq::post(&format!("{url}/api/punch"))
+    http_agent()
+        .post(&format!("{url}/api/punch"))
         .set("Content-Type", "application/json")
         .send_string(&punch_body)
         .map_err(|e| format!("request punch from server: {e}"))?;
@@ -681,7 +707,8 @@ pub fn unregister(shared: &ApiDiscoveryShared) {
         return;
     }
     let body = format!(r#"{{"token":"{token}","role":"client","peer_id":"{peer_id}"}}"#);
-    let _ = ureq::post(&format!("{url}/api/unregister"))
+    let _ = http_agent()
+        .post(&format!("{url}/api/unregister"))
         .set("Content-Type", "application/json")
         .send_string(&body);
     shared.connected.store(false, Ordering::Relaxed);

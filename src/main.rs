@@ -188,6 +188,11 @@ struct StreamApp {
     native_surfaces: Arc<NativeSurfaceControl>,
     disconnect_flag: Arc<AtomicBool>,
     connection_epoch: Arc<AtomicU64>,
+    // B7: handle to the running connection thread. Joined at the start of the
+    // next connect() (after signaling the old session to stop) so the previous
+    // session's media threads + UDP socket are fully gone before new ones bind —
+    // no two pipelines writing the shared frame buffer at once on reconnect.
+    connection_thread: Option<std::thread::JoinHandle<()>>,
     // Auto-reconnect on unexpected connection loss (network drop, server
     // restart, transient unreachable). Terminal errors (auth rejected, explicit
     // server rejection) are excluded so we never hammer a server that said no.
@@ -817,6 +822,7 @@ impl StreamApp {
             native_surfaces,
             disconnect_flag: Arc::new(AtomicBool::new(false)),
             connection_epoch: Arc::new(AtomicU64::new(0)),
+            connection_thread: None,
             auto_reconnect_attempts: 0,
             next_reconnect_at: None,
             connect_peer_id: None,
@@ -960,6 +966,14 @@ impl StreamApp {
         self.lan_upgrade_since = None;
 
         self.disconnect_flag.store(true, Ordering::SeqCst);
+        // B7: reap the previous connection thread now that it's been signaled to
+        // stop. It exits within ~one control-loop tick and tears down its media
+        // threads + UDP socket, so by the time we bind the new session there's no
+        // overlap (two pipelines into one frame buffer / two UDP sockets). Almost
+        // always already-exited here (reconnect backoff ≥0.5s), so join is cheap.
+        if let Some(handle) = self.connection_thread.take() {
+            let _ = handle.join();
+        }
         let disconnect_flag = Arc::new(AtomicBool::new(false));
         self.disconnect_flag = Arc::clone(&disconnect_flag);
         let connection_epoch = Arc::clone(&self.connection_epoch);
@@ -1013,7 +1027,7 @@ impl StreamApp {
         self.file_transfer_state = Arc::clone(&ft_state);
         debug_state.reset_for_connect(&addr, display_refresh_millihz);
 
-        std::thread::spawn(move || {
+        self.connection_thread = Some(std::thread::spawn(move || {
             run_connection(
                 addr,
                 token,
@@ -1036,7 +1050,7 @@ impl StreamApp {
                 api_disc,
                 ft_state,
             );
-        });
+        }));
     }
 
     fn disconnect(&mut self) {
@@ -3610,6 +3624,7 @@ fn start_media_threads(
     frame_buf: Arc<Mutex<VideoFrameBuffer>>,
     debug_state: Arc<ConnectionDebugState>,
     debug_enabled: Arc<AtomicBool>,
+    video_arrival: Arc<AtomicU64>,
     ctx: egui::Context,
     display_refresh_millihz: Option<u32>,
     audio_enabled: Arc<AtomicBool>,
@@ -3658,6 +3673,7 @@ fn start_media_threads(
             audio_data_tx,
             feedback_tx,
             decode_started_tx,
+            video_arrival,
             pipeline_audio_flag,
             native_surfaces,
             control_tx,
@@ -3694,6 +3710,7 @@ fn start_punched_media_threads(
     frame_buf: Arc<Mutex<VideoFrameBuffer>>,
     debug_state: Arc<ConnectionDebugState>,
     debug_enabled: Arc<AtomicBool>,
+    video_arrival: Arc<AtomicU64>,
     ctx: egui::Context,
     display_refresh_millihz: Option<u32>,
     audio_enabled: Arc<AtomicBool>,
@@ -3724,6 +3741,7 @@ fn start_punched_media_threads(
             audio_data_tx,
             feedback_tx,
             decode_started_tx,
+            video_arrival,
             pipeline_audio_flag,
             native_surfaces,
             control_tx,
@@ -3769,6 +3787,14 @@ fn stop_media_threads(media_threads: MediaThreads) {
 }
 
 const STARTUP_DECODE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// B1: once decoding has started, this long without a new video unit (while the
+/// TCP control link is still alive) means the UDP media path died silently — a
+/// wifi switch / NAT rebind that broke the server's return route — so we drop
+/// into the auto-reconnect path instead of freezing on the last frame. Longer
+/// than a normal encoder rebuild / keyframe-recovery gap, short enough to feel
+/// responsive (the server streams continuously while a subscriber is attached).
+const MEDIA_STALL_TIMEOUT: Duration = Duration::from_secs(4);
 
 fn filter_advertised_video_codec_support(
     report: decode::VideoCodecSupportReport,
@@ -3924,6 +3950,11 @@ fn run_connection(
     // out and the session tears down into the auto-reconnect path. Without this,
     // a frozen frame could sit on screen indefinitely.
     configure_tcp_keepalive(&tcp);
+
+    // B1: media-stall watchdog counter, bumped by the receive pipeline on every
+    // video unit. The control loop reconnects if it stops advancing while TCP
+    // is still up (UDP media path silently died — wifi switch / NAT rebind).
+    let video_arrival = Arc::new(AtomicU64::new(0));
 
     // --- Authentication handshake ---
     let _ = tcp.write_all(&ControlMessage::Authenticate(token).serialize());
@@ -4146,6 +4177,7 @@ fn run_connection(
                                     Arc::clone(&frame_buf),
                                     Arc::clone(&debug_state),
                                     Arc::clone(&debug_enabled),
+                                    Arc::clone(&video_arrival),
                                     ctx.clone(),
                                     display_refresh_millihz,
                                     Arc::clone(&audio_enabled),
@@ -4386,12 +4418,31 @@ fn run_connection(
     let mut last_rtt_ms: u32 = 0;
     let mut startup_decode_ok = false;
     let startup_deadline = Instant::now() + STARTUP_DECODE_TIMEOUT;
+    // B1: media-stall watchdog state.
+    let mut last_video_count = video_arrival.load(Ordering::Relaxed);
+    let mut last_video_at = Instant::now();
     loop {
         if session_cancelled(
             disconnect.as_ref(),
             connection_epoch.as_ref(),
             session_epoch,
         ) {
+            break;
+        }
+
+        // B1: reconnect if video stopped arriving while TCP is still alive.
+        // Breaking here drops through to the cleanup below, which marks the
+        // session Error("Connection lost") → auto-reconnect (re-resolves the
+        // peer, preferring LAN), binding a fresh UDP socket on the new path.
+        let video_count = video_arrival.load(Ordering::Relaxed);
+        if video_count != last_video_count {
+            last_video_count = video_count;
+            last_video_at = Instant::now();
+        } else if startup_decode_ok && last_video_at.elapsed() > MEDIA_STALL_TIMEOUT {
+            eprintln!(
+                "[media] no video for {}s while TCP alive — media path dead, reconnecting",
+                MEDIA_STALL_TIMEOUT.as_secs()
+            );
             break;
         }
 
@@ -4925,10 +4976,15 @@ fn run_punched_session(
     // --- Start media threads using direct bridged packets ---
     let (pipeline_control_tx, pipeline_control_rx) =
         crossbeam_channel::bounded::<ControlMessage>(8);
+    // Punched sessions detect a dead media path via last_peer_activity below
+    // (PUNCHED_INACTIVITY_TIMEOUT), so this video_arrival counter isn't watched
+    // here — it's only required by start_punched_media_threads' signature.
+    let video_arrival = Arc::new(AtomicU64::new(0));
     let media = start_punched_media_threads(
         Arc::clone(&frame_buf),
         Arc::clone(&debug_state),
         Arc::clone(&debug_enabled),
+        video_arrival,
         ctx.clone(),
         display_refresh_millihz,
         Arc::clone(&audio_enabled),
@@ -5343,7 +5399,12 @@ fn session_is_current(connection_epoch: &AtomicU64, session_epoch: u64) -> bool 
 /// and worth retrying. Matched on the stable message prefixes produced by the
 /// `set_error` call sites.
 fn connection_error_is_terminal(msg: &str) -> bool {
-    msg.starts_with("Authentication failed") || msg.starts_with("Server error:")
+    msg.starts_with("Authentication failed")
+        || msg.starts_with("Server error:")
+        // B8b: a GL upload failure is a local rendering/driver fault — a network
+        // reconnect can't fix it, so don't spin the auto-reconnect loop forever;
+        // surface it to the user instead.
+        || msg.starts_with("GL upload failed")
 }
 
 /// Exponential backoff for auto-reconnect: 0.5s, 1s, 2s, 4s, capped at 8s. The
