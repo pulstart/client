@@ -65,6 +65,11 @@ use crate::debug_state::{
 const DEFAULT_APP_PORT: u16 = 28_480;
 const DISCOVERY_PORT: u16 = 28_481;
 const DISCOVERY_EXPIRY: Duration = Duration::from_secs(10);
+/// While connected over a public/VPN path, how long a LAN beacon for the same
+/// peer must persist before we tear the WAN session down and re-connect over
+/// LAN. Short enough to switch promptly on returning to the server's subnet,
+/// long enough that a single stray beacon can't thrash a healthy session.
+const LAN_UPGRADE_HYSTERESIS: Duration = Duration::from_secs(2);
 const MAX_REMOTE_CURSOR_TEXTURES: usize = 8;
 const INPUT_SENDER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const INPUT_STATE_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
@@ -195,6 +200,11 @@ struct StreamApp {
     // address the session opened with (which a network switch can leave dead).
     // None when connecting to a bare address with no known peer_id.
     connect_peer_id: Option<String>,
+    // First instant a stable LAN beacon for `connect_peer_id` was seen while the
+    // live session runs over a non-LAN path. Drives the proactive LAN upgrade
+    // after `LAN_UPGRADE_HYSTERESIS`. Reset whenever LAN is absent or we're
+    // already on LAN.
+    lan_upgrade_since: Option<Instant>,
     shared_input: Arc<SharedInputState>,
     control_tx: Option<crossbeam_channel::Sender<ControlMessage>>,
     input_tx: Option<crossbeam_channel::Sender<InputPacket>>,
@@ -810,6 +820,7 @@ impl StreamApp {
             auto_reconnect_attempts: 0,
             next_reconnect_at: None,
             connect_peer_id: None,
+            lan_upgrade_since: None,
             shared_input: Arc::new(SharedInputState::new()),
             control_tx: None,
             input_tx: None,
@@ -887,6 +898,57 @@ impl StreamApp {
             .and_then(|h| pick_remote_reachable(&h.candidates))
     }
 
+    /// A fresh, token-matched LAN beacon address for the currently-targeted peer
+    /// — only when we are *not* already on a LAN path and it differs from the
+    /// current address. This is the low-latency path worth switching to, whether
+    /// the session is live (proactive upgrade) or mid-backoff (collapse the wait).
+    fn pending_lan_upgrade(&self) -> Option<String> {
+        let pid = self.connect_peer_id.as_deref()?;
+        if classify_path(&self.server_addr) == PathClass::Lan {
+            return None;
+        }
+        self.discovered_servers
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|d| {
+                d.peer_id == pid
+                    && d.token == self.token
+                    && !self.token.is_empty()
+                    && d.last_seen.elapsed() < DISCOVERY_EXPIRY
+            })
+            .map(|d| d.address.clone())
+            .filter(|a| a != &self.server_addr)
+    }
+
+    /// While connected over a public/VPN path, switch to the server's LAN address
+    /// as soon as a LAN beacon for that peer has been stable for
+    /// `LAN_UPGRADE_HYSTERESIS`. LAN is the low-latency path this app exists to
+    /// use; staying on WAN after returning to the server's subnet is a large,
+    /// needless latency cost, and waiting for the WAN session to drop on its own
+    /// is what made the switch feel slow. Resets the timer when no upgrade is
+    /// pending so a single stray beacon can't tear a healthy session.
+    fn maybe_upgrade_to_lan(&mut self, ctx: &egui::Context) {
+        let Some(lan_addr) = self.pending_lan_upgrade() else {
+            self.lan_upgrade_since = None;
+            return;
+        };
+        let stable_since = *self.lan_upgrade_since.get_or_insert_with(Instant::now);
+        if stable_since.elapsed() >= LAN_UPGRADE_HYSTERESIS {
+            self.lan_upgrade_since = None;
+            eprintln!(
+                "[connect] LAN path for peer is up — upgrading from {} to {lan_addr}",
+                self.server_addr
+            );
+            self.server_addr = lan_addr;
+            self.video_texture.clear_frame();
+            self.connect(ctx.clone());
+        } else {
+            // Keep re-checking until hysteresis elapses even if video is static.
+            ctx.request_repaint_after(LAN_UPGRADE_HYSTERESIS);
+        }
+    }
+
     fn connect(&mut self, ctx: egui::Context) {
         let saved_addr = self.server_addr.trim().to_string();
         touch_server_connected(&mut self.server_list, &saved_addr);
@@ -895,6 +957,7 @@ impl StreamApp {
         // a successful connection (state reaches Connected), not here, so backoff
         // keeps growing across a run of failures.
         self.next_reconnect_at = None;
+        self.lan_upgrade_since = None;
 
         self.disconnect_flag.store(true, Ordering::SeqCst);
         let disconnect_flag = Arc::new(AtomicBool::new(false));
@@ -980,6 +1043,7 @@ impl StreamApp {
         // User-initiated teardown cancels any pending auto-reconnect.
         self.auto_reconnect_attempts = 0;
         self.next_reconnect_at = None;
+        self.lan_upgrade_since = None;
         self.disconnect_flag.store(true, Ordering::SeqCst);
         self.connection_epoch.fetch_add(1, Ordering::SeqCst);
         self.clear_remote_keyboard();
@@ -6544,6 +6608,9 @@ impl eframe::App for StreamApp {
             ConnectionState::Connected => {
                 self.auto_reconnect_attempts = 0;
                 self.next_reconnect_at = None;
+                // Returned to the server's subnet? Switch off WAN onto LAN
+                // without waiting for the WAN session to drop.
+                self.maybe_upgrade_to_lan(ctx);
             }
             ConnectionState::Error(msg)
                 if !connection_error_is_terminal(msg) && !self.server_addr.trim().is_empty() =>
@@ -6574,7 +6641,15 @@ impl eframe::App for StreamApp {
                         return;
                     }
                     Some(at) => {
-                        ctx.request_repaint_after(at.saturating_duration_since(now));
+                        // LAN reappeared mid-backoff — don't sit on the timer;
+                        // retry now so we land on the low-latency LAN path
+                        // immediately instead of after the full delay.
+                        if self.pending_lan_upgrade().is_some() {
+                            self.next_reconnect_at = Some(now);
+                            ctx.request_repaint();
+                        } else {
+                            ctx.request_repaint_after(at.saturating_duration_since(now));
+                        }
                     }
                 }
             }
