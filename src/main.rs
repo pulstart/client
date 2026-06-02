@@ -296,6 +296,12 @@ struct StreamApp {
     /// frame to apply `CursorVisible(false)`, so the overlay must also wait until
     /// this instant before painting. `None` once the cursor is shown again.
     os_cursor_hide_settle_until: Option<Instant>,
+    /// Whether the pointer was over our surface last frame (`hover_pos().is_some()`).
+    /// The compositor only (re)applies our hidden-cursor state when the pointer
+    /// *enters* the surface, so a rising edge here — even with no change to our own
+    /// `applied_cursor_visible` belief — must re-arm the hide-settle backstop. This
+    /// is the "cross in from a window stacked on top" double-cursor case.
+    prev_pointer_present: bool,
     pending_wheel_units: egui::Vec2,
     /// Number of upcoming frames whose `MouseMoved` deltas must be dropped.
     /// Set on every `CursorGrab` change because locking/warping the pointer
@@ -891,6 +897,7 @@ impl StreamApp {
             applied_cursor_grab: None,
             os_cursor_hide_settle: 0,
             os_cursor_hide_settle_until: None,
+            prev_pointer_present: false,
             pending_wheel_units: egui::Vec2::ZERO,
             suppress_mouse_delta: 0,
             suppress_mouse_delta_until: None,
@@ -1195,7 +1202,7 @@ impl StreamApp {
         let snapshot = self.shared_input.snapshot();
         let preserved_cursor_pos = if self.capture_mode == LocalCaptureMode::CapturedRelative
             && snapshot.capabilities.separate_cursor
-            && snapshot.cursor_state.visible
+            && server_cursor_drawable(&snapshot)
         {
             self.hover_cursor_pos.or_else(|| {
                 self.last_video_rect
@@ -1457,9 +1464,9 @@ impl StreamApp {
             // Desktop: drawn at the local pointer position. Active whenever
             // that pointer is over the video and not over the local HUD.
             LocalCaptureMode::HoverAbsolute => self.hover_pointer_over_video(ctx, &snapshot),
-            // Game: drawn at the server-reported position, only while the
-            // server says the cursor is visible (hidden == mouselook).
-            LocalCaptureMode::CapturedRelative => snapshot.cursor_state.visible,
+            // Game: drawn at the server-reported position, only while the cursor
+            // is drawable (hidden or app_grab == mouselook, nothing to draw).
+            LocalCaptureMode::CapturedRelative => server_cursor_drawable(&snapshot),
             _ => false,
         }
     }
@@ -1472,7 +1479,7 @@ impl StreamApp {
         self.capture_mode == LocalCaptureMode::CapturedRelative
             && controller_state_has_separate_cursor(snapshot.controller_state)
             && snapshot.capabilities.separate_cursor
-            && snapshot.cursor_state.visible
+            && server_cursor_drawable(&snapshot)
             && self
                 .remote_cursor_texture_for_serial(snapshot.cursor_state.serial)
                 .is_none()
@@ -1490,7 +1497,7 @@ impl StreamApp {
         self.capture_mode == LocalCaptureMode::HoverAbsolute
             && controller_state_has_separate_cursor(snapshot.controller_state)
             && snapshot.capabilities.separate_cursor
-            && !snapshot.cursor_state.visible
+            && server_wants_relative(snapshot)
             && self.hover_pointer_over_video(ctx, snapshot)
     }
 
@@ -1543,9 +1550,24 @@ impl StreamApp {
         // not flash the pointer at the centre of the window.  When making
         // the cursor visible again, do it after the grab change so the
         // cursor appears at the released position, not the locked one.
-        if !cursor_visible && self.applied_cursor_visible != Some(false) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
-            self.applied_cursor_visible = Some(false);
+        // Pointer surface entry, independent of our own visibility belief. The
+        // compositor (re)applies our cursor state only when the pointer enters our
+        // surface, so crossing in from a window stacked on top of ours — where our
+        // belief was already `hidden` (held by a stale `latest_pos`) and so no
+        // visible→hidden transition fires below — would otherwise flash the OS
+        // arrow under the overlay with no settle armed. Re-arm on the rising edge.
+        let pointer_present = ctx.input(|i| i.pointer.hover_pos()).is_some();
+        let pointer_just_entered = pointer_present && !self.prev_pointer_present;
+        self.prev_pointer_present = pointer_present;
+
+        if !cursor_visible
+            && (self.applied_cursor_visible != Some(false)
+                || (pointer_just_entered && self.applied_cursor_visible == Some(false)))
+        {
+            if self.applied_cursor_visible != Some(false) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+                self.applied_cursor_visible = Some(false);
+            }
             // Defer the overlay: the hide applies asynchronously. The frame
             // counter handles the common case; the wall-clock backstop covers a
             // compositor that takes longer than one (possibly hitched) frame to
@@ -1790,8 +1812,9 @@ impl StreamApp {
         }
         // The server owns cursor visibility in both modes: when it reports the
         // cursor hidden (mouselook in Game, fullscreen-video auto-hide on the
-        // desktop) we draw nothing, so the local view matches the remote.
-        if !input_snapshot.cursor_state.visible {
+        // desktop) or app_grab (warp/park mouselook) we draw nothing, so the
+        // local view matches the remote.
+        if !server_cursor_drawable(input_snapshot) {
             return None;
         }
 
@@ -1913,10 +1936,11 @@ impl StreamApp {
         let overlay_geometry = self.compute_cursor_overlay_geometry(ctx, input_snapshot);
         let mut lines = vec![
             format!(
-                "cursor: mode={} controller={:?} visible={} separate={} hover={} overlay_active={} native_fallback={}",
+                "cursor: mode={} controller={:?} visible={} app_grab={} separate={} hover={} overlay_active={} native_fallback={}",
                 self.capture_mode.label(),
                 input_snapshot.controller_state,
                 if input_snapshot.cursor_state.visible { "y" } else { "n" },
+                if input_snapshot.cursor_state.app_grab { "y" } else { "n" },
                 if input_snapshot.capabilities.separate_cursor { "y" } else { "n" },
                 if input_snapshot.capabilities.hover_capture { "y" } else { "n" },
                 if overlay_geometry.is_some() { "y" } else { "n" },
@@ -2095,10 +2119,16 @@ impl StreamApp {
         // uninitialized state as "a game hid the cursor" and locks itself into
         // relative capture on connect — pointer grabbed and no cursor drawn,
         // with no way to leave the window short of force-release.
+        // "Server wants relative": cursor hidden, OR the warp detector flagged a
+        // mouselook-without-hide app (app_grab). Folding app_grab in here means
+        // the same hidden-frame counters drive entry into relative capture AND
+        // gate the exit — while app_grab holds, cursor_shown_frames never climbs,
+        // so the client can't bounce back to HoverAbsolute on the still-visible
+        // cursor.
         let server_cursor_hidden = separate_cursor
             && controller_state_has_separate_cursor(snapshot.controller_state)
             && snapshot.cursor_state_version > 0
-            && !snapshot.cursor_state.visible;
+            && server_wants_relative(&snapshot);
         if server_cursor_hidden {
             self.cursor_hidden_frames = self.cursor_hidden_frames.saturating_add(1);
             self.cursor_shown_frames = 0;
@@ -4426,11 +4456,6 @@ fn run_connection(
     let suppressed_paths = clipboard::new_suppressed_paths();
     let mut clipboard_sync = clipboard::ClipboardSync::start_with_file_detection(
         "client",
-        true,
-        {
-            let shared_input = Arc::clone(&shared_input);
-            move || shared_input.snapshot().controller_state == ControllerState::OwnedByYou
-        },
         clipboard_control_tx,
         file_detect_tx,
         Arc::clone(&suppressed_paths),
@@ -5072,11 +5097,6 @@ fn run_punched_session(
     let suppressed_paths = clipboard::new_suppressed_paths();
     let mut clipboard_sync = clipboard::ClipboardSync::start_with_file_detection(
         "client-punched",
-        true,
-        {
-            let shared_input = Arc::clone(&shared_input);
-            move || shared_input.snapshot().controller_state == ControllerState::OwnedByYou
-        },
         clipboard_control_tx,
         file_detect_tx,
         Arc::clone(&suppressed_paths),
@@ -6105,6 +6125,23 @@ fn drag_capture_button_mask(button: egui::PointerButton) -> u8 {
 
 fn controller_state_allows_input(controller_state: ControllerState) -> bool {
     controller_state != ControllerState::Unavailable
+}
+
+/// The server is signalling it wants relative (mouselook) input: either it hid
+/// the cursor, or the server-side warp detector flagged the remote app grabbing
+/// the pointer *without* hiding the cursor (`app_grab` — many XWayland/Proton
+/// FPS titles warp/park the pointer instead of hiding it). Both feed the
+/// hidden-frame counters, so this also gates the relative→desktop *exit*: while
+/// the server wants relative, `cursor_shown_frames` never climbs.
+fn server_wants_relative(snapshot: &input::SharedInputSnapshot) -> bool {
+    !snapshot.cursor_state.visible || snapshot.cursor_state.app_grab
+}
+
+/// A real, positionable remote cursor the client can draw. False during
+/// mouselook (cursor hidden, or `app_grab` where the server position is parked
+/// and meaningless), so the overlay is suppressed and raw deltas flow.
+fn server_cursor_drawable(snapshot: &input::SharedInputSnapshot) -> bool {
+    snapshot.cursor_state.visible && !snapshot.cursor_state.app_grab
 }
 
 fn controller_state_has_separate_cursor(controller_state: ControllerState) -> bool {
@@ -7231,7 +7268,7 @@ impl eframe::App for StreamApp {
                         // held so a stale CursorState from a dropped frame can't
                         // toggle scaling mid-drag and jolt the remote camera.
                         let live_scale = snapshot.capabilities.separate_cursor
-                            && snapshot.cursor_state.visible
+                            && server_cursor_drawable(&snapshot)
                             && !self.resume_hover_after_relative_drag;
                         let scale_enabled = if self.pointer_buttons != 0 {
                             *self.relative_drag_scaling.get_or_insert(live_scale)
@@ -7260,7 +7297,9 @@ impl eframe::App for StreamApp {
                             .clamp(i16::MIN as f32, i16::MAX as f32)
                             as i16;
                         let mut predicted_cursor_pos = None;
-                        if snapshot.capabilities.separate_cursor && snapshot.cursor_state.visible {
+                        if snapshot.capabilities.separate_cursor
+                            && server_cursor_drawable(&snapshot)
+                        {
                             if let Some(rect) = video_rect {
                                 let base_pos = self
                                     .hover_cursor_pos
@@ -7433,7 +7472,7 @@ impl eframe::App for StreamApp {
                     let relative_overlay_cursor = self.capture_mode
                         == LocalCaptureMode::CapturedRelative
                         && snapshot.capabilities.separate_cursor
-                        && snapshot.cursor_state.visible;
+                        && server_cursor_drawable(&snapshot);
                     let route_pos = if virtual_hover {
                         self.hover_cursor_pos.or(Some(pos))
                     } else if relative_overlay_cursor {
@@ -7464,7 +7503,7 @@ impl eframe::App for StreamApp {
                     }
                     let hidden_cursor_relative_drag = snapshot.capabilities.separate_cursor
                         && snapshot.capabilities.mouse_relative
-                        && !snapshot.cursor_state.visible;
+                        && server_wants_relative(&snapshot);
                     let enter_relative_drag = should_enter_relative_button_drag_capture(
                         self.capture_mode,
                         snapshot.controller_state,
@@ -7551,7 +7590,7 @@ impl eframe::App for StreamApp {
                     let relative_overlay_cursor = self.capture_mode
                         == LocalCaptureMode::CapturedRelative
                         && snapshot.capabilities.separate_cursor
-                        && snapshot.cursor_state.visible;
+                        && server_cursor_drawable(&snapshot);
                     let wheel_pos = if virtual_hover {
                         self.hover_cursor_pos.or(last_pointer_pos)
                     } else if relative_overlay_cursor {
