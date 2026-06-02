@@ -1878,13 +1878,19 @@ impl StreamApp {
                     video_rect.left() + server_top_left.x * scale_x + hotspot.x,
                     video_rect.top() + server_top_left.y * scale_y + hotspot.y,
                 );
+                // When the server can't report a true cursor position (KMS: the
+                // legacy plane reports (0,0)), never re-anchor to server_pos on
+                // idle — it would snap an in-game menu cursor to the top-left
+                // corner. Hold the local prediction instead.
+                let prefer_local = recent_local_prediction
+                    || !input_snapshot.capabilities.cursor_position_reliable;
                 let anchor = relative_capture_tracking_anchor(
                     Some(server_pos),
                     local_prediction,
-                    recent_local_prediction,
+                    prefer_local,
                 )
                 .unwrap_or(server_pos);
-                let using_local = recent_local_prediction && local_prediction.is_some();
+                let using_local = prefer_local && local_prediction.is_some();
                 (anchor, using_local)
             }
             _ => return None,
