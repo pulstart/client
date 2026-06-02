@@ -288,6 +288,10 @@ pub enum ReceivedData {
     Video(CompletedFrame, u64, u64),
     /// A single audio packet (raw Opus data).
     Audio(AudioPacket),
+    /// Server liveness keepalive (header only). Carries no media — exists so the
+    /// connection loop's media-stall watchdog can tell an idle path from a dead
+    /// one even when no video/audio is flowing (e.g. a static screen).
+    Keepalive,
 }
 
 pub struct UdpReceiver {
@@ -738,6 +742,11 @@ impl PacketProcessor {
                     }));
                 }
                 return None;
+            }
+            if header.payload_type == PayloadType::Keepalive {
+                // Liveness only — don't feed the assembler (it would treat the
+                // 7-byte header as a video packet and skew loss accounting).
+                return Some(ReceivedData::Keepalive);
             }
         }
 

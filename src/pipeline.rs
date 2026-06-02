@@ -492,9 +492,16 @@ pub fn run_receive_pipeline(
                 continue;
             }
             Some(ReceivedData::Audio(opus)) => {
+                // B1: audio is liveness too (flows continuously while enabled).
+                video_arrival.fetch_add(1, Ordering::Relaxed);
                 if audio_enabled.load(Ordering::Relaxed) {
                     let _ = audio_tx.try_send(opus);
                 }
+            }
+            Some(ReceivedData::Keepalive) => {
+                // B1: server liveness keepalive — no media, just reset the
+                // connection loop's media-stall watchdog (path is alive but idle).
+                video_arrival.fetch_add(1, Ordering::Relaxed);
             }
             Some(ReceivedData::Video(completed, assembled_micros, assembled_mono)) => {
                 // B1: signal liveness to the connection loop's media watchdog.
@@ -521,12 +528,17 @@ pub fn run_receive_pipeline(
                     }
                     match receiver.try_receive() {
                         Some(ReceivedData::Video(newer, newer_wall, newer_mono)) => {
+                            video_arrival.fetch_add(1, Ordering::Relaxed);
                             pending_video.push((newer, newer_wall, newer_mono))
                         }
                         Some(ReceivedData::Audio(opus)) => {
+                            video_arrival.fetch_add(1, Ordering::Relaxed);
                             if audio_enabled.load(Ordering::Relaxed) {
                                 let _ = audio_tx.try_send(opus);
                             }
+                        }
+                        Some(ReceivedData::Keepalive) => {
+                            video_arrival.fetch_add(1, Ordering::Relaxed);
                         }
                         None => break,
                     }
