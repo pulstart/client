@@ -2166,11 +2166,20 @@ impl StreamApp {
                     && self.cursor_shown_frames >= CURSOR_SHOWN_RELEASE_FRAMES
                     && self.pointer_buttons == 0
                 {
-                    // Warp the local pointer to where the server cursor now is so
-                    // Desktop control resumes from the same spot. This is the one
-                    // place we read the server position back into a local pos —
-                    // a single discrete event, not a per-frame feedback loop.
-                    if let Some(pos) = self.mapped_server_cursor_video_pos(&snapshot, video_rect) {
+                    // Warp the local pointer to where the cursor now is so Desktop
+                    // control resumes from the same spot. This is the one place we
+                    // read the server position back into a local pos — a single
+                    // discrete event, not a per-frame feedback loop. But only when
+                    // that position is real: on KMS the server reports (0,0), so
+                    // reading it here teleports the cursor to the top-left corner
+                    // the instant an in-game menu releases the pointer. There we
+                    // resume from the position we have been predicting instead.
+                    let resume_pos = if snapshot.capabilities.cursor_position_reliable {
+                        self.mapped_server_cursor_video_pos(&snapshot, video_rect)
+                    } else {
+                        self.hover_cursor_pos
+                    };
+                    if let Some(pos) = resume_pos {
                         let clamped =
                             clamp_pos_to_video_rect(pos, video_rect, ctx.pixels_per_point());
                         self.hover_cursor_pos = Some(clamped);
