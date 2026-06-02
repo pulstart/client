@@ -79,6 +79,20 @@ const INPUT_STATE_REPAIR_WINDOW: Duration = Duration::from_millis(200);
 /// single `visible=false` pulse from the compositor does not lock the pointer
 /// during ordinary desktop use.
 const CURSOR_HIDDEN_CAPTURE_FRAMES: u8 = 4;
+/// Wall-clock backstop for committing the OS-cursor hide before the remote
+/// overlay is painted. The 1-frame `os_cursor_hide_settle` counter slips when a
+/// frame hitches, and a compositor can take more than one frame to actually hide
+/// the OS cursor after `CursorVisible(false)` (notably Wayland/KDE, under load,
+/// or at high refresh where one frame is only a few ms). Painting the overlay
+/// before the hide commits is the "both cursors at once" bug. Mirrors the
+/// `suppress_mouse_delta_until` wall-clock backstop.
+///
+/// Two-sided tradeoff: too short re-admits the double cursor on a slow hide; too
+/// long shows *no* cursor for `this - actual_hide_latency` after entering the
+/// video on a fast compositor (native arrow gone, overlay not yet drawn). 50ms
+/// (~3 frames @60Hz) covers a hitched frame and typical compositor latency while
+/// keeping any fast-path no-cursor gap imperceptible. Tune live per compositor.
+const OS_CURSOR_HIDE_SETTLE: Duration = Duration::from_millis(50);
 /// Exit hysteresis (symmetric to the entry guard above): the server cursor must
 /// be continuously *shown* for this many frames before we drop game (relative)
 /// capture. Without it, a single stale/blipped `CursorState{visible=true}` — a
@@ -188,11 +202,6 @@ struct StreamApp {
     native_surfaces: Arc<NativeSurfaceControl>,
     disconnect_flag: Arc<AtomicBool>,
     connection_epoch: Arc<AtomicU64>,
-    // B7: handle to the running connection thread. Joined at the start of the
-    // next connect() (after signaling the old session to stop) so the previous
-    // session's media threads + UDP socket are fully gone before new ones bind —
-    // no two pipelines writing the shared frame buffer at once on reconnect.
-    connection_thread: Option<std::thread::JoinHandle<()>>,
     // Auto-reconnect on unexpected connection loss (network drop, server
     // restart, transient unreachable). Terminal errors (auth rejected, explicit
     // server rejection) are excluded so we never hammer a server that said no.
@@ -282,6 +291,11 @@ struct StreamApp {
     /// request the hide briefly shows both the OS cursor and the overlay at a
     /// HUD/edge→video transition. Deferring one frame keeps exactly one cursor.
     os_cursor_hide_settle: u8,
+    /// Wall-clock backstop paired with `os_cursor_hide_settle`: the frame counter
+    /// alone slips when a frame hitches and a compositor can take more than one
+    /// frame to apply `CursorVisible(false)`, so the overlay must also wait until
+    /// this instant before painting. `None` once the cursor is shown again.
+    os_cursor_hide_settle_until: Option<Instant>,
     pending_wheel_units: egui::Vec2,
     /// Number of upcoming frames whose `MouseMoved` deltas must be dropped.
     /// Set on every `CursorGrab` change because locking/warping the pointer
@@ -304,6 +318,23 @@ struct StreamApp {
 // ---------------------------------------------------------------------------
 // Server address persistence
 // ---------------------------------------------------------------------------
+
+/// Whether the remote-cursor overlay uses strict presence gating: paint it only
+/// once the OS cursor is committed-hidden past the wall-clock settle AND the
+/// window is focused with the pointer genuinely over the video. Closes the
+/// "both cursors" cases at window edges / on focus changes / when the pointer
+/// left the surface (egui's `latest_pos` lingers there). Default-on; set
+/// `ST_CURSOR_STRICT_PRESENCE=0` (`false`/`no`/`off`) to revert to the prior
+/// 1-frame-settle-only behavior for debugging.
+fn cursor_strict_presence() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        !matches!(
+            std::env::var("ST_CURSOR_STRICT_PRESENCE").ok().as_deref(),
+            Some("0") | Some("false") | Some("no") | Some("off")
+        )
+    })
+}
 
 fn state_dir() -> PathBuf {
     let base = std::env::var("XDG_STATE_HOME")
@@ -822,7 +853,6 @@ impl StreamApp {
             native_surfaces,
             disconnect_flag: Arc::new(AtomicBool::new(false)),
             connection_epoch: Arc::new(AtomicU64::new(0)),
-            connection_thread: None,
             auto_reconnect_attempts: 0,
             next_reconnect_at: None,
             connect_peer_id: None,
@@ -860,6 +890,7 @@ impl StreamApp {
             applied_cursor_visible: None,
             applied_cursor_grab: None,
             os_cursor_hide_settle: 0,
+            os_cursor_hide_settle_until: None,
             pending_wheel_units: egui::Vec2::ZERO,
             suppress_mouse_delta: 0,
             suppress_mouse_delta_until: None,
@@ -966,14 +997,6 @@ impl StreamApp {
         self.lan_upgrade_since = None;
 
         self.disconnect_flag.store(true, Ordering::SeqCst);
-        // B7: reap the previous connection thread now that it's been signaled to
-        // stop. It exits within ~one control-loop tick and tears down its media
-        // threads + UDP socket, so by the time we bind the new session there's no
-        // overlap (two pipelines into one frame buffer / two UDP sockets). Almost
-        // always already-exited here (reconnect backoff ≥0.5s), so join is cheap.
-        if let Some(handle) = self.connection_thread.take() {
-            let _ = handle.join();
-        }
         let disconnect_flag = Arc::new(AtomicBool::new(false));
         self.disconnect_flag = Arc::clone(&disconnect_flag);
         let connection_epoch = Arc::clone(&self.connection_epoch);
@@ -1027,7 +1050,7 @@ impl StreamApp {
         self.file_transfer_state = Arc::clone(&ft_state);
         debug_state.reset_for_connect(&addr, display_refresh_millihz);
 
-        self.connection_thread = Some(std::thread::spawn(move || {
+        std::thread::spawn(move || {
             run_connection(
                 addr,
                 token,
@@ -1050,7 +1073,7 @@ impl StreamApp {
                 api_disc,
                 ft_state,
             );
-        }));
+        });
     }
 
     fn disconnect(&mut self) {
@@ -1220,10 +1243,11 @@ impl StreamApp {
     }
 
     fn send_remote_wheel(&mut self, client_id: u32, delta: egui::Vec2, unit: egui::MouseWheelUnit) {
-        let mut scaled = delta * wheel_unit_scale(unit);
-        if scroll_should_invert() {
-            scaled = -scaled;
-        }
+        // Send wheel deltas exactly as the OS reports them. On macOS the sign
+        // already reflects the system "natural scrolling" setting, so that
+        // toggle is the single source of truth for remote scroll direction —
+        // no app-level inversion.
+        let scaled = delta * wheel_unit_scale(unit);
         self.pending_wheel_units += scaled;
         let delta_x = take_wheel_units(&mut self.pending_wheel_units.x);
         let delta_y = take_wheel_units(&mut self.pending_wheel_units.y);
@@ -1522,9 +1546,12 @@ impl StreamApp {
         if !cursor_visible && self.applied_cursor_visible != Some(false) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
             self.applied_cursor_visible = Some(false);
-            // Defer the overlay one frame: the hide applies asynchronously, so
-            // painting it now would briefly show both the OS cursor and overlay.
+            // Defer the overlay: the hide applies asynchronously. The frame
+            // counter handles the common case; the wall-clock backstop covers a
+            // compositor that takes longer than one (possibly hitched) frame to
+            // actually hide the cursor — that gap is the "both cursors" bug.
             self.os_cursor_hide_settle = 1;
+            self.os_cursor_hide_settle_until = Some(Instant::now() + OS_CURSOR_HIDE_SETTLE);
         }
         if self.applied_cursor_grab != Some(cursor_grab) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(cursor_grab));
@@ -1539,6 +1566,7 @@ impl StreamApp {
         if cursor_visible && self.applied_cursor_visible != Some(true) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
             self.applied_cursor_visible = Some(true);
+            self.os_cursor_hide_settle_until = None;
         }
     }
 
@@ -2253,6 +2281,34 @@ impl StreamApp {
         // cursor hidden — instead of briefly showing both.
         if self.applied_cursor_visible != Some(false) || self.os_cursor_hide_settle > 0 {
             return;
+        }
+        // Strict presence (default-on, ST_CURSOR_STRICT_PRESENCE=0 to disable):
+        // the OS-cursor hide is asynchronous and the 1-frame counter above slips
+        // when a frame hitches, so also wait on the wall-clock backstop; and only
+        // paint while the window is focused with the pointer genuinely over it.
+        // These close the "both cursors" cases: a compositor slow to hide the
+        // cursor, the pointer at a flush window edge / over a foreign window, or
+        // a stale `latest_pos` lingering after the pointer left the surface.
+        if cursor_strict_presence() {
+            if self
+                .os_cursor_hide_settle_until
+                .is_some_and(|t| Instant::now() < t)
+            {
+                return;
+            }
+            if !ctx.input(|i| i.focused) {
+                return;
+            }
+            // The desktop (HoverAbsolute) overlay tracks the local pointer; if the
+            // pointer is not currently over our window the OS is drawing its own
+            // cursor elsewhere, so a second one here would be the stale-position
+            // double. (Relative/game capture draws at the server position with the
+            // pointer locked, where hover_pos() is legitimately None.)
+            if self.capture_mode == LocalCaptureMode::HoverAbsolute
+                && ctx.input(|i| i.pointer.hover_pos()).is_none()
+            {
+                return;
+            }
         }
 
         let snapshot = self.shared_input.snapshot();
@@ -6089,26 +6145,6 @@ fn should_return_to_hover_after_relative_button_drag(
         && drag_capture_button_mask(button) != 0
         && !pressed
         && pointer_buttons & drag_buttons == 0
-}
-
-/// Whether to flip the scroll-wheel direction before sending it to the server.
-///
-/// macOS "natural scrolling" (the default) reports wheel deltas with the
-/// opposite sign to the traditional wheel direction that the Linux/Windows
-/// uinput/SendInput injection expects (`REL_WHEEL` positive = scroll up), so an
-/// un-normalized macOS client scrolls the remote backwards while a Linux/Windows
-/// client does not. Default to inverting on macOS so the wire direction is
-/// canonical across clients. Escape hatch for macOS users who turned natural
-/// scrolling off (or anyone who wants to force a direction): `ST_SCROLL_INVERT`
-/// = `1`/`true`/`yes`/`on` to force-invert, `0`/`false`/`no`/`off` to force-keep.
-fn scroll_should_invert() -> bool {
-    use std::sync::OnceLock;
-    static INVERT: OnceLock<bool> = OnceLock::new();
-    *INVERT.get_or_init(|| match std::env::var("ST_SCROLL_INVERT").ok().as_deref() {
-        Some("1") | Some("true") | Some("yes") | Some("on") => true,
-        Some("0") | Some("false") | Some("no") | Some("off") => false,
-        _ => cfg!(target_os = "macos"),
-    })
 }
 
 fn wheel_unit_scale(unit: egui::MouseWheelUnit) -> f32 {
