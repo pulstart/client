@@ -189,6 +189,12 @@ struct StreamApp {
     // Connection-level only — adds no latency to the live media path.
     auto_reconnect_attempts: u32,
     next_reconnect_at: Option<Instant>,
+    // Stable identity of the machine the live/last session targets, captured at
+    // connect time from the discovered/saved card. Auto-reconnect re-resolves
+    // this peer's best *current* path each attempt instead of replaying the
+    // address the session opened with (which a network switch can leave dead).
+    // None when connecting to a bare address with no known peer_id.
+    connect_peer_id: Option<String>,
     shared_input: Arc<SharedInputState>,
     control_tx: Option<crossbeam_channel::Sender<ControlMessage>>,
     input_tx: Option<crossbeam_channel::Sender<InputPacket>>,
@@ -405,6 +411,29 @@ fn classify_path(addr: &str) -> PathClass {
 
 fn allow_hole_punch_fallback(socket_addr: std::net::SocketAddr) -> bool {
     !is_privateish_ip(socket_addr.ip())
+}
+
+/// Choose the host candidate a *remote* client can actually reach.
+///
+/// Server candidates arrive sorted LAN-first (the server's own best path), but
+/// an API-discovered host with no LAN beacon means the client is almost
+/// certainly not on the server's LAN. The server's 192.168/172.16 address is
+/// then both unreachable AND — being private-ish — would suppress the
+/// hole-punch fallback in `connect()` (`allow_hole_punch_fallback`), so a
+/// connect attempt just hard-fails. Prefer a shared VPN address
+/// (Tailscale/CGNAT, directly routable across networks), else a public address
+/// (which routes via hole punch), and fall back to a LAN address only when the
+/// host advertised nothing better. When the client *is* co-LAN, `best_path`
+/// already overrides this with the real beacon address.
+fn pick_remote_reachable(candidates: &[String]) -> Option<String> {
+    candidates
+        .iter()
+        .min_by_key(|a| match classify_path(a) {
+            PathClass::Vpn => 0u8,
+            PathClass::Public => 1,
+            PathClass::Lan => 2,
+        })
+        .cloned()
 }
 
 fn load_audio_enabled() -> bool {
@@ -780,6 +809,7 @@ impl StreamApp {
             connection_epoch: Arc::new(AtomicU64::new(0)),
             auto_reconnect_attempts: 0,
             next_reconnect_at: None,
+            connect_peer_id: None,
             shared_input: Arc::new(SharedInputState::new()),
             control_tx: None,
             input_tx: None,
@@ -823,6 +853,38 @@ impl StreamApp {
             update_tx,
             update_rx,
         }
+    }
+
+    /// Re-resolve the best currently-reachable address for a peer we are
+    /// (re)connecting to. Mirrors the server-list merge: a live, token-matched
+    /// LAN beacon wins (a packet we actually received), else the public/VPN
+    /// path advertised over the API for this peer. Returns `None` when the peer
+    /// has no live variant right now — the caller then keeps the last-known
+    /// address and lets backoff retry until a path reappears.
+    fn best_addr_for_peer(&self, peer_id: &str) -> Option<String> {
+        let lan = self
+            .discovered_servers
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|d| {
+                d.peer_id == peer_id
+                    && d.token == self.token
+                    && !self.token.is_empty()
+                    && d.last_seen.elapsed() < DISCOVERY_EXPIRY
+            })
+            .map(|d| d.address.clone());
+        if lan.is_some() {
+            return lan;
+        }
+        let host = self.api_discovery.host.lock().unwrap();
+        host.as_ref()
+            .filter(|h| {
+                h.peer_id.as_deref() == Some(peer_id)
+                    && !h.candidates.is_empty()
+                    && h.last_seen.elapsed() < Duration::from_secs(30)
+            })
+            .and_then(|h| pick_remote_reachable(&h.candidates))
     }
 
     fn connect(&mut self, ctx: egui::Context) {
@@ -2421,9 +2483,12 @@ impl StreamApp {
         // API-discovered host. peer_id is mandatory to merge it against a LAN/saved
         // variant of the same machine; without it we cannot tell variants apart, so
         // an identity-less API host is dropped (the server always advertises one).
+        // Window must stay larger than the API discovery poll cadence
+        // (start_api_discovery in api_client.rs, 10s when keyed) or the public
+        // host blinks out between polls.
         let api_host = self.api_discovery.host.lock().unwrap().clone().filter(|h| {
             !h.candidates.is_empty()
-                && h.last_seen.elapsed() < Duration::from_secs(15)
+                && h.last_seen.elapsed() < Duration::from_secs(30)
                 && h.peer_id.as_ref().map(|p| !p.is_empty()).unwrap_or(false)
         });
         let any_api = api_host.is_some();
@@ -2453,9 +2518,11 @@ impl StreamApp {
                 .clone()
                 .expect("filtered for non-empty peer_id above");
             let v = by_peer.entry(pid).or_default();
-            // Candidates are pre-sorted LAN > VPN > public; first is the best path.
+            // Candidates arrive sorted LAN-first (the server's best *local* path),
+            // but a remote client needs the candidate reachable from where it sits
+            // — and a private LAN addr here would also block the punch fallback.
             if v.api_addr.is_none() {
-                v.api_addr = h.candidates.first().cloned();
+                v.api_addr = pick_remote_reachable(&h.candidates);
             }
             if v.hostname.is_none() {
                 v.hostname = h.hostname.clone();
@@ -2584,6 +2651,7 @@ impl StreamApp {
         }
 
         let mut connect_addr: Option<String> = None;
+        let mut connect_peer_id: Option<String> = None;
         let mut delete_idx: Option<usize> = None;
 
         if merged.is_empty() {
@@ -2730,6 +2798,7 @@ impl StreamApp {
                         );
                         if btn_resp.clicked() {
                             connect_addr = Some(srv.connect_addr.clone());
+                            connect_peer_id = srv.peer_id.clone();
                             // Backfill the saved entry: match by stable peer_id when
                             // known (the connect address may be a freshly-discovered
                             // LAN addr that differs from what was saved), else address.
@@ -2805,6 +2874,7 @@ impl StreamApp {
 
         if let Some(addr) = connect_addr {
             self.server_addr = addr;
+            self.connect_peer_id = connect_peer_id;
             self.video_texture.clear_frame();
             self.connect(ctx.clone());
         }
@@ -6488,6 +6558,18 @@ impl eframe::App for StreamApp {
                     Some(at) if now >= at => {
                         self.auto_reconnect_attempts =
                             self.auto_reconnect_attempts.saturating_add(1);
+                        // Re-resolve the peer's live best path before retrying so
+                        // a network switch promotes us onto whatever is reachable
+                        // now (LAN beacon ↔ public/VPN API candidate) instead of
+                        // hammering the address the session opened with — which a
+                        // switch can leave permanently dead. Keep the last address
+                        // when no live variant is known yet; backoff retries until
+                        // one reappears.
+                        if let Some(pid) = self.connect_peer_id.clone() {
+                            if let Some(addr) = self.best_addr_for_peer(&pid) {
+                                self.server_addr = addr;
+                            }
+                        }
                         self.connect(ctx.clone());
                         return;
                     }

@@ -522,9 +522,14 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
                 ctx.request_repaint();
             }
 
+            // Poll cadence must stay shorter than the UI's host-freshness window
+            // (the `api_host` filter in main.rs) or the public host flickers out
+            // of the server list between polls — LAN stays visible via its faster
+            // beacon, so the symptom is "only LAN shows". 10s refresh vs 30s
+            // window = 3x slack against a slow request.
             let has_key = shared.shared_key.lock().unwrap().is_some();
             let interval = if has_key {
-                Duration::from_secs(30)
+                Duration::from_secs(10)
             } else {
                 Duration::from_secs(3)
             };
