@@ -73,11 +73,13 @@ pub struct ApiDiscoveryShared {
     tunnel_keys: Mutex<TunnelKeys>,
     /// Derived ChaCha20 shared key from the latest partner key, if available.
     shared_key: Mutex<Option<[u8; 32]>>,
-    /// Cached `CryptoContext` for the current `shared_key`. We hand out the
-    /// same `Arc` to every caller so the AEAD nonce counter is monotonic
-    /// across reconnects; reusing nonce=0 across sessions on the same key
-    /// would let an attacker replay captured client→host packets.
-    crypto: Mutex<Option<Arc<CryptoContext>>>,
+    /// Cached `CryptoContext` paired with the key it was built from. We hand
+    /// out the same `Arc` to every caller so the AEAD nonce counter is
+    /// monotonic across reconnects; reusing nonce=0 across sessions on the same
+    /// key would let an attacker replay captured client→host packets. Keyed so
+    /// that re-deriving the *same* key (after a transient clear) reuses the
+    /// existing context+counter rather than resetting it to 0.
+    crypto: Mutex<Option<([u8; 32], Arc<CryptoContext>)>>,
     /// Partner (host) NAT candidates parsed as SocketAddr.
     pub partner_candidates: Mutex<Vec<SocketAddr>>,
     /// Process-lifetime UDP socket used for STUN and hole punching.
@@ -94,6 +96,10 @@ pub struct ApiDiscoveryShared {
     portmap_external: Mutex<Option<SocketAddr>>,
     /// Monotonic punch-request nonce sent to the API server.
     next_punch_nonce: AtomicU64,
+    /// Monotonic TCP-relay-request nonce sent to the API server.
+    next_relay_nonce: AtomicU64,
+    /// TCP relay port advertised by the API server (None = relay disabled).
+    relay_port: Mutex<Option<u16>>,
     /// True while a punched session owns the punch socket. STUN refresh
     /// (which would do an unauthenticated recv) is skipped while this is set.
     punch_session_active: AtomicBool,
@@ -122,22 +128,27 @@ impl ApiDiscoveryShared {
             last_stun: Mutex::new(None),
             portmap_external: Mutex::new(None),
             next_punch_nonce: AtomicU64::new(1),
+            next_relay_nonce: AtomicU64::new(1),
+            relay_port: Mutex::new(None),
             punch_session_active: AtomicBool::new(false),
             connected: AtomicBool::new(false),
         }
     }
 
-    /// Return the cached `CryptoContext` for the current shared key. Cached
-    /// so the AEAD nonce counter is monotonic across reconnects.
+    /// Return the cached `CryptoContext` for the current shared key. The same
+    /// instance is reused for an unchanged key so the AEAD nonce counter is
+    /// monotonic for the key's lifetime; it is rebuilt only when the key value
+    /// genuinely changes.
     pub fn crypto_context(&self) -> Option<Arc<CryptoContext>> {
-        let cached = self.crypto.lock().unwrap();
-        if let Some(ctx) = cached.clone() {
-            return Some(ctx);
-        }
-        drop(cached);
         let key = (*self.shared_key.lock().unwrap())?;
+        let mut cache = self.crypto.lock().unwrap();
+        if let Some((cached_key, ctx)) = cache.as_ref() {
+            if *cached_key == key {
+                return Some(Arc::clone(ctx));
+            }
+        }
         let ctx = Arc::new(CryptoContext::new(key, false));
-        *self.crypto.lock().unwrap() = Some(Arc::clone(&ctx));
+        *cache = Some((key, Arc::clone(&ctx)));
         Some(ctx)
     }
 
@@ -210,9 +221,9 @@ impl ApiDiscoveryShared {
             let had_key = current.is_some();
             let has_key = shared_key.is_some();
             *current = shared_key;
-            // The cached CryptoContext is keyed off shared_key — invalidate so
-            // a fresh one is built on next crypto_context() call.
-            *self.crypto.lock().unwrap() = None;
+            // Deliberately keep the cached CryptoContext: crypto_context()
+            // rebuilds only when the key value differs, so a clear + re-derive
+            // of the same key preserves the monotonic nonce counter.
             if has_key && !had_key {
                 eprintln!("[api] Shared key derived");
             }
@@ -652,10 +663,109 @@ pub fn prepare_punch_attempt(
     Ok((partner_candidates, crypto))
 }
 
+/// Refresh key material and signal the host to dial the API server's TCP
+/// relay. Returns the crypto context for the end-to-end encrypted tunnel and
+/// the relay address (`host:port`) to connect to. Used as the last-resort
+/// fallback when both direct TCP and UDP hole punching fail (e.g. UDP is
+/// blocked entirely by a firewall or proxy).
+pub fn prepare_relay_attempt(
+    shared: &ApiDiscoveryShared,
+) -> Result<(Arc<CryptoContext>, String), String> {
+    let url = shared.api_url.lock().unwrap().clone();
+    let token = shared.token.lock().unwrap().clone();
+    let peer_id = shared.peer_id.lock().unwrap().clone();
+    if url.is_empty() || token.is_empty() {
+        return Err("API discovery is not configured".into());
+    }
+
+    // Register (liveness) — without candidates, so an existing list is kept.
+    let reg_body = serde_json::json!({
+        "token": token,
+        "role": "client",
+        "peer_id": peer_id,
+        "candidates": [],
+    })
+    .to_string();
+    http_agent()
+        .post(&format!("{url}/api/register"))
+        .set("Content-Type", "application/json")
+        .send_string(&reg_body)
+        .map_err(|e| format!("register with API: {e}"))?;
+
+    // Key exchange — the relay only ever carries ciphertext.
+    let key_body = serde_json::json!({
+        "token": token,
+        "role": "client",
+        "public_key": shared.public_key_b64(),
+    })
+    .to_string();
+    let key_resp = http_agent()
+        .post(&format!("{url}/api/key"))
+        .set("Content-Type", "application/json")
+        .send_string(&key_body)
+        .map_err(|e| format!("exchange tunnel key: {e}"))?;
+    let key_text = key_resp
+        .into_string()
+        .map_err(|e| format!("read key response: {e}"))?;
+    let key_json: serde_json::Value =
+        serde_json::from_str(&key_text).map_err(|e| format!("parse key response: {e}"))?;
+    shared.update_shared_key_from_partner_b64(key_json["partner_key"].as_str());
+    let crypto = shared
+        .crypto_context()
+        .ok_or_else(|| "shared tunnel key not ready (host not registered?)".to_string())?;
+
+    // Learn the relay port from a fresh session poll (also refreshes liveness).
+    let session_body = format!(r#"{{"token":"{token}","role":"client"}}"#);
+    let session_resp = http_agent()
+        .post(&format!("{url}/api/session"))
+        .set("Content-Type", "application/json")
+        .send_string(&session_body)
+        .map_err(|e| format!("poll session: {e}"))?;
+    let session_text = session_resp
+        .into_string()
+        .map_err(|e| format!("read session response: {e}"))?;
+    let session_json: serde_json::Value =
+        serde_json::from_str(&session_text).map_err(|e| format!("parse session: {e}"))?;
+    let relay_port = session_json["relay_port"].as_u64().map(|p| p as u16);
+    *shared.relay_port.lock().unwrap() = relay_port;
+
+    let relay_addr = st_protocol::tcp_tunnel::resolve_relay_addr(
+        &url,
+        relay_port,
+        std::env::var("ST_RELAY_ADDR").ok(),
+    )
+    .ok_or_else(|| "API server does not advertise a TCP relay".to_string())?;
+
+    // Tell the host (via its session poll) to dial the relay.
+    let relay_nonce = shared.next_relay_nonce.fetch_add(1, Ordering::Relaxed);
+    let relay_body = serde_json::json!({
+        "token": token,
+        "role": "client",
+        "nonce": relay_nonce,
+    })
+    .to_string();
+    http_agent()
+        .post(&format!("{url}/api/relay"))
+        .set("Content-Type", "application/json")
+        .send_string(&relay_body)
+        .map_err(|e| format!("request relay from server: {e}"))?;
+
+    Ok((crypto, relay_addr))
+}
+
+/// Dial the relay and complete the pairing handshake. Blocks until the host
+/// arrives (it dials once it sees the relay nonce on its session poll).
+/// Returns the stream positioned exactly at the start of tunnel traffic.
+pub fn connect_relay(addr: &str, token: &str) -> Result<std::net::TcpStream, String> {
+    st_protocol::tcp_tunnel::connect_relay(addr, "client", token, Duration::from_secs(30))
+}
+
 fn parse_session_status(shared: &ApiDiscoveryShared, json: &str) -> bool {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
         return clear_host(shared);
     };
+
+    *shared.relay_port.lock().unwrap() = v["relay_port"].as_u64().map(|p| p as u16);
 
     let host_joined = v["host_joined"].as_bool().unwrap_or(false);
     let mut host_guard = shared.host.lock().unwrap();

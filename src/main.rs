@@ -315,6 +315,13 @@ struct StreamApp {
     suppress_mouse_delta_until: Option<Instant>,
     suppress_pointer_pos_frames: u8,
     excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
+    /// Per-server sticky fallback: holds the normalized addresses of servers
+    /// for which a session had a live TCP control link but zero UDP media
+    /// (UDP blocked by firewall/proxy/NAT). The next connect to *that* server
+    /// tunnels all media over TCP; other servers are unaffected. An address is
+    /// removed when its TCP-tunnel session fails to establish, so the UDP path
+    /// gets retried.
+    force_tcp_media: Arc<Mutex<std::collections::HashSet<String>>>,
     file_transfer_state: file_transfer::SharedTransferState,
     update_ui_state: UpdateUiState,
     update_tx: crossbeam_channel::Sender<UpdateWorkerEvent>,
@@ -903,6 +910,7 @@ impl StreamApp {
             suppress_mouse_delta_until: None,
             suppress_pointer_pos_frames: 0,
             excluded_video_codecs: Arc::new(Mutex::new(st_protocol::VideoCodecSupport::empty())),
+            force_tcp_media: Arc::new(Mutex::new(std::collections::HashSet::new())),
             file_transfer_state: file_transfer::new_shared_state(),
             update_ui_state,
             update_tx,
@@ -1050,6 +1058,7 @@ impl StreamApp {
         let video_codec_support =
             advertised_video_codec_support(self.video_codec_support, self.yuv444_enabled);
         let excluded_video_codecs = Arc::clone(&self.excluded_video_codecs);
+        let force_tcp_media = Arc::clone(&self.force_tcp_media);
         let shared_input = Arc::clone(&self.shared_input);
         let token = self.token.clone();
         let api_disc = Arc::clone(&self.api_discovery);
@@ -1064,6 +1073,7 @@ impl StreamApp {
                 display_refresh_millihz,
                 video_codec_support,
                 excluded_video_codecs,
+                force_tcp_media,
                 state,
                 frame_buf,
                 debug_state,
@@ -3924,6 +3934,15 @@ fn advertised_video_codec_support(
     filter_advertised_video_codec_support(report, yuv444_enabled, true, !cfg!(target_os = "macos"))
 }
 
+/// `ST_FORCE_TCP=1` skips UDP media entirely and tunnels everything over TCP
+/// from the first connect (useful behind proxies / UDP-blocking firewalls).
+fn force_tcp_env() -> bool {
+    matches!(
+        std::env::var("ST_FORCE_TCP").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_connection(
     addr: String,
@@ -3931,6 +3950,7 @@ fn run_connection(
     display_refresh_millihz: Option<u32>,
     video_codec_support: decode::VideoCodecSupportReport,
     excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
+    force_tcp_media: Arc<Mutex<std::collections::HashSet<String>>>,
     state: Arc<Mutex<ConnectionState>>,
     frame_buf: Arc<Mutex<VideoFrameBuffer>>,
     debug_state: Arc<ConnectionDebugState>,
@@ -3981,58 +4001,128 @@ fn run_connection(
         return;
     }
 
-    // Try direct TCP first. If it fails and we have tunnel state, fall back to hole punch.
+    // Try direct TCP first. If it fails and we have tunnel state, fall back to
+    // hole punch, then to the API server's TCP relay.
+    let force_tcp = force_tcp_media.lock().unwrap().contains(&addr) || force_tcp_env();
     let tcp_timeout = if punch_fallback_available { 3 } else { 5 };
     let tcp_result = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(tcp_timeout));
 
     let mut tcp = match tcp_result {
-        Ok(s) => s,
+        Ok(s) => {
+            if force_tcp {
+                // A previous session saw a live control link but zero UDP
+                // media (or ST_FORCE_TCP is set): run the whole session over
+                // this TCP connection using tunnel framing.
+                eprintln!(
+                    "[connect] TCP media transport active for {socket_addr} (UDP blocked or forced)"
+                );
+                let established = run_direct_tcp_tunnel_session(
+                    s,
+                    token,
+                    display_refresh_millihz,
+                    video_codec_support,
+                    excluded_video_codecs,
+                    state,
+                    frame_buf,
+                    debug_state,
+                    disconnect,
+                    connection_epoch,
+                    session_epoch,
+                    audio_enabled,
+                    debug_enabled,
+                    native_surfaces,
+                    shared_input,
+                    control_rx,
+                    input_rx,
+                    ctx,
+                    ft_shared_state,
+                );
+                if !established && !force_tcp_env() {
+                    // The tunnel never reached Connected — drop this server's
+                    // sticky flag so the next attempt retries the UDP path.
+                    eprintln!("[connect] TCP tunnel did not establish; re-enabling UDP path");
+                    force_tcp_media.lock().unwrap().remove(&addr);
+                }
+                return;
+            }
+            s
+        }
         Err(tcp_err) => {
             if allow_hole_punch_fallback(socket_addr) && punch_fallback_available {
+                let mut punch_failure: String;
                 match api_client::prepare_punch_attempt(api_discovery.as_ref()) {
                     Ok((partner_cands, punched_crypto)) => {
                         eprintln!(
                             "[connect] Direct TCP to {socket_addr} failed ({tcp_err}), attempting hole punch..."
                         );
-                        run_punched_session(
+                        let punched = run_punched_session(
                             partner_cands,
                             punched_crypto,
-                            token,
+                            token.clone(),
                             display_refresh_millihz,
                             video_codec_support,
-                            excluded_video_codecs,
-                            state,
-                            frame_buf,
-                            debug_state,
-                            disconnect,
-                            connection_epoch,
+                            Arc::clone(&excluded_video_codecs),
+                            Arc::clone(&state),
+                            Arc::clone(&frame_buf),
+                            Arc::clone(&debug_state),
+                            Arc::clone(&disconnect),
+                            Arc::clone(&connection_epoch),
                             session_epoch,
-                            audio_enabled,
-                            debug_enabled,
-                            native_surfaces,
-                            shared_input,
-                            control_rx,
-                            input_rx,
-                            ctx,
-                            api_discovery,
-                            ft_shared_state,
+                            Arc::clone(&audio_enabled),
+                            Arc::clone(&debug_enabled),
+                            Arc::clone(&native_surfaces),
+                            Arc::clone(&shared_input),
+                            control_rx.clone(),
+                            input_rx.clone(),
+                            ctx.clone(),
+                            Arc::clone(&api_discovery),
+                            ft_shared_state.clone(),
                         );
-                        return;
+                        if punched {
+                            return;
+                        }
+                        punch_failure = "UDP hole punch failed".into();
                     }
                     Err(punch_err) => {
-                        set_error(
-                            &state,
-                            &ctx,
-                            &disconnect,
-                            &connection_epoch,
-                            session_epoch,
-                            format!(
-                                "Connection failed: {tcp_err}. Hole punch setup failed: {punch_err}"
-                            ),
-                        );
-                        return;
+                        punch_failure = format!("Hole punch setup failed: {punch_err}");
                     }
                 }
+                // Last resort: end-to-end encrypted TCP tunnel through the
+                // API server's relay (works when UDP is blocked entirely).
+                eprintln!("[connect] {punch_failure}; attempting TCP relay fallback...");
+                if run_relay_tunnel_session(
+                    token,
+                    display_refresh_millihz,
+                    video_codec_support,
+                    excluded_video_codecs,
+                    state.clone(),
+                    frame_buf,
+                    debug_state,
+                    disconnect.clone(),
+                    connection_epoch.clone(),
+                    session_epoch,
+                    audio_enabled,
+                    debug_enabled,
+                    native_surfaces,
+                    shared_input,
+                    control_rx,
+                    input_rx,
+                    ctx.clone(),
+                    api_discovery,
+                    ft_shared_state,
+                ) {
+                    return;
+                }
+                punch_failure.push_str(". TCP relay fallback failed");
+                set_error(
+                    &state,
+                    &ctx,
+                    &disconnect,
+                    &connection_epoch,
+                    session_epoch,
+                    format!("Connection failed: {tcp_err}. {punch_failure}."),
+                );
+                return;
             }
             set_error(
                 &state,
@@ -4514,7 +4604,9 @@ fn run_connection(
     let mut last_rtt_ms: u32 = 0;
     let mut startup_decode_ok = false;
     let startup_deadline = Instant::now() + STARTUP_DECODE_TIMEOUT;
-    // B1: media-stall watchdog state.
+    // B1: media-stall watchdog state. `video_arrival` counts every media
+    // datagram (video, audio, AND keepalive — see run_receive_pipeline), so it
+    // doubles as the UDP-liveness signal for the UDP-blocked detector below.
     let mut last_video_count = video_arrival.load(Ordering::Relaxed);
     let mut last_video_at = Instant::now();
     loop {
@@ -4585,6 +4677,31 @@ fn run_connection(
             }
         }
         if !startup_decode_ok && Instant::now() >= startup_deadline {
+            if video_arrival.load(Ordering::Relaxed) == 0 {
+                // TCP control is alive but not a single UDP datagram (video,
+                // audio, or keepalive) arrived: the media path is blocked, not
+                // the codec. Flip THIS server to TCP media transport and
+                // reconnect (non-terminal error → auto-reconnect picks it up
+                // with the per-server force-TCP flag set).
+                eprintln!(
+                    "[transport] no UDP media within {}s while TCP control is alive — \
+                     switching to TCP media transport and reconnecting",
+                    STARTUP_DECODE_TIMEOUT.as_secs(),
+                );
+                force_tcp_media.lock().unwrap().insert(addr.clone());
+                clipboard_sync.stop();
+                ft_manager.stop();
+                stop_media_threads(media_threads);
+                set_error(
+                    &state,
+                    &ctx,
+                    &disconnect,
+                    &connection_epoch,
+                    session_epoch,
+                    "UDP media blocked — retrying over TCP".into(),
+                );
+                return;
+            }
             let codec = stream_config.codec;
             eprintln!(
                 "[codec] no frames decoded within {}s — excluding {:?} and reconnecting",
@@ -4821,8 +4938,9 @@ fn run_connection(
 /// Run a full streaming session over a hole-punched UDP socket.
 /// Called when direct TCP connection fails but tunnel crypto + partner candidates are available.
 ///
-/// Uses a packet channel bridge: a background thread reads from the PunchedSocket and
-/// forwards decrypted media packets directly into the existing receive pipeline.
+/// Returns `true` when the hole punch succeeded and a session ran (however it
+/// ended); `false` when punching itself failed, so the caller can fall back to
+/// the TCP relay.
 #[allow(clippy::too_many_arguments)]
 fn run_punched_session(
     partner_candidates: Vec<std::net::SocketAddr>,
@@ -4846,22 +4964,15 @@ fn run_punched_session(
     ctx: egui::Context,
     api_discovery: Arc<api_client::ApiDiscoveryShared>,
     ft_shared_state: file_transfer::SharedTransferState,
-) {
-    use st_protocol::reliable_udp::{PunchedMessage, PunchedSocket};
+) -> bool {
+    use st_protocol::reliable_udp::PunchedSocket;
 
     // Clone the process-lifetime punch socket from API discovery.
     let socket = match api_discovery.clone_punch_socket() {
         Ok(socket) => socket,
         Err(e) => {
-            set_error(
-                &state,
-                &ctx,
-                &disconnect,
-                &connection_epoch,
-                session_epoch,
-                format!("Failed to prepare punch socket: {e}"),
-            );
-            return;
+            eprintln!("[punch] Failed to prepare punch socket: {e}");
+            return false;
         }
     };
 
@@ -4895,20 +5006,78 @@ fn run_punched_session(
     ) {
         Ok(p) => p,
         Err(e) => {
-            set_error(
-                &state,
-                &ctx,
-                &disconnect,
-                &connection_epoch,
-                session_epoch,
-                format!("Hole punch failed: {e}"),
-            );
-            return;
+            eprintln!("[punch] Hole punch failed: {e}");
+            return false;
         }
     };
     eprintln!("[punch] Success! Server confirmed at {peer}");
 
-    let punched = Arc::new(PunchedSocket::new(socket, peer, crypto));
+    let punched: Arc<dyn st_protocol::tcp_tunnel::TunnelLink> =
+        Arc::new(PunchedSocket::new(socket, peer, crypto));
+    // The punch-session guard stays alive for the whole session (the session
+    // shares the process-lifetime punch socket with the STUN refresher).
+    //
+    // Return whether the session actually reached Connected. The punch
+    // handshake passing does NOT mean the session works — a NAT can pass the
+    // tiny STPUNCH probe yet block/throttle sustained UDP (PMTU blackhole), in
+    // which case the session auth-times-out. Propagating that lets the caller
+    // fall through to the TCP relay instead of treating the dead punched path
+    // as a successful connection.
+    run_tunnel_session(
+        punched,
+        "punch",
+        token,
+        display_refresh_millihz,
+        video_codec_support,
+        excluded_video_codecs,
+        state,
+        frame_buf,
+        debug_state,
+        disconnect,
+        connection_epoch,
+        session_epoch,
+        audio_enabled,
+        debug_enabled,
+        native_surfaces,
+        shared_input,
+        control_rx,
+        input_rx,
+        ctx,
+        ft_shared_state,
+    )
+}
+
+/// Run a full streaming session over any tunnel link: hole-punched UDP,
+/// direct TCP tunnel, or relayed TCP tunnel. All control and media traffic
+/// flows through the single link; media packets are bridged into the normal
+/// receive pipeline through a channel.
+///
+/// Returns `true` once the session reached the Connected state.
+#[allow(clippy::too_many_arguments)]
+fn run_tunnel_session(
+    punched: Arc<dyn st_protocol::tcp_tunnel::TunnelLink>,
+    via: &'static str,
+    token: String,
+    display_refresh_millihz: Option<u32>,
+    video_codec_support: decode::VideoCodecSupportReport,
+    excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
+    state: Arc<Mutex<ConnectionState>>,
+    frame_buf: Arc<Mutex<VideoFrameBuffer>>,
+    debug_state: Arc<ConnectionDebugState>,
+    disconnect: Arc<AtomicBool>,
+    connection_epoch: Arc<AtomicU64>,
+    session_epoch: u64,
+    audio_enabled: Arc<AtomicBool>,
+    debug_enabled: Arc<AtomicBool>,
+    native_surfaces: Arc<NativeSurfaceControl>,
+    shared_input: Arc<SharedInputState>,
+    control_rx: crossbeam_channel::Receiver<ControlMessage>,
+    input_rx: crossbeam_channel::Receiver<InputPacket>,
+    ctx: egui::Context,
+    ft_shared_state: file_transfer::SharedTransferState,
+) -> bool {
+    use st_protocol::reliable_udp::PunchedMessage;
+    let mut reached_connected = false;
     let _ = punched.set_read_timeout(Some(Duration::from_millis(100)));
 
     // --- Authentication ---
@@ -4922,7 +5091,7 @@ fn run_punched_session(
             session_epoch,
             format!("Failed to send auth: {e}"),
         );
-        return;
+        return false;
     }
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -4942,7 +5111,7 @@ fn run_punched_session(
                         session_epoch,
                         "Authentication failed. Check your token.".into(),
                     );
-                    return;
+                    return false;
                 }
                 break;
             }
@@ -4955,11 +5124,11 @@ fn run_punched_session(
             &disconnect,
             &connection_epoch,
             session_epoch,
-            "Authentication timeout over punched connection".into(),
+            "Authentication timeout over tunnel connection".into(),
         );
-        return;
+        return false;
     }
-    eprintln!("[punch] Authenticated");
+    eprintln!("[{via}] Authenticated");
 
     // --- Send ClientDisplayInfo ---
     let mut excluded = *excluded_video_codecs.lock().unwrap();
@@ -5039,7 +5208,7 @@ fn run_punched_session(
                 session_epoch,
                 "Timeout waiting for StreamConfig from server".into(),
             );
-            return;
+            return false;
         }
     };
 
@@ -5057,7 +5226,7 @@ fn run_punched_session(
         }
     }
 
-    eprintln!("[punch] Stream started, entering unified punched loop");
+    eprintln!("[{via}] Stream started, entering unified session loop");
     let (media_packet_tx, media_packet_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let _ = punched.set_nonblocking(true);
     let _ = punched.set_read_timeout(None);
@@ -5067,6 +5236,7 @@ fn run_punched_session(
         let mut s = state.lock().unwrap();
         *s = ConnectionState::Connected;
     }
+    reached_connected = true;
     ctx.request_repaint();
 
     // --- Start media threads using direct bridged packets ---
@@ -5136,6 +5306,10 @@ fn run_punched_session(
             connection_epoch.as_ref(),
             session_epoch,
         ) {
+            break;
+        }
+        if punched.is_closed() {
+            eprintln!("[{via}] tunnel closed by peer");
             break;
         }
         if last_peer_activity.elapsed() > PUNCHED_INACTIVITY_TIMEOUT {
@@ -5420,7 +5594,7 @@ fn run_punched_session(
         if !startup_decode_ok && Instant::now() >= startup_deadline {
             let codec = stream_config.codec;
             eprintln!(
-                "[codec] no frames decoded within {}s over punched transport — excluding {:?} and reconnecting",
+                "[codec] no frames decoded within {}s over tunnel transport — excluding {:?} and reconnecting",
                 STARTUP_DECODE_TIMEOUT.as_secs(),
                 codec,
             );
@@ -5459,6 +5633,170 @@ fn run_punched_session(
         }
     }
     ctx.request_repaint();
+    reached_connected
+}
+
+/// Run a whole session (control + media) over one direct TCP connection using
+/// tunnel framing. Used when UDP media is blocked (firewall/proxy) but the
+/// server's control port is reachable, or when `ST_FORCE_TCP` is set. The
+/// preamble tells the server to switch this connection into tunnel mode.
+///
+/// Returns `true` once the session reached the Connected state.
+#[allow(clippy::too_many_arguments)]
+fn run_direct_tcp_tunnel_session(
+    mut stream: TcpStream,
+    token: String,
+    display_refresh_millihz: Option<u32>,
+    video_codec_support: decode::VideoCodecSupportReport,
+    excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
+    state: Arc<Mutex<ConnectionState>>,
+    frame_buf: Arc<Mutex<VideoFrameBuffer>>,
+    debug_state: Arc<ConnectionDebugState>,
+    disconnect: Arc<AtomicBool>,
+    connection_epoch: Arc<AtomicU64>,
+    session_epoch: u64,
+    audio_enabled: Arc<AtomicBool>,
+    debug_enabled: Arc<AtomicBool>,
+    native_surfaces: Arc<NativeSurfaceControl>,
+    shared_input: Arc<SharedInputState>,
+    control_rx: crossbeam_channel::Receiver<ControlMessage>,
+    input_rx: crossbeam_channel::Receiver<InputPacket>,
+    ctx: egui::Context,
+    ft_shared_state: file_transfer::SharedTransferState,
+) -> bool {
+    let _ = stream.set_nodelay(true);
+    configure_tcp_keepalive(&stream);
+    if let Err(e) = stream.write_all(st_protocol::tcp_tunnel::TCP_TUNNEL_PREAMBLE) {
+        set_error(
+            &state,
+            &ctx,
+            &disconnect,
+            &connection_epoch,
+            session_epoch,
+            format!("TCP tunnel handshake failed: {e}"),
+        );
+        return false;
+    }
+    let tunnel = match st_protocol::tcp_tunnel::TcpTunnel::new(stream, None, Vec::new()) {
+        Ok(t) => t,
+        Err(e) => {
+            set_error(
+                &state,
+                &ctx,
+                &disconnect,
+                &connection_epoch,
+                session_epoch,
+                format!("TCP tunnel setup failed: {e}"),
+            );
+            return false;
+        }
+    };
+    run_tunnel_session(
+        Arc::new(tunnel),
+        "tcp",
+        token,
+        display_refresh_millihz,
+        video_codec_support,
+        excluded_video_codecs,
+        state,
+        frame_buf,
+        debug_state,
+        disconnect,
+        connection_epoch,
+        session_epoch,
+        audio_enabled,
+        debug_enabled,
+        native_surfaces,
+        shared_input,
+        control_rx,
+        input_rx,
+        ctx,
+        ft_shared_state,
+    )
+}
+
+/// Last-resort fallback: run the session through the API server's TCP relay,
+/// end-to-end encrypted with the X25519-derived key (the relay only ever sees
+/// ciphertext). Used when direct TCP and UDP hole punching both failed —
+/// typically when UDP is blocked entirely.
+///
+/// Returns `true` when a session ran (pairing + tunnel setup succeeded);
+/// `false` when the relay attempt failed and the caller should report the
+/// connection as failed.
+#[allow(clippy::too_many_arguments)]
+fn run_relay_tunnel_session(
+    token: String,
+    display_refresh_millihz: Option<u32>,
+    video_codec_support: decode::VideoCodecSupportReport,
+    excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
+    state: Arc<Mutex<ConnectionState>>,
+    frame_buf: Arc<Mutex<VideoFrameBuffer>>,
+    debug_state: Arc<ConnectionDebugState>,
+    disconnect: Arc<AtomicBool>,
+    connection_epoch: Arc<AtomicU64>,
+    session_epoch: u64,
+    audio_enabled: Arc<AtomicBool>,
+    debug_enabled: Arc<AtomicBool>,
+    native_surfaces: Arc<NativeSurfaceControl>,
+    shared_input: Arc<SharedInputState>,
+    control_rx: crossbeam_channel::Receiver<ControlMessage>,
+    input_rx: crossbeam_channel::Receiver<InputPacket>,
+    ctx: egui::Context,
+    api_discovery: Arc<api_client::ApiDiscoveryShared>,
+    ft_shared_state: file_transfer::SharedTransferState,
+) -> bool {
+    {
+        let mut s = state.lock().unwrap();
+        *s = ConnectionState::Connecting;
+    }
+    ctx.request_repaint();
+
+    let (crypto, relay_addr) = match api_client::prepare_relay_attempt(api_discovery.as_ref()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[relay] Relay setup failed: {e}");
+            return false;
+        }
+    };
+    eprintln!("[relay] Dialing TCP relay {relay_addr}...");
+    let stream = match api_client::connect_relay(&relay_addr, &token) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[relay] {e}");
+            return false;
+        }
+    };
+    eprintln!("[relay] Paired with host via relay");
+    let tunnel = match st_protocol::tcp_tunnel::TcpTunnel::new(stream, Some(crypto), Vec::new()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[relay] Tunnel setup failed: {e}");
+            return false;
+        }
+    };
+    run_tunnel_session(
+        Arc::new(tunnel),
+        "relay",
+        token,
+        display_refresh_millihz,
+        video_codec_support,
+        excluded_video_codecs,
+        state,
+        frame_buf,
+        debug_state,
+        disconnect,
+        connection_epoch,
+        session_epoch,
+        audio_enabled,
+        debug_enabled,
+        native_surfaces,
+        shared_input,
+        control_rx,
+        input_rx,
+        ctx,
+        ft_shared_state,
+    );
+    true
 }
 
 fn set_error(
