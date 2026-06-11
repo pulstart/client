@@ -3943,6 +3943,102 @@ fn force_tcp_env() -> bool {
     )
 }
 
+/// Fallback connection chain when the direct TCP path is unusable: UDP hole
+/// punch first, then the API server's TCP relay. Reached both when `connect()`
+/// itself fails AND when it "succeeded" but the auth handshake got no reply —
+/// locked-down networks put transparent proxies in the path that fake-accept
+/// every TCP SYN and then black-hole the bytes, so a successful `connect()`
+/// alone proves nothing about reachability. Returns `Ok(())` once a fallback
+/// session ran (the session manages its own state transitions), or
+/// `Err(description)` when neither path could establish.
+#[allow(clippy::too_many_arguments)]
+fn run_fallback_chain(
+    token: String,
+    display_refresh_millihz: Option<u32>,
+    video_codec_support: decode::VideoCodecSupportReport,
+    excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
+    state: Arc<Mutex<ConnectionState>>,
+    frame_buf: Arc<Mutex<VideoFrameBuffer>>,
+    debug_state: Arc<ConnectionDebugState>,
+    disconnect: Arc<AtomicBool>,
+    connection_epoch: Arc<AtomicU64>,
+    session_epoch: u64,
+    audio_enabled: Arc<AtomicBool>,
+    debug_enabled: Arc<AtomicBool>,
+    native_surfaces: Arc<NativeSurfaceControl>,
+    shared_input: Arc<SharedInputState>,
+    control_rx: crossbeam_channel::Receiver<ControlMessage>,
+    input_rx: crossbeam_channel::Receiver<InputPacket>,
+    ctx: egui::Context,
+    api_discovery: Arc<api_client::ApiDiscoveryShared>,
+    ft_shared_state: file_transfer::SharedTransferState,
+) -> Result<(), String> {
+    let mut punch_failure: String;
+    match api_client::prepare_punch_attempt(api_discovery.as_ref()) {
+        Ok((partner_cands, punched_crypto)) => {
+            eprintln!("[connect] attempting UDP hole punch...");
+            let punched = run_punched_session(
+                partner_cands,
+                punched_crypto,
+                token.clone(),
+                display_refresh_millihz,
+                video_codec_support,
+                Arc::clone(&excluded_video_codecs),
+                Arc::clone(&state),
+                Arc::clone(&frame_buf),
+                Arc::clone(&debug_state),
+                Arc::clone(&disconnect),
+                Arc::clone(&connection_epoch),
+                session_epoch,
+                Arc::clone(&audio_enabled),
+                Arc::clone(&debug_enabled),
+                Arc::clone(&native_surfaces),
+                Arc::clone(&shared_input),
+                control_rx.clone(),
+                input_rx.clone(),
+                ctx.clone(),
+                Arc::clone(&api_discovery),
+                ft_shared_state.clone(),
+            );
+            if punched {
+                return Ok(());
+            }
+            punch_failure = "UDP hole punch failed".into();
+        }
+        Err(punch_err) => {
+            punch_failure = format!("Hole punch setup failed: {punch_err}");
+        }
+    }
+    // Last resort: end-to-end encrypted TCP tunnel through the API server's
+    // relay (works when UDP is blocked entirely).
+    eprintln!("[connect] {punch_failure}; attempting TCP relay fallback...");
+    if run_relay_tunnel_session(
+        token,
+        display_refresh_millihz,
+        video_codec_support,
+        excluded_video_codecs,
+        state,
+        frame_buf,
+        debug_state,
+        disconnect,
+        connection_epoch,
+        session_epoch,
+        audio_enabled,
+        debug_enabled,
+        native_surfaces,
+        shared_input,
+        control_rx,
+        input_rx,
+        ctx,
+        api_discovery,
+        ft_shared_state,
+    ) {
+        return Ok(());
+    }
+    punch_failure.push_str(". TCP relay fallback failed");
+    Err(punch_failure)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_connection(
     addr: String,
@@ -4049,57 +4145,19 @@ fn run_connection(
         }
         Err(tcp_err) => {
             if allow_hole_punch_fallback(socket_addr) && punch_fallback_available {
-                let mut punch_failure: String;
-                match api_client::prepare_punch_attempt(api_discovery.as_ref()) {
-                    Ok((partner_cands, punched_crypto)) => {
-                        eprintln!(
-                            "[connect] Direct TCP to {socket_addr} failed ({tcp_err}), attempting hole punch..."
-                        );
-                        let punched = run_punched_session(
-                            partner_cands,
-                            punched_crypto,
-                            token.clone(),
-                            display_refresh_millihz,
-                            video_codec_support,
-                            Arc::clone(&excluded_video_codecs),
-                            Arc::clone(&state),
-                            Arc::clone(&frame_buf),
-                            Arc::clone(&debug_state),
-                            Arc::clone(&disconnect),
-                            Arc::clone(&connection_epoch),
-                            session_epoch,
-                            Arc::clone(&audio_enabled),
-                            Arc::clone(&debug_enabled),
-                            Arc::clone(&native_surfaces),
-                            Arc::clone(&shared_input),
-                            control_rx.clone(),
-                            input_rx.clone(),
-                            ctx.clone(),
-                            Arc::clone(&api_discovery),
-                            ft_shared_state.clone(),
-                        );
-                        if punched {
-                            return;
-                        }
-                        punch_failure = "UDP hole punch failed".into();
-                    }
-                    Err(punch_err) => {
-                        punch_failure = format!("Hole punch setup failed: {punch_err}");
-                    }
-                }
-                // Last resort: end-to-end encrypted TCP tunnel through the
-                // API server's relay (works when UDP is blocked entirely).
-                eprintln!("[connect] {punch_failure}; attempting TCP relay fallback...");
-                if run_relay_tunnel_session(
+                eprintln!(
+                    "[connect] Direct TCP to {socket_addr} failed ({tcp_err}); trying punch/relay fallback..."
+                );
+                if let Err(failure) = run_fallback_chain(
                     token,
                     display_refresh_millihz,
                     video_codec_support,
                     excluded_video_codecs,
-                    state.clone(),
+                    Arc::clone(&state),
                     frame_buf,
                     debug_state,
-                    disconnect.clone(),
-                    connection_epoch.clone(),
+                    Arc::clone(&disconnect),
+                    Arc::clone(&connection_epoch),
                     session_epoch,
                     audio_enabled,
                     debug_enabled,
@@ -4111,17 +4169,15 @@ fn run_connection(
                     api_discovery,
                     ft_shared_state,
                 ) {
-                    return;
+                    set_error(
+                        &state,
+                        &ctx,
+                        &disconnect,
+                        &connection_epoch,
+                        session_epoch,
+                        format!("Connection failed: {tcp_err}. {failure}."),
+                    );
                 }
-                punch_failure.push_str(". TCP relay fallback failed");
-                set_error(
-                    &state,
-                    &ctx,
-                    &disconnect,
-                    &connection_epoch,
-                    session_epoch,
-                    format!("Connection failed: {tcp_err}. {punch_failure}."),
-                );
                 return;
             }
             set_error(
@@ -4148,16 +4204,25 @@ fn run_connection(
     let video_arrival = Arc::new(AtomicU64::new(0));
 
     // --- Authentication handshake ---
-    let _ = tcp.write_all(&ControlMessage::Authenticate(token).serialize());
+    let _ = tcp.write_all(&ControlMessage::Authenticate(token.clone()).serialize());
     tcp.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    {
+    // `None` = authenticated. `Some(reason)` = the socket connected but no
+    // genuine st-server ever spoke back (EOF, read error, or silence). That is
+    // indistinguishable from a transparent proxy fake-accepting the SYN on a
+    // locked-down network, so it is treated like a failed connect: fall through
+    // to the punch → relay chain instead of erroring out. An explicit
+    // AuthResult(false)/Error from a real server still returns terminally.
+    let auth_dead: Option<String> = {
         let mut auth_buf = vec![0u8; 64];
         let mut pending = Vec::new();
         let auth_deadline = Instant::now() + Duration::from_secs(5);
-        let mut authenticated = false;
+        let mut dead = Some("Authentication timed out.".to_string());
         'auth: while Instant::now() < auth_deadline {
             match tcp.read(&mut auth_buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    dead = Some("Server closed the connection during authentication.".to_string());
+                    break 'auth;
+                }
                 Ok(n) => {
                     pending.extend_from_slice(&auth_buf[..n]);
                     let mut consumed = 0;
@@ -4177,7 +4242,7 @@ fn run_connection(
                                     );
                                     return;
                                 }
-                                authenticated = true;
+                                dead = None;
                                 break 'auth;
                             }
                             ControlMessage::Error(msg) => {
@@ -4200,29 +4265,61 @@ fn run_connection(
                 }
                 Err(ref e) if is_timeout(e) => continue,
                 Err(e) => {
-                    set_error(
-                        &state,
-                        &ctx,
-                        &disconnect,
-                        &connection_epoch,
-                        session_epoch,
-                        format!("Auth read error: {e}"),
-                    );
-                    return;
+                    dead = Some(format!("Auth read error: {e}"));
+                    break 'auth;
                 }
             }
         }
-        if !authenticated {
-            set_error(
-                &state,
-                &ctx,
-                &disconnect,
-                &connection_epoch,
-                session_epoch,
-                "Authentication timed out.".into(),
+        dead
+    };
+    if let Some(reason) = auth_dead {
+        if allow_hole_punch_fallback(socket_addr) && punch_fallback_available {
+            eprintln!(
+                "[connect] TCP to {socket_addr} accepted but handshake dead ({reason}); \
+                 trying punch/relay fallback..."
             );
+            drop(tcp);
+            if let Err(failure) = run_fallback_chain(
+                token,
+                display_refresh_millihz,
+                video_codec_support,
+                excluded_video_codecs,
+                Arc::clone(&state),
+                frame_buf,
+                debug_state,
+                Arc::clone(&disconnect),
+                Arc::clone(&connection_epoch),
+                session_epoch,
+                audio_enabled,
+                debug_enabled,
+                native_surfaces,
+                shared_input,
+                control_rx,
+                input_rx,
+                ctx.clone(),
+                api_discovery,
+                ft_shared_state,
+            ) {
+                set_error(
+                    &state,
+                    &ctx,
+                    &disconnect,
+                    &connection_epoch,
+                    session_epoch,
+                    format!("Connection failed: {reason} {failure}."),
+                );
+            }
             return;
         }
+        set_error(
+            &state,
+            &ctx,
+            &disconnect,
+            &connection_epoch,
+            session_epoch,
+            reason,
+        );
+        return;
     }
 
     if session_cancelled(
