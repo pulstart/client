@@ -2,8 +2,8 @@ use crate::transport::TransportWindowStats;
 use crate::video_frame::{FrameDebugTiming, VideoFormat, VideoFrameBuffer};
 use st_protocol::{ClockSyncPong, SessionDebugInfo};
 use std::collections::VecDeque;
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// How far back the latency window keeps raw samples for p95/max readouts.
 const LATENCY_WINDOW: Duration = Duration::from_secs(3);
@@ -538,16 +538,11 @@ pub fn stutter_percent(completed_frames: u32, dropped_frames: u32, playout_drops
 /// durations (decode, queue, present); it can't jump or run backwards the way
 /// `unix_time_micros` (wall clock) can when NTP steps the system clock.
 pub fn mono_micros() -> u64 {
-    static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_micros() as u64
+    st_client_core::mono_micros()
 }
 
 pub fn unix_time_micros() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros()
-        .min(u64::MAX as u128) as u64
+    st_client_core::unix_time_micros()
 }
 
 /// Network round-trip time in microseconds from a clock-sync exchange, clamped

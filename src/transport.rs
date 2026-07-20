@@ -1,23 +1,22 @@
 use crossbeam_channel::{Receiver as PacketChannel, TryRecvError};
-use st_protocol::packet::{parse_audio_packet, PacketHeader, PayloadType, HEADER_SIZE};
+use st_client_core::MediaDemux;
+pub use st_client_core::{AudioPacket, ReceivedData, TransportWindowStats};
 use st_protocol::tunnel::CryptoContext;
-use st_protocol::{CompletedFrame, FrameAssembler, TransportFeedback};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::UdpSocket;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-const FEEDBACK_INTERVAL: Duration = Duration::from_millis(500);
-/// Minimum spacing between *consecutive* urgent feedback flushes. The first loss
-/// after a clean period flushes immediately (server reacts ~10-100ms sooner —
-/// drops bitrate / requests a recovery keyframe); this only debounces a burst of
-/// follow-up loss events so a lossy window can't spam feedback. The server's own
-/// ABR/keyframe logic is separately debounced (~250ms), so the early flush can't
-/// trigger a keyframe storm.
-const URGENT_FEEDBACK_DEBOUNCE: Duration = Duration::from_millis(20);
 const MAX_UDP_DATAGRAM_SIZE: usize = 65_535;
 const DEFAULT_UDP_RECV_BUFFER: i32 = 4 * 1024 * 1024;
+
+fn poll_timeout_ms(timeout: Duration) -> i32 {
+    if timeout.is_zero() {
+        return 0;
+    }
+    timeout.as_millis().max(1).min(i32::MAX as u128) as i32
+}
 
 #[cfg(target_os = "linux")]
 const RECVMMSG_BATCH: usize = 32;
@@ -268,38 +267,12 @@ mod linux_batch {
     fn _ip_unused(_a: IpAddr) {}
 }
 
-/// Demuxed data from the unified UDP stream.
-#[derive(Debug, Clone)]
-pub struct AudioPacket {
-    pub seq: u16,
-    pub data: Vec<u8>,
-    /// Redundant copies of previous opus packets, oldest-first.
-    /// `redundant_prev[i]` is the opus packet at seq `self.seq - (len - i)`.
-    pub redundant_prev: Vec<Vec<u8>>,
-}
-
-pub enum ReceivedData {
-    /// A fully assembled video frame (one or more packets reassembled), paired
-    /// with the client `(wall, monotonic)` micros at which reassembly completed.
-    /// The timestamp is captured here — when the final packet lands — rather than
-    /// later at decode time, so the "send→assemble" latency stage reflects the
-    /// real network + reassembly cost instead of also absorbing queue delay.
-    /// Wall feeds the cross-machine stage; monotonic feeds the client-only ones.
-    Video(CompletedFrame, u64, u64),
-    /// A single audio packet (raw Opus data).
-    Audio(AudioPacket),
-    /// Server liveness keepalive (header only). Carries no media — exists so the
-    /// connection loop's media-stall watchdog can tell an idle path from a dead
-    /// one even when no video/audio is flowing (e.g. a static screen).
-    Keepalive,
-}
-
 pub struct UdpReceiver {
     socket: UdpSocket,
     #[cfg(not(target_os = "linux"))]
     buf: Vec<u8>,
     crypto: Option<Arc<CryptoContext>>,
-    inner: PacketProcessor,
+    inner: MediaDemux,
     pending: VecDeque<ReceivedData>,
     #[cfg(target_os = "linux")]
     batch: linux_batch::RecvBatch,
@@ -309,7 +282,7 @@ pub struct UdpReceiver {
 
 pub struct PacketReceiver {
     packet_rx: PacketChannel<Vec<u8>>,
-    inner: PacketProcessor,
+    inner: MediaDemux,
 }
 
 // Boxing a variant would add heap indirection on the per-packet receive hot
@@ -318,58 +291,6 @@ pub struct PacketReceiver {
 pub enum MediaReceiver {
     Udp(UdpReceiver),
     Packets(PacketReceiver),
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TransportWindowStats {
-    pub interval_ms: u32,
-    pub received_packets: u32,
-    pub lost_packets: u32,
-    pub late_packets: u32,
-    pub completed_frames: u32,
-    pub dropped_frames: u32,
-    pub received_bytes: u64,
-    pub received_video_bytes: u64,
-    pub received_audio_bytes: u64,
-    /// One-way-delay trend over the window in microseconds (B1): the change in
-    /// the window's minimum observed (arrival − server-send) delay vs the prior
-    /// window. The constant client/server clock offset cancels out, so a
-    /// sustained positive value means the bottleneck queue is filling.
-    pub owd_trend_us: i32,
-}
-
-impl TransportWindowStats {
-    pub fn feedback(self) -> TransportFeedback {
-        // recv_video_kbps is derivable here and now (B1 capacity clamp); the
-        // lost-frame range + rtt + owd-trend fields are populated by the
-        // congestion-control layer before send. Default 0 = no signal yet.
-        let recv_video_kbps = if self.interval_ms > 0 {
-            (self.received_video_bytes.saturating_mul(8) / self.interval_ms as u64)
-                .min(u32::MAX as u64) as u32
-        } else {
-            0
-        };
-        TransportFeedback {
-            interval_ms: self.interval_ms,
-            received_packets: self.received_packets,
-            lost_packets: self.lost_packets,
-            late_packets: self.late_packets,
-            completed_frames: self.completed_frames,
-            dropped_frames: self.dropped_frames,
-            recv_video_kbps,
-            owd_trend_us: self.owd_trend_us,
-            ..Default::default()
-        }
-    }
-
-    pub fn needs_recovery_keyframe(self) -> bool {
-        // Only a real, unrecoverable frame gap warrants forcing a fresh IDR.
-        // A single lost packet is routinely recovered by the parity packet (or
-        // the duplicated FrameStart) without dropping a frame, and forcing an
-        // IDR for every lost packet creates a keyframe storm: each large IDR
-        // bursts the pacing budget, causing more loss and yet another IDR.
-        self.dropped_frames > 0
-    }
 }
 
 impl UdpReceiver {
@@ -420,7 +341,7 @@ impl UdpReceiver {
             // instead of assuming an Ethernet-sized packet.
             buf: vec![0u8; MAX_UDP_DATAGRAM_SIZE],
             crypto,
-            inner: PacketProcessor::default(),
+            inner: MediaDemux::default(),
             pending: VecDeque::with_capacity(64),
             #[cfg(target_os = "linux")]
             batch,
@@ -445,8 +366,7 @@ impl UdpReceiver {
         #[cfg(target_os = "linux")]
         {
             if let Some(uring) = self.uring.as_mut() {
-                let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-                let _ = uring.wait(ms);
+                let _ = uring.wait(poll_timeout_ms(timeout));
                 return;
             }
         }
@@ -459,9 +379,8 @@ impl UdpReceiver {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
             unsafe {
-                let _ = libc::poll(&mut pfd as *mut libc::pollfd, 1, ms);
+                let _ = libc::poll(&mut pfd as *mut libc::pollfd, 1, poll_timeout_ms(timeout));
             }
         }
         #[cfg(not(unix))]
@@ -612,7 +531,7 @@ impl PacketReceiver {
     pub fn from_channel(packet_rx: PacketChannel<Vec<u8>>) -> Self {
         Self {
             packet_rx,
-            inner: PacketProcessor::default(),
+            inner: MediaDemux::default(),
         }
     }
 
@@ -674,231 +593,18 @@ impl MediaReceiver {
     }
 }
 
-struct PacketProcessor {
-    assembler: FrameAssembler,
-    feedback: FeedbackWindow,
-    trace_packets_logged: usize,
-}
+#[cfg(test)]
+mod tests {
+    use super::poll_timeout_ms;
+    use std::time::Duration;
 
-impl Default for PacketProcessor {
-    fn default() -> Self {
-        Self {
-            assembler: FrameAssembler::new(),
-            feedback: FeedbackWindow::default(),
-            trace_packets_logged: 0,
-        }
-    }
-}
-
-impl PacketProcessor {
-    fn process_packet(
-        &mut self,
-        raw: &[u8],
-        from_addr: Option<SocketAddr>,
-    ) -> Option<ReceivedData> {
-        let raw_len = raw.len();
-
-        if let Some(header) = PacketHeader::deserialize(raw) {
-            if std::env::var_os("ST_TRACE").is_some() && self.trace_packets_logged < 24 {
-                if let Some(addr) = from_addr {
-                    eprintln!(
-                        "[trace][client] udp packet #{} from {addr}: type={:?} frame_id={} seq={} bytes={raw_len}",
-                        self.trace_packets_logged,
-                        header.payload_type,
-                        header.frame_id,
-                        header.seq
-                    );
-                } else {
-                    eprintln!(
-                        "[trace][client] bridged media packet #{}: type={:?} frame_id={} seq={} bytes={raw_len}",
-                        self.trace_packets_logged,
-                        header.payload_type,
-                        header.frame_id,
-                        header.seq
-                    );
-                }
-                self.trace_packets_logged += 1;
-            }
-            if header.payload_type == PayloadType::Audio {
-                if raw_len > HEADER_SIZE {
-                    let payload = &raw[HEADER_SIZE..];
-                    let (data, redundant_prev) = if let Some(view) = parse_audio_packet(payload) {
-                        let redundant_prev =
-                            view.redundant.iter().map(|chunk| chunk.to_vec()).collect();
-                        (view.primary.to_vec(), redundant_prev)
-                    } else {
-                        (payload.to_vec(), Vec::new())
-                    };
-                    self.feedback.received_bytes =
-                        self.feedback.received_bytes.saturating_add(raw_len as u64);
-                    self.feedback.received_audio_bytes = self
-                        .feedback
-                        .received_audio_bytes
-                        .saturating_add(raw_len as u64);
-                    return Some(ReceivedData::Audio(AudioPacket {
-                        seq: header.seq,
-                        data,
-                        redundant_prev,
-                    }));
-                }
-                return None;
-            }
-            if header.payload_type == PayloadType::Keepalive {
-                // Liveness only — don't feed the assembler (it would treat the
-                // 7-byte header as a video packet and skew loss accounting).
-                return Some(ReceivedData::Keepalive);
-            }
-        }
-
-        self.feedback.received_packets = self.feedback.received_packets.saturating_add(1);
-        self.feedback.received_bytes = self.feedback.received_bytes.saturating_add(raw_len as u64);
-        self.feedback.received_video_bytes = self
-            .feedback
-            .received_video_bytes
-            .saturating_add(raw_len as u64);
-        let outcome = self.assembler.ingest_with_feedback(raw);
-        self.feedback.lost_packets = self
-            .feedback
-            .lost_packets
-            .saturating_add(outcome.feedback.lost_packets);
-        self.feedback.late_packets = self
-            .feedback
-            .late_packets
-            .saturating_add(outcome.feedback.late_packets);
-        self.feedback.dropped_frames = self
-            .feedback
-            .dropped_frames
-            .saturating_add(outcome.feedback.dropped_frames);
-        if outcome.feedback.lost_packets > 0 || outcome.feedback.dropped_frames > 0 {
-            // Flush the feedback window early so the server can react to loss
-            // (drop bitrate / send a recovery keyframe) without waiting for the
-            // full window. Decode recovery itself is handled by the decoder's
-            // frame-id continuity check, not by this transport flag.
-            self.feedback.urgent = true;
-        }
-        if let Some(frame) = outcome.completed {
-            self.feedback.completed_frames = self.feedback.completed_frames.saturating_add(1);
-            let assembled_wall = crate::debug_state::unix_time_micros();
-            let assembled_mono = crate::debug_state::mono_micros();
-            // B1: feed the one-way-delay trend estimator.
-            self.feedback
-                .record_owd(assembled_wall, frame.timing.send_ts_micros);
-            return Some(ReceivedData::Video(frame, assembled_wall, assembled_mono));
-        }
-        None
-    }
-
-    fn take_stats(&mut self) -> Option<TransportWindowStats> {
-        self.feedback.take_if_due()
-    }
-}
-
-#[derive(Debug)]
-struct FeedbackWindow {
-    started_at: Instant,
-    urgent: bool,
-    /// When the last urgent flush fired, so the first loss after a clean period
-    /// flushes immediately and only a burst of follow-up losses is debounced.
-    last_urgent_flush: Option<Instant>,
-    received_packets: u32,
-    lost_packets: u32,
-    late_packets: u32,
-    completed_frames: u32,
-    dropped_frames: u32,
-    received_bytes: u64,
-    received_video_bytes: u64,
-    received_audio_bytes: u64,
-    /// Minimum (arrival − server-send) delay seen this window, in micros (B1).
-    min_owd_micros: Option<i64>,
-    /// The previous window's minimum OWD, for computing the trend.
-    prev_min_owd_micros: Option<i64>,
-}
-
-impl Default for FeedbackWindow {
-    fn default() -> Self {
-        Self {
-            started_at: Instant::now(),
-            urgent: false,
-            last_urgent_flush: None,
-            received_packets: 0,
-            lost_packets: 0,
-            late_packets: 0,
-            completed_frames: 0,
-            dropped_frames: 0,
-            received_bytes: 0,
-            received_video_bytes: 0,
-            received_audio_bytes: 0,
-            min_owd_micros: None,
-            prev_min_owd_micros: None,
-        }
-    }
-}
-
-impl FeedbackWindow {
-    /// Record the one-way delay of a completed frame: `arrival_wall_micros`
-    /// (client clock) minus the server's `send_ts_micros`. The absolute value is
-    /// meaningless (clocks differ), but its per-window minimum tracks queueing.
-    fn record_owd(&mut self, arrival_wall_micros: u64, send_ts_micros: u64) {
-        if send_ts_micros == 0 {
-            return;
-        }
-        let owd = arrival_wall_micros as i64 - send_ts_micros as i64;
-        self.min_owd_micros = Some(match self.min_owd_micros {
-            Some(cur) => cur.min(owd),
-            None => owd,
-        });
-    }
-
-    fn take_if_due(&mut self) -> Option<TransportWindowStats> {
-        let elapsed = self.started_at.elapsed();
-        // First loss after a clean period flushes immediately; a burst of
-        // follow-up losses is spaced by URGENT_FEEDBACK_DEBOUNCE.
-        let urgent_due = self.urgent
-            && self
-                .last_urgent_flush
-                .map(|last| last.elapsed() >= URGENT_FEEDBACK_DEBOUNCE)
-                .unwrap_or(true);
-        if elapsed < FEEDBACK_INTERVAL && !urgent_due {
-            return None;
-        }
-        if self.urgent {
-            self.last_urgent_flush = Some(Instant::now());
-        }
-
-        let owd_trend_us = match (self.min_owd_micros, self.prev_min_owd_micros) {
-            (Some(cur), Some(prev)) => (cur - prev).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-            _ => 0,
-        };
-
-        let stats = TransportWindowStats {
-            interval_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
-            received_packets: self.received_packets,
-            lost_packets: self.lost_packets,
-            late_packets: self.late_packets,
-            completed_frames: self.completed_frames,
-            dropped_frames: self.dropped_frames,
-            received_bytes: self.received_bytes,
-            received_video_bytes: self.received_video_bytes,
-            received_audio_bytes: self.received_audio_bytes,
-            owd_trend_us,
-        };
-
-        // Carry this window's min OWD forward only when we actually saw a frame,
-        // so a silent window doesn't spuriously reset the trend baseline.
-        if self.min_owd_micros.is_some() {
-            self.prev_min_owd_micros = self.min_owd_micros;
-        }
-        self.started_at = Instant::now();
-        self.urgent = false;
-        self.received_packets = 0;
-        self.lost_packets = 0;
-        self.late_packets = 0;
-        self.completed_frames = 0;
-        self.dropped_frames = 0;
-        self.received_bytes = 0;
-        self.received_video_bytes = 0;
-        self.received_audio_bytes = 0;
-        self.min_owd_micros = None;
-        Some(stats)
+    #[test]
+    fn poll_timeout_rounds_nonzero_sub_millisecond_waits_up() {
+        assert_eq!(poll_timeout_ms(Duration::ZERO), 0);
+        assert_eq!(poll_timeout_ms(Duration::from_nanos(1)), 1);
+        assert_eq!(poll_timeout_ms(Duration::from_micros(999)), 1);
+        assert_eq!(poll_timeout_ms(Duration::from_millis(1)), 1);
+        assert_eq!(poll_timeout_ms(Duration::from_micros(1_001)), 1);
+        assert_eq!(poll_timeout_ms(Duration::from_millis(2)), 2);
     }
 }

@@ -563,7 +563,6 @@ impl NativeVideoTexture {
             };
             if let Some(presenter) = self.macos_metal_presenter.as_mut() {
                 if presenter.is_enabled() && presenter.stage_frame(frame) {
-                    self.retain_recent_macos_frame(frame);
                     self.width = video.width;
                     self.height = video.height;
                     return true;

@@ -6,7 +6,7 @@ use crate::transport::AudioPacket;
 use crossbeam_channel::Receiver;
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex,
 };
 
@@ -50,6 +50,114 @@ struct PlaybackBuffer {
     needs_crossfade: bool,
 }
 
+struct AudioOutput {
+    ring: Arc<Mutex<PlaybackBuffer>>,
+    stream: cpal::Stream,
+}
+
+fn fill_playback_output(
+    playback: &mut PlaybackBuffer,
+    output: &mut [f32],
+    target_buffer_samples: usize,
+) {
+    if !playback.primed && playback.samples.len() >= target_buffer_samples {
+        playback.primed = true;
+    }
+
+    let copied = if playback.primed {
+        let count = output.len().min(playback.samples.len());
+        let (front, back) = playback.samples.as_slices();
+        let front_count = count.min(front.len());
+        output[..front_count].copy_from_slice(&front[..front_count]);
+        let back_count = count - front_count;
+        if back_count > 0 {
+            output[front_count..count].copy_from_slice(&back[..back_count]);
+        }
+        playback.samples.drain(..count);
+        if count > 0 {
+            playback.last_sample = output[count - 1];
+        }
+        count
+    } else {
+        0
+    };
+
+    if copied < output.len() {
+        if playback.primed {
+            playback.primed = false;
+            playback.needs_crossfade = true;
+        }
+        for sample in &mut output[copied..] {
+            *sample = playback.last_sample;
+            playback.last_sample *= SILENCE_DECAY_PER_SAMPLE;
+        }
+    }
+}
+
+fn create_audio_output(
+    target_buffer_samples: usize,
+    max_buffer_samples: usize,
+) -> Result<AudioOutput, String> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    let device = cpal::default_host()
+        .default_output_device()
+        .ok_or("No audio output device")?;
+    let config = cpal::StreamConfig {
+        channels: CHANNELS as u16,
+        sample_rate: cpal::SampleRate(SAMPLE_RATE),
+        buffer_size: cpal::BufferSize::Default,
+    };
+    let ring = Arc::new(Mutex::new(PlaybackBuffer {
+        samples: VecDeque::with_capacity(max_buffer_samples),
+        primed: false,
+        last_sample: 0.0,
+        needs_crossfade: false,
+    }));
+    let ring_cb = Arc::clone(&ring);
+    let last_sample_bits = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+    let last_sample_bits_cb = Arc::clone(&last_sample_bits);
+    let stream = device
+        .build_output_stream(
+            &config,
+            move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                // Never block the real-time thread. A callback-wide atomic
+                // handoff is enough; doing one atomic and one VecDeque pop per
+                // sample wastes substantial CPU at 48 kHz.
+                let mut playback = match ring_cb.try_lock() {
+                    Ok(playback) => playback,
+                    Err(_) => {
+                        let mut held = f32::from_bits(last_sample_bits_cb.load(Ordering::Relaxed));
+                        for sample in output {
+                            *sample = held;
+                            held *= SILENCE_DECAY_PER_SAMPLE;
+                        }
+                        last_sample_bits_cb.store(held.to_bits(), Ordering::Relaxed);
+                        return;
+                    }
+                };
+                playback.last_sample = f32::from_bits(last_sample_bits_cb.load(Ordering::Relaxed));
+                fill_playback_output(&mut playback, output, target_buffer_samples);
+                last_sample_bits_cb.store(playback.last_sample.to_bits(), Ordering::Relaxed);
+            },
+            |err| eprintln!("[audio] output error: {err}"),
+            None,
+        )
+        .map_err(|e| format!("audio stream: {e}"))?;
+    stream.play().map_err(|e| format!("audio play: {e}"))?;
+    eprintln!("[audio] Playback started (48kHz stereo)");
+    Ok(AudioOutput { ring, stream })
+}
+
+fn drop_audio_output(output: &mut Option<AudioOutput>) {
+    use cpal::traits::StreamTrait;
+
+    if let Some(output) = output.take() {
+        let _ = output.stream.pause();
+        eprintln!("[audio] Playback paused");
+    }
+}
+
 /// E1: derive per-packet audio timing from the negotiated Opus frame duration.
 /// `packet_duration_ms == 0` (server declared none) falls back to the default.
 /// Returns `(effective_ms, max_concealed_packets, packet_samples)`. Kept pure so
@@ -69,9 +177,8 @@ pub fn run_audio_pipeline(
     opus_rx: Receiver<AudioPacket>,
     shutdown_rx: Receiver<()>,
     packet_duration_ms: u32,
+    audio_enabled: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-
     // E1: derive the per-packet timing from the negotiated Opus frame duration
     // rather than a hardcoded 20 ms, so 5 ms frames keep correct sequence-gap /
     // concealment math (and a proportionally higher concealment packet cap).
@@ -93,82 +200,11 @@ pub fn run_audio_pipeline(
     let mut decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo)
         .map_err(|e| format!("Opus decoder: {e}"))?;
 
-    // Create cpal audio output
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or("No audio output device")?;
-
-    let config = cpal::StreamConfig {
-        channels: CHANNELS as u16,
-        sample_rate: cpal::SampleRate(SAMPLE_RATE),
-        buffer_size: cpal::BufferSize::Default,
-    };
-
-    // Shared ring buffer between decode thread and cpal callback
-    let ring: Arc<Mutex<PlaybackBuffer>> = Arc::new(Mutex::new(PlaybackBuffer {
-        samples: VecDeque::with_capacity(max_buffer_samples),
-        primed: false,
-        last_sample: 0.0,
-        needs_crossfade: false,
-    }));
-    let ring_cb = Arc::clone(&ring);
-    let last_sample_bits = Arc::new(AtomicU32::new(0.0f32.to_bits()));
-    let last_sample_bits_cb = Arc::clone(&last_sample_bits);
-
-    let stream = device
-        .build_output_stream(
-            &config,
-            move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                // Use try_lock to avoid blocking the real-time audio thread.
-                // If the decode thread holds the lock, repeat the last sample.
-                let mut buf = match ring_cb.try_lock() {
-                    Ok(b) => b,
-                    Err(_) => {
-                        // Real-time callback can't block. Fade from the last
-                        // real sample toward silence so brief contention sounds
-                        // like a dip, not a DC step or a click.
-                        let mut held = f32::from_bits(last_sample_bits_cb.load(Ordering::Relaxed));
-                        for sample in output.iter_mut() {
-                            *sample = held;
-                            held *= SILENCE_DECAY_PER_SAMPLE;
-                        }
-                        last_sample_bits_cb.store(held.to_bits(), Ordering::Relaxed);
-                        return;
-                    }
-                };
-                if !buf.primed && buf.samples.len() >= target_buffer_samples {
-                    buf.primed = true;
-                }
-                for sample in output.iter_mut() {
-                    if buf.primed {
-                        if let Some(next) = buf.samples.pop_front() {
-                            buf.last_sample = next;
-                            last_sample_bits_cb.store(next.to_bits(), Ordering::Relaxed);
-                            *sample = next;
-                        } else {
-                            buf.primed = false;
-                            buf.needs_crossfade = true;
-                            *sample = buf.last_sample;
-                            buf.last_sample *= SILENCE_DECAY_PER_SAMPLE;
-                        }
-                    } else {
-                        *sample = buf.last_sample;
-                        buf.last_sample *= SILENCE_DECAY_PER_SAMPLE;
-                    }
-                }
-            },
-            |err| eprintln!("[audio] output error: {err}"),
-            None,
-        )
-        .map_err(|e| format!("audio stream: {e}"))?;
-    stream.play().map_err(|e| format!("audio play: {e}"))?;
-
-    eprintln!("[audio] Playback started (48kHz stereo)");
-
     // Decode loop: receive Opus packets from pipeline, decode, push to ring
     let mut pcm_buf = vec![0.0f32; MAX_OPUS_FRAME_SAMPLES * CHANNELS as usize];
     let mut expected_seq = None::<u16>;
+    let mut output = None;
+    let mut was_enabled = audio_enabled.load(Ordering::Relaxed);
     // `packet_samples` and `max_concealed_packets` are derived above from the
     // negotiated frame duration (E1).
     let trace = std::env::var_os("ST_TRACE").is_some();
@@ -180,15 +216,38 @@ pub fn run_audio_pipeline(
             break;
         }
 
+        let enabled = audio_enabled.load(Ordering::Relaxed);
+        if !enabled {
+            if was_enabled {
+                drop_audio_output(&mut output);
+                expected_seq = None;
+                let _ = decoder.reset_state();
+                while opus_rx.try_recv().is_ok() {}
+            }
+            was_enabled = false;
+        } else {
+            was_enabled = true;
+        }
+
         let mut packet = match opus_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(d) => d,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
+        if !audio_enabled.load(Ordering::Relaxed) {
+            continue;
+        }
+        if output.is_none() {
+            output = Some(create_audio_output(
+                target_buffer_samples,
+                max_buffer_samples,
+            )?);
+        }
+        let ring = &output.as_ref().expect("audio output initialized").ring;
         if trim_packet_backlog(
             &opus_rx,
             &mut packet,
-            &ring,
+            ring,
             max_queued_packets,
             target_buffer_samples,
             packet_samples,
@@ -220,7 +279,7 @@ pub fn run_audio_pipeline(
                                     &packet.redundant_prev[idx],
                                     false,
                                     &mut pcm_buf,
-                                    &ring,
+                                    ring,
                                     target_buffer_samples,
                                     max_buffer_samples,
                                 )
@@ -239,7 +298,7 @@ pub fn run_audio_pipeline(
                                     &packet.data,
                                     true,
                                     &mut pcm_buf,
-                                    &ring,
+                                    ring,
                                     target_buffer_samples,
                                     max_buffer_samples,
                                 )
@@ -254,7 +313,7 @@ pub fn run_audio_pipeline(
                                     &[],
                                     false,
                                     &mut pcm_buf,
-                                    &ring,
+                                    ring,
                                     target_buffer_samples,
                                     max_buffer_samples,
                                 )
@@ -267,7 +326,7 @@ pub fn run_audio_pipeline(
                         // PLC / FEC / redundancy tails may not perfectly match
                         // the next real packet's first sample. Crossfade the
                         // boundary on the upcoming primary push.
-                        mark_needs_crossfade(&ring);
+                        mark_needs_crossfade(ring);
 
                         if trace && concealment_logs < 12 {
                             eprintln!(
@@ -284,7 +343,7 @@ pub fn run_audio_pipeline(
                         expected_seq = None;
                         // Hard resync — buffer (if any) ends at one waveform,
                         // primary starts at another. Crossfade the join.
-                        mark_needs_crossfade(&ring);
+                        mark_needs_crossfade(ring);
                         if trace && concealment_logs < 12 {
                             eprintln!(
                                 "[trace][audio] large audio gap ({} packets), resyncing at seq={}",
@@ -304,7 +363,7 @@ pub fn run_audio_pipeline(
             &packet.data,
             false,
             &mut pcm_buf,
-            &ring,
+            ring,
             target_buffer_samples,
             max_buffer_samples,
         ) {
@@ -317,7 +376,7 @@ pub fn run_audio_pipeline(
         }
     }
 
-    drop(stream);
+    drop_audio_output(&mut output);
     eprintln!("[audio] Pipeline stopped");
     Ok(())
 }
@@ -499,5 +558,40 @@ mod tests {
             let (eff, max_concealed, _) = audio_timing(ms);
             assert_eq!(max_concealed * eff, MAX_CONCEALED_AUDIO_MS);
         }
+    }
+
+    #[test]
+    fn playback_callback_drains_samples_in_bulk_and_fades_underrun() {
+        let mut playback = PlaybackBuffer {
+            samples: VecDeque::from([1.0, 2.0, 3.0, 4.0]),
+            primed: false,
+            last_sample: 0.0,
+            needs_crossfade: false,
+        };
+        let mut output = [0.0; 6];
+
+        fill_playback_output(&mut playback, &mut output, 4);
+
+        assert_eq!(&output[..5], &[1.0, 2.0, 3.0, 4.0, 4.0]);
+        assert!(output[5] < output[4]);
+        assert!(playback.samples.is_empty());
+        assert!(!playback.primed);
+        assert!(playback.needs_crossfade);
+    }
+
+    #[test]
+    fn playback_callback_waits_for_prebuffer_without_discarding_samples() {
+        let mut playback = PlaybackBuffer {
+            samples: VecDeque::from([1.0, 2.0]),
+            primed: false,
+            last_sample: 0.0,
+            needs_crossfade: false,
+        };
+        let mut output = [1.0; 4];
+
+        fill_playback_output(&mut playback, &mut output, 4);
+
+        assert_eq!(output, [0.0; 4]);
+        assert_eq!(playback.samples, VecDeque::from([1.0, 2.0]));
     }
 }

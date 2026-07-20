@@ -1,0 +1,19 @@
+[package]
+name = "st-client-android"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "st_client_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+audiopus_sys = { version = "0.2", features = ["static"] }
+jni = "0.21"
+opus = "0.3"
+serde_json = "1"
+st-client-core = { path = "../../core" }
+
+[patch.crates-io]
+# crates.io 0.2.2 cannot target Android; this pinned upstream PR adds Android CMake support.
+audiopus_sys = { git = "https://github.com/SetZero/audiopus_sys.git", rev = "51ac3bb471f41fc510b4a3a46951e8e4715f8a76" }

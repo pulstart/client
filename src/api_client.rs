@@ -1,4 +1,7 @@
-use st_protocol::tunnel::{CryptoContext, TunnelKeys};
+use rand::{rngs::OsRng, RngCore};
+use st_protocol::tunnel::{
+    derive_session_key, CryptoContext, SessionKeyContext, TunnelKeys, TunnelMode,
+};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -29,6 +32,8 @@ pub struct ApiDiscoveredHost {
     pub hostname: Option<String>,
     /// Stable host identifier from the signaling service.
     pub peer_id: Option<String>,
+    /// Process lease paired with `peer_id` by the signaling service.
+    pub lease_id: Option<String>,
     pub last_seen: Instant,
 }
 
@@ -69,16 +74,14 @@ pub struct ApiDiscoveryShared {
     pub api_url: Mutex<String>,
     pub token: Mutex<String>,
     pub peer_id: Mutex<String>,
+    /// Random identity for this process. Unlike peer_id, this is never persisted.
+    pub lease_id: String,
     pub host: Mutex<Option<ApiDiscoveredHost>>,
     tunnel_keys: Mutex<TunnelKeys>,
     /// Derived ChaCha20 shared key from the latest partner key, if available.
     shared_key: Mutex<Option<[u8; 32]>>,
-    /// Cached `CryptoContext` paired with the key it was built from. We hand
-    /// out the same `Arc` to every caller so the AEAD nonce counter is
-    /// monotonic across reconnects; reusing nonce=0 across sessions on the same
-    /// key would let an attacker replay captured client→host packets. Keyed so
-    /// that re-deriving the *same* key (after a transient clear) reuses the
-    /// existing context+counter rather than resetting it to 0.
+    /// Request-scoped CryptoContext cache. Idempotent retries reuse counters,
+    /// while each API-generated request context derives a different key.
     crypto: Mutex<Option<([u8; 32], Arc<CryptoContext>)>>,
     /// Partner (host) NAT candidates parsed as SocketAddr.
     pub partner_candidates: Mutex<Vec<SocketAddr>>,
@@ -111,13 +114,26 @@ pub struct ApiDiscoveryShared {
 /// mappings typically expire after 30–120 s of silence, so 25 s leaves
 /// margin to re-probe before the partner-advertised public address goes dead.
 const STUN_REFRESH_TTL: Duration = Duration::from_secs(25);
+const MAX_API_TOKEN_LEN: usize = 256;
+
+fn valid_api_token(token: &str) -> bool {
+    !token.is_empty() && token.len() <= MAX_API_TOKEN_LEN
+}
 
 impl ApiDiscoveryShared {
     pub fn new(api_url: String, token: String, peer_id: String) -> Self {
+        let mut lease_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut lease_bytes);
+        let initial_nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
         Self {
             api_url: Mutex::new(api_url),
             token: Mutex::new(token),
             peer_id: Mutex::new(peer_id),
+            lease_id: base64_encode(&lease_bytes),
             host: Mutex::new(None),
             tunnel_keys: Mutex::new(TunnelKeys::generate()),
             shared_key: Mutex::new(None),
@@ -127,29 +143,24 @@ impl ApiDiscoveryShared {
             punch_candidates: Mutex::new(Vec::new()),
             last_stun: Mutex::new(None),
             portmap_external: Mutex::new(None),
-            next_punch_nonce: AtomicU64::new(1),
-            next_relay_nonce: AtomicU64::new(1),
+            next_punch_nonce: AtomicU64::new(initial_nonce.max(1)),
+            next_relay_nonce: AtomicU64::new(initial_nonce.saturating_add(1).max(1)),
             relay_port: Mutex::new(None),
             punch_session_active: AtomicBool::new(false),
             connected: AtomicBool::new(false),
         }
     }
 
-    /// Return the cached `CryptoContext` for the current shared key. The same
-    /// instance is reused for an unchanged key so the AEAD nonce counter is
-    /// monotonic for the key's lifetime; it is rebuilt only when the key value
-    /// genuinely changes.
-    pub fn crypto_context(&self) -> Option<Arc<CryptoContext>> {
-        let key = (*self.shared_key.lock().unwrap())?;
+    fn crypto_for_session_key(&self, key: [u8; 32]) -> Arc<CryptoContext> {
         let mut cache = self.crypto.lock().unwrap();
         if let Some((cached_key, ctx)) = cache.as_ref() {
             if *cached_key == key {
-                return Some(Arc::clone(ctx));
+                return Arc::clone(ctx);
             }
         }
         let ctx = Arc::new(CryptoContext::new(key, false));
         *cache = Some((key, Arc::clone(&ctx)));
-        Some(ctx)
+        ctx
     }
 
     /// Clone the process-lifetime punch socket for an individual attempt/session.
@@ -221,9 +232,6 @@ impl ApiDiscoveryShared {
             let had_key = current.is_some();
             let has_key = shared_key.is_some();
             *current = shared_key;
-            // Deliberately keep the cached CryptoContext: crypto_context()
-            // rebuilds only when the key value differs, so a clear + re-derive
-            // of the same key preserves the monotonic nonce counter.
             if has_key && !had_key {
                 eprintln!("[api] Shared key derived");
             }
@@ -408,18 +416,12 @@ pub fn start_port_mapping(shared: Arc<ApiDiscoveryShared>) {
 
 pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::Context) {
     std::thread::spawn(move || {
-        let peer_id = shared.peer_id.lock().unwrap().clone();
         let mut failures: u32 = 0;
-
-        if let Err(e) = shared.ensure_punch_socket() {
-            eprintln!("[api] Failed to prepare punch socket: {e}");
-        }
-
         loop {
             let url = shared.api_url.lock().unwrap().clone();
             let token = shared.token.lock().unwrap().clone();
 
-            if url.is_empty() || token.is_empty() {
+            if url.is_empty() || !valid_api_token(&token) {
                 shared.connected.store(false, Ordering::Relaxed);
                 let changed = clear_host(&shared);
                 if changed {
@@ -429,146 +431,108 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
                 continue;
             }
 
-            let local_candidates = match shared.ensure_punch_socket() {
-                Ok(candidates) => candidates,
-                Err(e) => {
-                    eprintln!("[api] Failed to prepare punch socket: {e}");
-                    shared.punch_candidates.lock().unwrap().clear();
-                    Vec::new()
-                }
-            };
-
-            // 1. Register as client — this is the connectivity check.
-            let reg_body = serde_json::json!({
-                "token": token,
-                "role": "client",
-                "peer_id": peer_id,
-                "candidates": local_candidates,
-            })
-            .to_string();
-            let ok = http_agent()
-                .post(&format!("{url}/api/register"))
-                .set("Content-Type", "application/json")
-                .send_string(&reg_body)
-                .is_ok();
-
-            if !ok {
-                let was_connected = shared.connected.swap(false, Ordering::Relaxed);
-                if was_connected {
-                    ctx.request_repaint();
-                }
-                let wait = retry_interval(failures);
-                failures = failures.saturating_add(1);
-                eprintln!("[api] Registration failed, retrying in {}s", wait.as_secs());
-                std::thread::sleep(wait);
-                continue;
-            }
-
-            if failures > 0 || !shared.is_connected() {
-                eprintln!("[api] Connected to API server");
-            }
-            failures = 0;
-            let was_disconnected = !shared.connected.swap(true, Ordering::Relaxed);
-            if was_disconnected {
-                ctx.request_repaint();
-            }
-
-            // 2. Upload our public key and try to get host's key.
-            let key_body = serde_json::json!({
-                "token": token,
-                "role": "client",
-                "public_key": shared.public_key_b64(),
-            })
-            .to_string();
-            match http_agent()
-                .post(&format!("{url}/api/key"))
-                .set("Content-Type", "application/json")
-                .send_string(&key_body)
-            {
-                Ok(resp) => {
-                    if let Ok(text) = resp.into_string() {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                            shared.update_shared_key_from_partner_b64(v["partner_key"].as_str());
-                        } else {
-                            shared.set_shared_key(None);
-                        }
-                    } else {
-                        shared.set_shared_key(None);
-                    }
-                }
-                Err(_) => shared.set_shared_key(None),
-            }
-
-            // 3. Fetch fresh partner candidates.
-            let cand_body = serde_json::json!({
-                "token": token,
-                "role": "client",
-                "candidates": local_candidates,
-            })
-            .to_string();
-            match http_agent()
-                .post(&format!("{url}/api/candidates"))
-                .set("Content-Type", "application/json")
-                .send_string(&cand_body)
-            {
-                Ok(resp) => {
-                    if let Ok(text) = resp.into_string() {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                            let addrs: Vec<SocketAddr> = v["partner_candidates"]
-                                .as_array()
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|value| value.as_str()?.parse().ok())
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            *shared.partner_candidates.lock().unwrap() = addrs;
-                        } else {
-                            shared.partner_candidates.lock().unwrap().clear();
-                        }
-                    } else {
-                        shared.partner_candidates.lock().unwrap().clear();
-                    }
-                }
-                Err(_) => shared.partner_candidates.lock().unwrap().clear(),
-            }
-
-            // 4. Poll session status for UI. Send our role so the API refreshes
-            // our last_seen (polling = liveness) and we don't age out mid-setup.
-            let session_body = format!(r#"{{"token":"{token}","role":"client"}}"#);
-            let changed = match http_agent()
+            // Idle discovery is deliberately token-only and read-only. It must
+            // never reserve the session's sole active-client slot.
+            let session_body = serde_json::json!({"token": token}).to_string();
+            let result = http_agent()
                 .post(&format!("{url}/api/session"))
                 .set("Content-Type", "application/json")
-                .send_string(&session_body)
-            {
-                Ok(resp) => {
-                    if let Ok(text) = resp.into_string() {
-                        parse_session_status(&shared, &text)
-                    } else {
-                        clear_host(&shared)
-                    }
-                }
-                Err(_) => clear_host(&shared),
+                .send_string(&session_body);
+            let (reachable, changed) = match result {
+                Ok(response) => match response.into_string() {
+                    Ok(text) => (true, parse_session_status(&shared, &text)),
+                    Err(_) => (false, clear_host(&shared)),
+                },
+                Err(ureq::Error::Status(404, _)) => (true, clear_host(&shared)),
+                Err(_) => (false, clear_host(&shared)),
             };
-
-            if changed {
+            let connection_changed =
+                shared.connected.swap(reachable, Ordering::Relaxed) != reachable;
+            if changed || connection_changed {
                 ctx.request_repaint();
             }
-
-            // Poll cadence must stay shorter than the UI's host-freshness window
-            // (the `api_host` filter in main.rs) or the public host flickers out
-            // of the server list between polls — LAN stays visible via its faster
-            // beacon, so the symptom is "only LAN shows". 10s refresh vs 30s
-            // window = 3x slack against a slow request.
-            let has_key = shared.shared_key.lock().unwrap().is_some();
-            let interval = if has_key {
-                Duration::from_secs(10)
+            if reachable {
+                if failures > 0 {
+                    eprintln!("[api] Discovery connection restored");
+                }
+                failures = 0;
+                std::thread::sleep(Duration::from_secs(3));
             } else {
-                Duration::from_secs(3)
-            };
-            std::thread::sleep(interval);
+                let wait = retry_interval(failures);
+                failures = failures.saturating_add(1);
+                std::thread::sleep(wait);
+            }
         }
     });
+}
+
+fn expected_host_identity(shared: &ApiDiscoveryShared) -> Result<(String, String), String> {
+    shared
+        .host
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|host| Some((host.peer_id.clone()?, host.lease_id.clone()?)))
+        .ok_or_else(|| "API host has no lease-bound identity; refresh discovery".to_string())
+}
+
+fn validate_partner_response(
+    response: &serde_json::Value,
+    expected_peer_id: &str,
+    expected_lease_id: &str,
+) -> Result<(), String> {
+    if response["partner_peer_id"].as_str() != Some(expected_peer_id)
+        || response["partner_lease_id"].as_str() != Some(expected_lease_id)
+    {
+        return Err("API host identity changed during signaling".into());
+    }
+    Ok(())
+}
+
+fn crypto_from_signal_response(
+    shared: &ApiDiscoveryShared,
+    response: &serde_json::Value,
+    mode: TunnelMode,
+    mode_label: &str,
+    generation: u64,
+    client_peer_id: &str,
+    host_identity: (&str, &str),
+) -> Result<Arc<CryptoContext>, String> {
+    let (host_peer_id, host_lease_id) = host_identity;
+    if response["mode"].as_str() != Some(mode_label)
+        || response["generation"].as_u64() != Some(generation)
+        || response["owner_peer_id"].as_str() != Some(client_peer_id)
+        || response["owner_lease_id"].as_str() != Some(shared.lease_id.as_str())
+        || response["partner_peer_id"].as_str() != Some(host_peer_id)
+        || response["partner_lease_id"].as_str() != Some(host_lease_id)
+    {
+        return Err("API returned a mismatched tunnel request context".into());
+    }
+    let session_id = response["session_id"]
+        .as_str()
+        .ok_or_else(|| "API returned no tunnel session ID".to_string())?;
+    let request_context = response["context"]
+        .as_str()
+        .ok_or_else(|| "API returned no tunnel request context".to_string())?;
+    let shared_secret = shared
+        .shared_key
+        .lock()
+        .unwrap()
+        .ok_or_else(|| "shared tunnel secret not ready".to_string())?;
+    let session_key = derive_session_key(
+        &shared_secret,
+        &SessionKeyContext {
+            request_context,
+            session_id,
+            mode,
+            generation,
+            host_peer_id,
+            host_lease_id,
+            client_peer_id,
+            client_lease_id: &shared.lease_id,
+        },
+    )?;
+    Ok(shared.crypto_for_session_key(session_key))
 }
 
 /// Refresh candidates and key material immediately before a punched connection attempt.
@@ -578,7 +542,9 @@ pub fn prepare_punch_attempt(
     let url = shared.api_url.lock().unwrap().clone();
     let token = shared.token.lock().unwrap().clone();
     let peer_id = shared.peer_id.lock().unwrap().clone();
-    if url.is_empty() || token.is_empty() {
+    let lease_id = &shared.lease_id;
+    let (expected_host_peer_id, expected_host_lease_id) = expected_host_identity(shared)?;
+    if url.is_empty() || !valid_api_token(&token) {
         return Err("API discovery is not configured".into());
     }
 
@@ -588,7 +554,9 @@ pub fn prepare_punch_attempt(
         "token": token,
         "role": "client",
         "peer_id": peer_id,
+        "lease_id": lease_id,
         "candidates": local_candidates,
+        "public_key": shared.public_key_b64(),
     })
     .to_string();
     http_agent()
@@ -600,6 +568,10 @@ pub fn prepare_punch_attempt(
     let key_body = serde_json::json!({
         "token": token,
         "role": "client",
+        "peer_id": peer_id,
+        "lease_id": lease_id,
+        "expected_partner_peer_id": expected_host_peer_id,
+        "expected_partner_lease_id": expected_host_lease_id,
         "public_key": shared.public_key_b64(),
     })
     .to_string();
@@ -613,14 +585,16 @@ pub fn prepare_punch_attempt(
         .map_err(|e| format!("read key response: {e}"))?;
     let key_json: serde_json::Value =
         serde_json::from_str(&key_text).map_err(|e| format!("parse key response: {e}"))?;
+    validate_partner_response(&key_json, &expected_host_peer_id, &expected_host_lease_id)?;
     shared.update_shared_key_from_partner_b64(key_json["partner_key"].as_str());
-    let crypto = shared
-        .crypto_context()
-        .ok_or_else(|| "shared tunnel key not ready".to_string())?;
 
     let cand_body = serde_json::json!({
         "token": token,
         "role": "client",
+        "peer_id": peer_id,
+        "lease_id": lease_id,
+        "expected_partner_peer_id": expected_host_peer_id,
+        "expected_partner_lease_id": expected_host_lease_id,
         "candidates": local_candidates,
     })
     .to_string();
@@ -634,6 +608,7 @@ pub fn prepare_punch_attempt(
         .map_err(|e| format!("read candidates response: {e}"))?;
     let cand_json: serde_json::Value =
         serde_json::from_str(&cand_text).map_err(|e| format!("parse candidates response: {e}"))?;
+    validate_partner_response(&cand_json, &expected_host_peer_id, &expected_host_lease_id)?;
     let partner_candidates: Vec<SocketAddr> = cand_json["partner_candidates"]
         .as_array()
         .map(|arr| {
@@ -651,30 +626,50 @@ pub fn prepare_punch_attempt(
     let punch_body = serde_json::json!({
         "token": token,
         "role": "client",
-        "nonce": punch_nonce,
+        "peer_id": peer_id,
+        "lease_id": lease_id,
+        "expected_partner_peer_id": expected_host_peer_id,
+        "expected_partner_lease_id": expected_host_lease_id,
+        "generation": punch_nonce,
     })
     .to_string();
-    http_agent()
+    let punch_response = http_agent()
         .post(&format!("{url}/api/punch"))
         .set("Content-Type", "application/json")
         .send_string(&punch_body)
         .map_err(|e| format!("request punch from server: {e}"))?;
+    let punch_text = punch_response
+        .into_string()
+        .map_err(|e| format!("read punch response: {e}"))?;
+    let punch_json: serde_json::Value =
+        serde_json::from_str(&punch_text).map_err(|e| format!("parse punch response: {e}"))?;
+    let crypto = crypto_from_signal_response(
+        shared,
+        &punch_json,
+        TunnelMode::Punch,
+        "punch",
+        punch_nonce,
+        &peer_id,
+        (&expected_host_peer_id, &expected_host_lease_id),
+    )?;
 
     Ok((partner_candidates, crypto))
 }
 
 /// Refresh key material and signal the host to dial the API server's TCP
-/// relay. Returns the crypto context for the end-to-end encrypted tunnel and
-/// the relay address (`host:port`) to connect to. Used as the last-resort
+/// relay. Returns the crypto context, relay address, and one-use client ticket.
+/// Used as the last-resort
 /// fallback when both direct TCP and UDP hole punching fail (e.g. UDP is
 /// blocked entirely by a firewall or proxy).
 pub fn prepare_relay_attempt(
     shared: &ApiDiscoveryShared,
-) -> Result<(Arc<CryptoContext>, String), String> {
+) -> Result<(Arc<CryptoContext>, String, String), String> {
     let url = shared.api_url.lock().unwrap().clone();
     let token = shared.token.lock().unwrap().clone();
     let peer_id = shared.peer_id.lock().unwrap().clone();
-    if url.is_empty() || token.is_empty() {
+    let lease_id = &shared.lease_id;
+    let (expected_host_peer_id, expected_host_lease_id) = expected_host_identity(shared)?;
+    if url.is_empty() || !valid_api_token(&token) {
         return Err("API discovery is not configured".into());
     }
 
@@ -683,7 +678,9 @@ pub fn prepare_relay_attempt(
         "token": token,
         "role": "client",
         "peer_id": peer_id,
+        "lease_id": lease_id,
         "candidates": [],
+        "public_key": shared.public_key_b64(),
     })
     .to_string();
     http_agent()
@@ -696,6 +693,10 @@ pub fn prepare_relay_attempt(
     let key_body = serde_json::json!({
         "token": token,
         "role": "client",
+        "peer_id": peer_id,
+        "lease_id": lease_id,
+        "expected_partner_peer_id": expected_host_peer_id,
+        "expected_partner_lease_id": expected_host_lease_id,
         "public_key": shared.public_key_b64(),
     })
     .to_string();
@@ -709,26 +710,51 @@ pub fn prepare_relay_attempt(
         .map_err(|e| format!("read key response: {e}"))?;
     let key_json: serde_json::Value =
         serde_json::from_str(&key_text).map_err(|e| format!("parse key response: {e}"))?;
+    validate_partner_response(&key_json, &expected_host_peer_id, &expected_host_lease_id)?;
     shared.update_shared_key_from_partner_b64(key_json["partner_key"].as_str());
-    let crypto = shared
-        .crypto_context()
-        .ok_or_else(|| "shared tunnel key not ready (host not registered?)".to_string())?;
 
-    // Learn the relay port from a fresh session poll (also refreshes liveness).
-    let session_body = format!(r#"{{"token":"{token}","role":"client"}}"#);
-    let session_resp = http_agent()
-        .post(&format!("{url}/api/session"))
+    // Create a real relay request and obtain a short-lived ticket over HTTPS.
+    let relay_nonce = shared.next_relay_nonce.fetch_add(1, Ordering::Relaxed);
+    let relay_body = serde_json::json!({
+        "token": token,
+        "role": "client",
+        "peer_id": peer_id,
+        "lease_id": lease_id,
+        "expected_partner_peer_id": expected_host_peer_id,
+        "expected_partner_lease_id": expected_host_lease_id,
+        "generation": relay_nonce,
+        "mode": "request",
+    })
+    .to_string();
+    let relay_response = http_agent()
+        .post(&format!("{url}/api/relay"))
         .set("Content-Type", "application/json")
-        .send_string(&session_body)
-        .map_err(|e| format!("poll session: {e}"))?;
-    let session_text = session_resp
+        .send_string(&relay_body)
+        .map_err(|e| format!("request relay from server: {e}"))?;
+    let relay_text = relay_response
         .into_string()
-        .map_err(|e| format!("read session response: {e}"))?;
-    let session_json: serde_json::Value =
-        serde_json::from_str(&session_text).map_err(|e| format!("parse session: {e}"))?;
-    let relay_port = session_json["relay_port"].as_u64().map(|p| p as u16);
+        .map_err(|e| format!("read relay response: {e}"))?;
+    let relay_json: serde_json::Value =
+        serde_json::from_str(&relay_text).map_err(|e| format!("parse relay response: {e}"))?;
+    let crypto = crypto_from_signal_response(
+        shared,
+        &relay_json,
+        TunnelMode::Relay,
+        "relay",
+        relay_nonce,
+        &peer_id,
+        (&expected_host_peer_id, &expected_host_lease_id),
+    )?;
+    let ticket = relay_json["ticket"]
+        .as_str()
+        .filter(|ticket| !ticket.is_empty())
+        .ok_or_else(|| "API server returned no relay ticket".to_string())?
+        .to_string();
+    let relay_port = relay_json["relay_port"]
+        .as_u64()
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0);
     *shared.relay_port.lock().unwrap() = relay_port;
-
     let relay_addr = st_protocol::tcp_tunnel::resolve_relay_addr(
         &url,
         relay_port,
@@ -736,28 +762,14 @@ pub fn prepare_relay_attempt(
     )
     .ok_or_else(|| "API server does not advertise a TCP relay".to_string())?;
 
-    // Tell the host (via its session poll) to dial the relay.
-    let relay_nonce = shared.next_relay_nonce.fetch_add(1, Ordering::Relaxed);
-    let relay_body = serde_json::json!({
-        "token": token,
-        "role": "client",
-        "nonce": relay_nonce,
-    })
-    .to_string();
-    http_agent()
-        .post(&format!("{url}/api/relay"))
-        .set("Content-Type", "application/json")
-        .send_string(&relay_body)
-        .map_err(|e| format!("request relay from server: {e}"))?;
-
-    Ok((crypto, relay_addr))
+    Ok((crypto, relay_addr, ticket))
 }
 
 /// Dial the relay and complete the pairing handshake. Blocks until the host
 /// arrives (it dials once it sees the relay nonce on its session poll).
 /// Returns the stream positioned exactly at the start of tunnel traffic.
-pub fn connect_relay(addr: &str, token: &str) -> Result<std::net::TcpStream, String> {
-    st_protocol::tcp_tunnel::connect_relay(addr, "client", token, Duration::from_secs(30))
+pub fn connect_relay(addr: &str, ticket: &str) -> Result<std::net::TcpStream, String> {
+    st_protocol::tcp_tunnel::connect_relay(addr, "client", ticket, Duration::from_secs(30))
 }
 
 fn parse_session_status(shared: &ApiDiscoveryShared, json: &str) -> bool {
@@ -767,10 +779,9 @@ fn parse_session_status(shared: &ApiDiscoveryShared, json: &str) -> bool {
 
     *shared.relay_port.lock().unwrap() = v["relay_port"].as_u64().map(|p| p as u16);
 
-    let host_joined = v["host_joined"].as_bool().unwrap_or(false);
     let mut host_guard = shared.host.lock().unwrap();
-    if host_joined {
-        let mut candidates: Vec<String> = v["host_candidates"]
+    if let Some(host) = v["host"].as_object() {
+        let mut candidates: Vec<String> = host["candidates"]
             .as_array()
             .map(|arr| {
                 arr.iter()
@@ -780,14 +791,16 @@ fn parse_session_status(shared: &ApiDiscoveryShared, json: &str) -> bool {
             .unwrap_or_default();
         sort_candidates(&mut candidates);
 
-        let hostname = v["host_hostname"].as_str().map(String::from);
-        let peer_id = v["host_peer_id"].as_str().map(String::from);
+        let hostname = host["hostname"].as_str().map(String::from);
+        let peer_id = host["peer_id"].as_str().map(String::from);
+        let lease_id = host["lease_id"].as_str().map(String::from);
 
         let changed = match host_guard.as_ref() {
             Some(existing) => {
                 existing.candidates != candidates
                     || existing.hostname != hostname
                     || existing.peer_id != peer_id
+                    || existing.lease_id != lease_id
             }
             None => true,
         };
@@ -795,6 +808,7 @@ fn parse_session_status(shared: &ApiDiscoveryShared, json: &str) -> bool {
             candidates,
             hostname,
             peer_id,
+            lease_id,
             last_seen: Instant::now(),
         });
         changed
@@ -813,10 +827,16 @@ pub fn unregister(shared: &ApiDiscoveryShared) {
     let url = shared.api_url.lock().unwrap().clone();
     let token = shared.token.lock().unwrap().clone();
     let peer_id = shared.peer_id.lock().unwrap().clone();
-    if url.is_empty() || token.is_empty() {
+    if url.is_empty() || !valid_api_token(&token) {
         return;
     }
-    let body = format!(r#"{{"token":"{token}","role":"client","peer_id":"{peer_id}"}}"#);
+    let body = serde_json::json!({
+        "token": token,
+        "role": "client",
+        "peer_id": peer_id,
+        "lease_id": shared.lease_id,
+    })
+    .to_string();
     let _ = http_agent()
         .post(&format!("{url}/api/unregister"))
         .set("Content-Type", "application/json")

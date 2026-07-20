@@ -1,15 +1,16 @@
 extern crate ffmpeg_next as ffmpeg;
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use crate::video_frame::FfmpegVideoFrameRef;
 #[cfg(target_os = "macos")]
 use crate::video_frame::MacosVideoToolboxFrame;
 #[cfg(target_os = "windows")]
 use crate::video_frame::WindowsD3d11Frame;
-use crate::video_frame::{
-    FfmpegVideoFrameRef, NativeSurfaceCapabilities, NativeSurfaceControl, VideoFormat,
-    VideoFrameBuffer,
-};
 #[cfg(target_os = "linux")]
 use crate::video_frame::{LinuxDmaBufFormat, LinuxDmaBufFrame, LinuxDmaBufPlane};
+use crate::video_frame::{
+    NativeSurfaceCapabilities, NativeSurfaceControl, VideoFormat, VideoFrameBuffer,
+};
 use ffmpeg::codec::{self, packet, Context as CodecContext};
 use ffmpeg::decoder::Video as FfmpegVideoDecoder;
 use ffmpeg::format::Pixel;
@@ -1126,16 +1127,13 @@ impl VideoDecoder {
         frame_out.plane0.clear();
         frame_out.plane1.clear();
         frame_out.plane2.clear();
-        let decoder_frame_ref = Some(FfmpegVideoFrameRef::retain(decoded)?);
         frame_out.clear_native_surfaces();
         frame_out.videotoolbox = Some(MacosVideoToolboxFrame {
             width: decoded.width(),
             height: decoded.height(),
             format,
             pixel_buffer,
-            decoder_frame_ref: decoder_frame_ref.clone(),
         });
-        frame_out.decoder_frame_ref = decoder_frame_ref;
         self.note_hw_frame_access(HwFrameAccess::DirectMap, Pixel::VIDEOTOOLBOX);
         Ok(())
     }

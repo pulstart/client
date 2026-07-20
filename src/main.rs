@@ -38,12 +38,13 @@ use input::{LocalCaptureMode, LocalKeyboardState, RemoteCursorTexture, SharedInp
 use keep_awake::KeepAwakeController;
 use render::VideoTexture;
 use serde::{Deserialize, Serialize};
+use st_client_core::drain_control_messages;
 use st_protocol::{
-    ClientDisplayInfo, ClockSyncPing, ControlMessage, ControllerState, InputPacket, KeyboardKey,
-    KeyboardStateInput, MouseAbsoluteInput, MouseButtonsInput, MouseRelativeInput, MouseWheelInput,
-    StreamConfig, TransportFeedback, VideoChromaSampling, VideoCodec, VideoCodecSupport,
-    MOUSE_BUTTON_EXTRA1, MOUSE_BUTTON_EXTRA2, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_PRIMARY,
-    MOUSE_BUTTON_SECONDARY, MOUSE_WHEEL_STEP_UNITS,
+    ClientDisplayInfo, ClockSyncPing, ControlMessage, ControllerState, InputCredential,
+    InputPacket, KeyboardKey, KeyboardStateInput, MouseAbsoluteInput, MouseButtonsInput,
+    MouseRelativeInput, MouseWheelInput, StreamConfig, TransportFeedback, VideoChromaSampling,
+    VideoCodec, VideoCodecSupport, MOUSE_BUTTON_EXTRA1, MOUSE_BUTTON_EXTRA2, MOUSE_BUTTON_MIDDLE,
+    MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY, MOUSE_WHEEL_STEP_UNITS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -3742,6 +3743,7 @@ fn start_media_threads(
     native_surfaces: Arc<NativeSurfaceControl>,
     control_tx: crossbeam_channel::Sender<ControlMessage>,
     input_rx: crossbeam_channel::Receiver<InputPacket>,
+    shared_input: Arc<SharedInputState>,
     stream_config: StreamConfig,
     udp_socket: UdpSocket,
     crypto: Option<Arc<st_protocol::tunnel::CryptoContext>>,
@@ -3760,10 +3762,12 @@ fn start_media_threads(
             input_rx,
             input_stop_rx,
             input_crypto,
+            shared_input,
         );
     });
 
-    let (audio_data_tx, audio_data_rx) = crossbeam_channel::unbounded::<AudioPacket>();
+    let (audio_data_tx, audio_data_rx) = crossbeam_channel::bounded::<AudioPacket>(16);
+    let audio_drop_rx = audio_data_rx.clone();
     let (feedback_tx, feedback_rx) = crossbeam_channel::bounded::<TransportFeedback>(8);
     let (decode_started_tx, decode_started_rx) = crossbeam_channel::bounded::<()>(1);
     let present_refresh_millihz =
@@ -3782,6 +3786,7 @@ fn start_media_threads(
             pipeline_ctx,
             video_stop_rx,
             audio_data_tx,
+            audio_drop_rx,
             feedback_tx,
             decode_started_tx,
             video_arrival,
@@ -3797,9 +3802,12 @@ fn start_media_threads(
     let (audio_stop_tx, audio_stop_rx) = crossbeam_channel::bounded(1);
     let audio_packet_duration_ms = stream_config.packet_duration_ms as u32;
     let audio_thread = std::thread::spawn(move || {
-        if let Err(e) =
-            audio::run_audio_pipeline(audio_data_rx, audio_stop_rx, audio_packet_duration_ms)
-        {
+        if let Err(e) = audio::run_audio_pipeline(
+            audio_data_rx,
+            audio_stop_rx,
+            audio_packet_duration_ms,
+            audio_enabled,
+        ) {
             eprintln!("[audio] {e}");
         }
     });
@@ -3831,7 +3839,8 @@ fn start_punched_media_threads(
     media_packet_rx: crossbeam_channel::Receiver<Vec<u8>>,
 ) -> MediaThreads {
     let receiver = MediaReceiver::from_packet_channel(media_packet_rx);
-    let (audio_data_tx, audio_data_rx) = crossbeam_channel::unbounded::<AudioPacket>();
+    let (audio_data_tx, audio_data_rx) = crossbeam_channel::bounded::<AudioPacket>(16);
+    let audio_drop_rx = audio_data_rx.clone();
     let (feedback_tx, feedback_rx) = crossbeam_channel::bounded::<TransportFeedback>(8);
     let (decode_started_tx, decode_started_rx) = crossbeam_channel::bounded::<()>(1);
     let present_refresh_millihz =
@@ -3850,6 +3859,7 @@ fn start_punched_media_threads(
             pipeline_ctx,
             video_stop_rx,
             audio_data_tx,
+            audio_drop_rx,
             feedback_tx,
             decode_started_tx,
             video_arrival,
@@ -3865,9 +3875,12 @@ fn start_punched_media_threads(
     let (audio_stop_tx, audio_stop_rx) = crossbeam_channel::bounded(1);
     let audio_packet_duration_ms = stream_config.packet_duration_ms as u32;
     let audio_thread = std::thread::spawn(move || {
-        if let Err(e) =
-            audio::run_audio_pipeline(audio_data_rx, audio_stop_rx, audio_packet_duration_ms)
-        {
+        if let Err(e) = audio::run_audio_pipeline(
+            audio_data_rx,
+            audio_stop_rx,
+            audio_packet_duration_ms,
+            audio_enabled,
+        ) {
             eprintln!("[audio] {e}");
         }
     });
@@ -4001,6 +4014,15 @@ fn run_fallback_chain(
                 ft_shared_state.clone(),
             );
             if punched {
+                return Ok(());
+            }
+            let terminal = match &*state.lock().unwrap() {
+                ConnectionState::Error(message) => connection_error_is_terminal(message),
+                _ => false,
+            };
+            if terminal {
+                // A real server explicitly rejected authentication/startup.
+                // Changing transport cannot make that request valid.
                 return Ok(());
             }
             punch_failure = "UDP hole punch failed".into();
@@ -4472,6 +4494,7 @@ fn run_connection(
                                     Arc::clone(&native_surfaces),
                                     pipeline_control_tx.clone(),
                                     input_rx.take().expect("input receiver already taken"),
+                                    Arc::clone(&shared_input),
                                     cfg,
                                     udp_socket.take().expect("udp socket already taken"),
                                     None,
@@ -4519,13 +4542,14 @@ fn run_connection(
                         ControlMessage::SessionDebugInfo(info) => {
                             debug_state.set_session_info(info);
                         }
-                        ControlMessage::ClockSyncPong(pong) => {
-                            if debug_enabled.load(Ordering::Relaxed) {
-                                debug_state.update_clock_sync(pong, unix_time_micros());
-                            }
+                        ControlMessage::ClockSyncPong(pong)
+                            if debug_enabled.load(Ordering::Relaxed) =>
+                        {
+                            debug_state.update_clock_sync(pong, unix_time_micros());
                         }
+                        ControlMessage::ClockSyncPong(_) => {}
                         ControlMessage::InputSession(session) => {
-                            shared_input.set_client_id(session.client_id);
+                            shared_input.set_input_session(session);
                         }
                         ControlMessage::ControllerState(controller_state) => {
                             shared_input.set_controller_state(controller_state);
@@ -4854,7 +4878,7 @@ fn run_connection(
                             }
                         }
                         ControlMessage::InputSession(session) => {
-                            shared_input.set_client_id(session.client_id);
+                            shared_input.set_input_session(session);
                         }
                         ControlMessage::ControllerState(controller_state) => {
                             shared_input.set_controller_state(controller_state);
@@ -5174,7 +5198,6 @@ fn run_tunnel_session(
     ft_shared_state: file_transfer::SharedTransferState,
 ) -> bool {
     use st_protocol::reliable_udp::PunchedMessage;
-    let mut reached_connected = false;
     let _ = punched.set_read_timeout(Some(Duration::from_millis(100)));
 
     // --- Authentication ---
@@ -5191,25 +5214,42 @@ fn run_tunnel_session(
         return false;
     }
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(5);
     let mut authenticated = false;
     while Instant::now() < deadline {
         punched.tick();
         if let Some(PunchedMessage::Control(data)) = punched.try_recv() {
-            if let Some((ControlMessage::AuthResult(ok), _)) = ControlMessage::deserialize(&data) {
-                if ok {
-                    authenticated = true;
-                } else {
-                    set_error(
-                        &state,
-                        &ctx,
-                        &disconnect,
-                        &connection_epoch,
-                        session_epoch,
-                        "Authentication failed. Check your token.".into(),
-                    );
-                    return false;
+            let mut offset = 0;
+            while let Some((message, used)) = ControlMessage::deserialize(&data[offset..]) {
+                offset += used;
+                match message {
+                    ControlMessage::AuthResult(true) => authenticated = true,
+                    ControlMessage::AuthResult(false) => {
+                        set_error(
+                            &state,
+                            &ctx,
+                            &disconnect,
+                            &connection_epoch,
+                            session_epoch,
+                            "Authentication failed. Check your token.".into(),
+                        );
+                        return false;
+                    }
+                    ControlMessage::Error(error) => {
+                        set_error(
+                            &state,
+                            &ctx,
+                            &disconnect,
+                            &connection_epoch,
+                            session_epoch,
+                            format!("Server error: {error}"),
+                        );
+                        return false;
+                    }
+                    _ => {}
                 }
+            }
+            if authenticated {
                 break;
             }
         }
@@ -5272,7 +5312,7 @@ fn run_tunnel_session(
                         debug_state.set_session_info(info);
                     }
                     ControlMessage::InputSession(session) => {
-                        shared_input.set_client_id(session.client_id);
+                        shared_input.set_input_session(session);
                     }
                     ControlMessage::InputCapabilities(caps) => {
                         shared_input.set_capabilities(caps);
@@ -5286,11 +5326,33 @@ fn run_tunnel_session(
                     ControlMessage::SelectOutput(id) => {
                         shared_input.set_selected_output(id);
                     }
+                    ControlMessage::Error(error) => {
+                        set_error(
+                            &state,
+                            &ctx,
+                            &disconnect,
+                            &connection_epoch,
+                            session_epoch,
+                            format!("Server error: {error}"),
+                        );
+                        return false;
+                    }
+                    ControlMessage::Shutdown => {
+                        set_error(
+                            &state,
+                            &ctx,
+                            &disconnect,
+                            &connection_epoch,
+                            session_epoch,
+                            "Server shut down".into(),
+                        );
+                        return false;
+                    }
                     _ => {}
                 }
             }
         }
-        if stream_config.is_some() {
+        if stream_config.is_some() && shared_input.snapshot().input_credential.is_some() {
             break;
         }
     }
@@ -5314,13 +5376,55 @@ fn run_tunnel_session(
 
     // Wait for StreamStarted.
     let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stream_started = false;
     while Instant::now() < deadline {
         punched.tick();
         if let Some(PunchedMessage::Control(data)) = punched.try_recv() {
-            if let Some((ControlMessage::StreamStarted, _)) = ControlMessage::deserialize(&data) {
+            let mut offset = 0;
+            while let Some((message, used)) = ControlMessage::deserialize(&data[offset..]) {
+                offset += used;
+                match message {
+                    ControlMessage::StreamStarted => stream_started = true,
+                    ControlMessage::Error(error) => {
+                        set_error(
+                            &state,
+                            &ctx,
+                            &disconnect,
+                            &connection_epoch,
+                            session_epoch,
+                            format!("Server error: {error}"),
+                        );
+                        return false;
+                    }
+                    ControlMessage::Shutdown => {
+                        set_error(
+                            &state,
+                            &ctx,
+                            &disconnect,
+                            &connection_epoch,
+                            session_epoch,
+                            "Server shut down".into(),
+                        );
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
+            if stream_started {
                 break;
             }
         }
+    }
+    if !stream_started {
+        set_error(
+            &state,
+            &ctx,
+            &disconnect,
+            &connection_epoch,
+            session_epoch,
+            "Stream startup timed out over tunnel connection".into(),
+        );
+        return false;
     }
 
     eprintln!("[{via}] Stream started, entering unified session loop");
@@ -5333,7 +5437,6 @@ fn run_tunnel_session(
         let mut s = state.lock().unwrap();
         *s = ConnectionState::Connected;
     }
-    reached_connected = true;
     ctx.request_repaint();
 
     // --- Start media threads using direct bridged packets ---
@@ -5442,24 +5545,30 @@ fn run_tunnel_session(
             did_work = true;
             mouse_heartbeat.observe(input_pkt, now);
             keyboard_heartbeat.observe(input_pkt, now);
-            let serialized = input_pkt.serialize(input_seq);
-            input_seq = input_seq.wrapping_add(1);
-            let _ = punched.send_media(&serialized);
+            if let Some(credential) = shared_input.snapshot().input_credential {
+                let serialized = input_pkt.serialize(input_seq, credential);
+                input_seq = input_seq.wrapping_add(1);
+                let _ = punched.send_media(&serialized);
+            }
             mouse_heartbeat.mark_sent(input_pkt, now);
             keyboard_heartbeat.mark_sent(input_pkt, now);
         }
         // Heartbeat retransmission for button/key state repair over lossy UDP.
         if let Some(pkt) = mouse_heartbeat.due_packet(now) {
             did_work = true;
-            let serialized = pkt.serialize(input_seq);
-            input_seq = input_seq.wrapping_add(1);
-            let _ = punched.send_media(&serialized);
+            if let Some(credential) = shared_input.snapshot().input_credential {
+                let serialized = pkt.serialize(input_seq, credential);
+                input_seq = input_seq.wrapping_add(1);
+                let _ = punched.send_media(&serialized);
+            }
         }
         if let Some(pkt) = keyboard_heartbeat.due_packet(now) {
             did_work = true;
-            let serialized = pkt.serialize(input_seq);
-            input_seq = input_seq.wrapping_add(1);
-            let _ = punched.send_media(&serialized);
+            if let Some(credential) = shared_input.snapshot().input_credential {
+                let serialized = pkt.serialize(input_seq, credential);
+                input_seq = input_seq.wrapping_add(1);
+                let _ = punched.send_media(&serialized);
+            }
         }
 
         // Forward outgoing control messages to punched socket.
@@ -5550,7 +5659,7 @@ fn run_tunnel_session(
                                     }
                                 }
                                 ControlMessage::InputSession(session) => {
-                                    shared_input.set_client_id(session.client_id);
+                                    shared_input.set_input_session(session);
                                 }
                                 ControlMessage::ControllerState(cs) => {
                                     shared_input.set_controller_state(cs);
@@ -5730,7 +5839,7 @@ fn run_tunnel_session(
         }
     }
     ctx.request_repaint();
-    reached_connected
+    true
 }
 
 /// Run a whole session (control + media) over one direct TCP connection using
@@ -5848,15 +5957,16 @@ fn run_relay_tunnel_session(
     }
     ctx.request_repaint();
 
-    let (crypto, relay_addr) = match api_client::prepare_relay_attempt(api_discovery.as_ref()) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[relay] Relay setup failed: {e}");
-            return false;
-        }
-    };
+    let (crypto, relay_addr, relay_ticket) =
+        match api_client::prepare_relay_attempt(api_discovery.as_ref()) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[relay] Relay setup failed: {e}");
+                return false;
+            }
+        };
     eprintln!("[relay] Dialing TCP relay {relay_addr}...");
-    let stream = match api_client::connect_relay(&relay_addr, &token) {
+    let stream = match api_client::connect_relay(&relay_addr, &relay_ticket) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[relay] {e}");
@@ -6027,27 +6137,6 @@ fn is_timeout(e: &std::io::Error) -> bool {
         || e.kind() == std::io::ErrorKind::Interrupted
 }
 
-fn drain_control_messages(buf: &mut Vec<u8>) -> Vec<ControlMessage> {
-    let mut messages = Vec::new();
-    let mut consumed = 0usize;
-
-    while consumed < buf.len() {
-        match ControlMessage::deserialize(&buf[consumed..]) {
-            Some((msg, used)) => {
-                messages.push(msg);
-                consumed += used;
-            }
-            None => break,
-        }
-    }
-
-    if consumed > 0 {
-        buf.drain(..consumed);
-    }
-
-    messages
-}
-
 #[derive(Clone, Copy, Default)]
 struct MouseInputHeartbeat {
     packet: Option<InputPacket>,
@@ -6191,10 +6280,11 @@ fn send_input_packet_raw(
     socket: &UdpSocket,
     target: std::net::SocketAddr,
     packet: InputPacket,
+    credential: InputCredential,
     seq: &mut u16,
     crypto: Option<&st_protocol::tunnel::CryptoContext>,
 ) {
-    let raw = packet.serialize(*seq);
+    let raw = packet.serialize(*seq, credential);
     *seq = seq.wrapping_add(1);
     if let Some(crypto) = crypto {
         let encrypted = crypto.encrypt(&raw);
@@ -6210,6 +6300,7 @@ fn run_input_sender(
     input_rx: crossbeam_channel::Receiver<InputPacket>,
     shutdown_rx: crossbeam_channel::Receiver<()>,
     crypto: Option<Arc<st_protocol::tunnel::CryptoContext>>,
+    shared_input: Arc<SharedInputState>,
 ) {
     let mut seq = 0u16;
     let mut mouse_heartbeat = MouseInputHeartbeat::default();
@@ -6226,17 +6317,21 @@ fn run_input_sender(
                 let now = Instant::now();
                 mouse_heartbeat.observe(packet, now);
                 keyboard_heartbeat.observe(packet, now);
-                send_input_packet_raw(&socket, target, packet, &mut seq, cref);
-                mouse_heartbeat.mark_sent(packet, now);
-                keyboard_heartbeat.mark_sent(packet, now);
+                if let Some(credential) = shared_input.snapshot().input_credential {
+                    send_input_packet_raw(&socket, target, packet, credential, &mut seq, cref);
+                    mouse_heartbeat.mark_sent(packet, now);
+                    keyboard_heartbeat.mark_sent(packet, now);
+                }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 let now = Instant::now();
-                if let Some(packet) = mouse_heartbeat.due_packet(now) {
-                    send_input_packet_raw(&socket, target, packet, &mut seq, cref);
-                }
-                if let Some(packet) = keyboard_heartbeat.due_packet(now) {
-                    send_input_packet_raw(&socket, target, packet, &mut seq, cref);
+                if let Some(credential) = shared_input.snapshot().input_credential {
+                    if let Some(packet) = mouse_heartbeat.due_packet(now) {
+                        send_input_packet_raw(&socket, target, packet, credential, &mut seq, cref);
+                    }
+                    if let Some(packet) = keyboard_heartbeat.due_packet(now) {
+                        send_input_packet_raw(&socket, target, packet, credential, &mut seq, cref);
+                    }
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,

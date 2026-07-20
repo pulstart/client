@@ -298,6 +298,12 @@ impl MetalVideoRenderer {
         rect: egui::Rect,
         pixels_per_point: f32,
     ) -> Result<bool, String> {
+        let changed = self.last_rect != Some(rect)
+            || (self.last_scale - pixels_per_point).abs() > f32::EPSILON;
+        if !changed {
+            return Ok(false);
+        }
+
         let local_rect = CGRect::new(
             &CGPoint::new(rect.left() as f64, rect.top() as f64),
             &CGSize::new(rect.width() as f64, rect.height() as f64),
@@ -308,27 +314,19 @@ impl MetalVideoRenderer {
         let background_rect = root_view_rect_in_parent(self.root_view, self.parent_view);
         self.background_view.update(background_rect);
 
-        let changed = self.last_rect != Some(rect)
-            || (self.last_scale - pixels_per_point).abs() > f32::EPSILON;
-        if changed {
-            unsafe {
-                let () = msg_send![*self.host_view, setFrame: parent_rect];
-                let () = msg_send![*self.host_view, setHidden: NO];
-            }
-            self.layer.set_drawable_size(CGSize::new(
-                (rect.width().max(1.0) * pixels_per_point) as f64,
-                (rect.height().max(1.0) * pixels_per_point) as f64,
-            ));
-            self.layer.set_contents_scale(pixels_per_point as f64);
-            self.last_rect = Some(rect);
-            self.last_scale = pixels_per_point;
-        } else {
-            unsafe {
-                let () = msg_send![*self.host_view, setHidden: NO];
-            }
+        unsafe {
+            let () = msg_send![*self.host_view, setFrame: parent_rect];
+            let () = msg_send![*self.host_view, setHidden: NO];
         }
+        self.layer.set_drawable_size(CGSize::new(
+            (rect.width().max(1.0) * pixels_per_point) as f64,
+            (rect.height().max(1.0) * pixels_per_point) as f64,
+        ));
+        self.layer.set_contents_scale(pixels_per_point as f64);
+        self.last_rect = Some(rect);
+        self.last_scale = pixels_per_point;
 
-        Ok(changed)
+        Ok(true)
     }
 
     fn render_frame(&mut self, frame: &MacosVideoToolboxFrame) -> Result<(), String> {

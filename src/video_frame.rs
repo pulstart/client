@@ -252,7 +252,6 @@ pub struct MacosVideoToolboxFrame {
     pub height: u32,
     pub format: VideoFormat,
     pub pixel_buffer: MacosCvPixelBuffer,
-    pub decoder_frame_ref: Option<FfmpegVideoFrameHold>,
 }
 
 #[cfg(target_os = "macos")]
@@ -263,7 +262,6 @@ impl Clone for MacosVideoToolboxFrame {
             height: self.height,
             format: self.format,
             pixel_buffer: self.pixel_buffer.clone(),
-            decoder_frame_ref: self.decoder_frame_ref.clone(),
         }
     }
 }

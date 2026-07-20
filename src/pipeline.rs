@@ -12,9 +12,15 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+/// Keep shutdown and feedback/recovery checks responsive without waking an
+/// otherwise idle media thread every 2 ms. The 20 ms cap matches the urgent
+/// feedback debounce; queued video deadlines can still shorten it to sub-ms.
+const MEDIA_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(20);
+
 struct RepaintPacer {
     min_interval: Option<Duration>,
     last_request: Option<Instant>,
+    immediate_pending: bool,
 }
 
 impl RepaintPacer {
@@ -28,6 +34,23 @@ impl RepaintPacer {
                 }
             }),
             last_request: None,
+            immediate_pending: false,
+        }
+    }
+
+    fn request_video(&mut self, ctx: &egui::Context, immediate: bool, repaint_pending: bool) {
+        if !repaint_pending {
+            self.immediate_pending = false;
+        } else if !immediate || self.immediate_pending {
+            return;
+        }
+
+        if immediate {
+            self.last_request = Some(Instant::now());
+            self.immediate_pending = true;
+            ctx.request_repaint();
+        } else {
+            self.request(ctx);
         }
     }
 
@@ -354,6 +377,8 @@ fn recycle_video_frame(recycled_frames: &mut Vec<VideoFrameBuffer>, mut frame: V
         return;
     }
     frame.dirty = false;
+    #[cfg(target_os = "macos")]
+    frame.clear_native_surfaces();
     recycled_frames.push(frame);
 }
 
@@ -384,15 +409,15 @@ fn present_due_video_frames(
         return dropped_count;
     };
 
-    let mut fb = frame_buf.lock().unwrap();
-    std::mem::swap(&mut *fb, &mut frame);
-    fb.dirty = true;
+    let repaint_pending = {
+        let mut fb = frame_buf.lock().unwrap();
+        let repaint_pending = fb.dirty;
+        std::mem::swap(&mut *fb, &mut frame);
+        fb.dirty = true;
+        repaint_pending
+    };
     recycle_video_frame(recycled_frames, frame);
-    if immediate {
-        ctx.request_repaint();
-    } else {
-        repaint_pacer.request(ctx);
-    }
+    repaint_pacer.request_video(ctx, immediate, repaint_pending);
     dropped_count
 }
 
@@ -404,6 +429,7 @@ pub fn run_receive_pipeline(
     ctx: egui::Context,
     shutdown_rx: Receiver<()>,
     audio_tx: Sender<AudioPacket>,
+    audio_drop_rx: Receiver<AudioPacket>,
     feedback_tx: Sender<TransportFeedback>,
     decode_started_tx: Sender<()>,
     // B1: bumped on every received video unit so the connection loop can detect
@@ -478,16 +504,12 @@ pub fn run_receive_pipeline(
                 if drops > 0 && debug_enabled.load(Ordering::Relaxed) {
                     debug_state.record_playout_drop(drops as u32);
                 }
-                // Block briefly on the socket instead of spinning: wakes as soon
-                // as a datagram arrives (Linux poll) or after a timeout so
-                // stats/recovery/shutdown checks still get a turn. Cap the wait at
-                // the next queued frame's due time (never more than 2ms) so a
-                // frame scheduled <2ms out is presented on time instead of being
-                // held back by a flat poll timeout.
+                // Block until data, the next playout deadline, or the bounded
+                // maintenance cadence for shutdown and transport feedback.
                 let wait = playout
                     .next_present_delay(Instant::now())
-                    .map(|until| until.min(Duration::from_millis(2)))
-                    .unwrap_or(Duration::from_millis(2));
+                    .map(|until| until.min(MEDIA_MAINTENANCE_INTERVAL))
+                    .unwrap_or(MEDIA_MAINTENANCE_INTERVAL);
                 receiver.wait_for_data(wait);
                 continue;
             }
@@ -495,7 +517,7 @@ pub fn run_receive_pipeline(
                 // B1: audio is liveness too (flows continuously while enabled).
                 video_arrival.fetch_add(1, Ordering::Relaxed);
                 if audio_enabled.load(Ordering::Relaxed) {
-                    let _ = audio_tx.try_send(opus);
+                    queue_latest_audio(&audio_tx, &audio_drop_rx, opus);
                 }
             }
             Some(ReceivedData::Keepalive) => {
@@ -534,7 +556,7 @@ pub fn run_receive_pipeline(
                         Some(ReceivedData::Audio(opus)) => {
                             video_arrival.fetch_add(1, Ordering::Relaxed);
                             if audio_enabled.load(Ordering::Relaxed) {
-                                let _ = audio_tx.try_send(opus);
+                                queue_latest_audio(&audio_tx, &audio_drop_rx, opus);
                             }
                         }
                         Some(ReceivedData::Keepalive) => {
@@ -669,6 +691,22 @@ pub fn run_receive_pipeline(
     }
 }
 
+fn queue_latest_audio(
+    audio_tx: &Sender<AudioPacket>,
+    audio_drop_rx: &Receiver<AudioPacket>,
+    mut packet: AudioPacket,
+) {
+    loop {
+        match audio_tx.try_send(packet) {
+            Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => return,
+            Err(crossbeam_channel::TrySendError::Full(returned)) => {
+                packet = returned;
+                let _ = audio_drop_rx.try_recv();
+            }
+        }
+    }
+}
+
 fn maybe_request_transport_recovery_keyframe(
     stats: TransportWindowStats,
     control_tx: &Sender<ControlMessage>,
@@ -709,7 +747,10 @@ fn request_recovery_keyframe(
 
 #[cfg(test)]
 mod tests {
-    use super::{adaptive_delay_ceiling, frame_id_is_newer, VideoPlayoutBuffer};
+    use super::{
+        adaptive_delay_ceiling, frame_id_is_newer, queue_latest_audio, VideoPlayoutBuffer,
+    };
+    use crate::transport::AudioPacket;
     use crate::video_frame::{FrameDebugTiming, VideoFrameBuffer};
     use std::time::{Duration, Instant};
 
@@ -721,6 +762,28 @@ mod tests {
             }),
             ..VideoFrameBuffer::default()
         }
+    }
+
+    #[test]
+    fn bounded_audio_handoff_evicts_oldest_packet() {
+        let (tx, rx) = crossbeam_channel::bounded(3);
+        let drop_rx = rx.clone();
+        for seq in 1..=5 {
+            queue_latest_audio(
+                &tx,
+                &drop_rx,
+                AudioPacket {
+                    seq,
+                    data: vec![seq as u8],
+                    redundant_prev: Vec::new(),
+                },
+            );
+        }
+
+        assert_eq!(
+            rx.try_iter().map(|packet| packet.seq).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
     }
 
     #[test]

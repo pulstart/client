@@ -1,7 +1,7 @@
 use eframe::egui;
 use st_protocol::{
-    control::OutputInfo, ControllerState, CursorShape, CursorState, InputCapabilities, KeyboardKey,
-    StreamConfig, KEYBOARD_STATE_BYTES,
+    control::OutputInfo, ControllerState, CursorShape, CursorState, InputCapabilities,
+    InputCredential, InputSession, KeyboardKey, StreamConfig, KEYBOARD_STATE_BYTES,
 };
 use std::sync::Mutex;
 
@@ -50,6 +50,7 @@ impl LocalCaptureMode {
 #[derive(Clone, Debug)]
 pub struct SharedInputSnapshot {
     pub client_id: Option<u32>,
+    pub input_credential: Option<InputCredential>,
     pub controller_state: ControllerState,
     pub capabilities: InputCapabilities,
     pub stream_config: Option<StreamConfig>,
@@ -69,6 +70,7 @@ impl Default for SharedInputSnapshot {
     fn default() -> Self {
         Self {
             client_id: None,
+            input_credential: None,
             controller_state: ControllerState::Unavailable,
             capabilities: InputCapabilities::default(),
             stream_config: None,
@@ -101,8 +103,10 @@ impl SharedInputState {
         self.inner.lock().unwrap().clone()
     }
 
-    pub fn set_client_id(&self, client_id: u32) {
-        self.inner.lock().unwrap().client_id = Some(client_id);
+    pub fn set_input_session(&self, session: InputSession) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.client_id = Some(session.client_id);
+        inner.input_credential = Some(session.credential);
     }
 
     pub fn set_controller_state(&self, controller_state: ControllerState) {
