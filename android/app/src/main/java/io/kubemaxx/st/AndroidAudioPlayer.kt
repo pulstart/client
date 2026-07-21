@@ -145,19 +145,20 @@ internal class AndroidAudioPlayer(
                 val currentUnderruns = underrunCount(track)
                 val underrunPlan = planAudioUnderrun(observedUnderruns, currentUnderruns)
                 if (playing && underrunPlan.rebuffer) {
+                    // The device buffer drained (network jitter). Count it and
+                    // deepen the cushion for future primes, but keep the track
+                    // PLAYING: a drained MODE_STREAM track resumes cleanly on the
+                    // next write. Pausing+flushing+re-priming here instead would
+                    // discard already-buffered audio and inject a prebuffer-length
+                    // silence gap on every jitter spike — a rapid gap+fade train
+                    // that sounds robotic/metallic. The desktop client never
+                    // flushes on underrun either; it keeps streaming and conceals.
                     val addedUnderruns = (currentUnderruns - observedUnderruns).coerceAtLeast(1)
                     underrunEvents.addAndGet(addedUnderruns.toLong())
                     prebuffer.onUnderrun(addedUnderruns)
                     activePrebufferMs.set(prebuffer.targetMs)
-                    onStatus("audio underrun; rebuffering")
-                    pauseAndFlush(track)
-                    playing = false
-                    primedBytes = 0
-                    reportedActive = false
                     observedUnderruns = currentUnderruns
-                    continue
-                }
-                if (playing) {
+                } else if (playing) {
                     prebuffer.onStablePlayback(stableElapsedMs)
                     activePrebufferMs.set(prebuffer.targetMs)
                 }
@@ -170,7 +171,6 @@ internal class AndroidAudioPlayer(
                     buffer,
                     POLL_TIMEOUT_MS,
                 )
-                val hardResync: Boolean
                 val bytes: Int
                 when (fillResult) {
                     0 -> continue
@@ -196,18 +196,15 @@ internal class AndroidAudioPlayer(
                         reportedActive = false
                         continue
                     } else {
-                        hardResync = fillResult and FILL_RESYNC_FLAG != 0
+                        // Strip the resync flag but take no special action: the
+                        // Rust decoder already reset and fade-in'd this frame, so
+                        // playing it directly smooths the discontinuity. Flushing
+                        // the track here is what produced the robotic artifact.
                         bytes = fillResult and FILL_RESYNC_FLAG.inv()
                         if (bytes == 0) continue
                         buffer.position(0)
                         buffer.limit(bytes)
                     }
-                }
-                if (hardResync) {
-                    pauseAndFlush(track)
-                    playing = false
-                    primedBytes = 0
-                    reportedActive = false
                 }
 
                 var rebuild = false
