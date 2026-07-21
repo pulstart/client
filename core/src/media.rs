@@ -1,8 +1,9 @@
 use st_protocol::frame_assembler::AssemblyFeedback;
 use st_protocol::packet::{parse_audio_packet, PacketHeader, PayloadType, HEADER_SIZE};
 use st_protocol::{CompletedFrame, FrameAssembler, TransportFeedback};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::OnceLock;
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const FEEDBACK_INTERVAL: Duration = Duration::from_millis(500);
@@ -13,6 +14,132 @@ pub struct AudioPacket {
     pub seq: u16,
     pub data: Vec<u8>,
     pub redundant_prev: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueuedAudioPacket {
+    pub seq: u16,
+    pub data: Vec<u8>,
+    pub redundant_prev: Vec<Vec<u8>>,
+    pub local_discontinuity: bool,
+}
+
+impl From<AudioPacket> for QueuedAudioPacket {
+    fn from(packet: AudioPacket) -> Self {
+        Self {
+            seq: packet.seq,
+            data: packet.data,
+            redundant_prev: packet.redundant_prev,
+            local_discontinuity: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AudioQueueStats {
+    pub occupancy: usize,
+    pub local_drops: u64,
+}
+
+pub(crate) struct AudioPacketQueue {
+    state: Mutex<AudioQueueState>,
+    available: Condvar,
+    max_capacity: usize,
+}
+
+struct AudioQueueState {
+    packets: VecDeque<QueuedAudioPacket>,
+    limit: usize,
+    local_drops: u64,
+}
+
+impl AudioPacketQueue {
+    pub(crate) fn new(max_capacity: usize, initial_limit: usize) -> Self {
+        assert!(max_capacity > 0);
+        Self {
+            state: Mutex::new(AudioQueueState {
+                packets: VecDeque::with_capacity(max_capacity),
+                limit: initial_limit.clamp(1, max_capacity),
+                local_drops: 0,
+            }),
+            available: Condvar::new(),
+            max_capacity,
+        }
+    }
+
+    pub(crate) fn push_latest(&self, packet: AudioPacket) {
+        let mut packet = QueuedAudioPacket::from(packet);
+        let mut state = self.state.lock().unwrap();
+        let mut dropped = 0u64;
+        while state.packets.len() >= state.limit {
+            state.packets.pop_front();
+            dropped += 1;
+        }
+        if dropped > 0 {
+            state.local_drops = state.local_drops.saturating_add(dropped);
+            if let Some(next) = state.packets.front_mut() {
+                next.local_discontinuity = true;
+            } else {
+                packet.local_discontinuity = true;
+            }
+        }
+        state.packets.push_back(packet);
+        drop(state);
+        self.available.notify_one();
+    }
+
+    pub(crate) fn recv_timeout(&self, timeout: Duration) -> Option<QueuedAudioPacket> {
+        let deadline = Instant::now().checked_add(timeout);
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(packet) = state.packets.pop_front() {
+                return Some(packet);
+            }
+            let remaining = deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(timeout);
+            if remaining.is_zero() {
+                return None;
+            }
+            let (next, wait) = self.available.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if wait.timed_out() && state.packets.is_empty() {
+                return None;
+            }
+        }
+    }
+
+    pub(crate) fn try_recv(&self) -> Option<QueuedAudioPacket> {
+        self.state.lock().unwrap().packets.pop_front()
+    }
+
+    pub(crate) fn set_limit(&self, limit: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.limit = limit.clamp(1, self.max_capacity);
+        let mut dropped = 0u64;
+        while state.packets.len() > state.limit {
+            state.packets.pop_front();
+            dropped += 1;
+        }
+        if dropped > 0 {
+            state.local_drops = state.local_drops.saturating_add(dropped);
+            if let Some(next) = state.packets.front_mut() {
+                next.local_discontinuity = true;
+            }
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        self.state.lock().unwrap().packets.clear();
+    }
+
+    pub(crate) fn stats(&self) -> AudioQueueStats {
+        let state = self.state.lock().unwrap();
+        AudioQueueStats {
+            occupancy: state.packets.len(),
+            local_drops: state.local_drops,
+        }
+    }
 }
 
 pub enum ReceivedData {
@@ -151,6 +278,12 @@ impl MediaDemux {
         self.feedback.dropped_frames = self.feedback.dropped_frames.saturating_add(1);
         self.feedback.urgent = true;
     }
+
+    /// Drop only partial video assembly state during a decoder/profile epoch
+    /// transition. Audio sequencing and transport feedback remain continuous.
+    pub fn reset_video(&mut self) {
+        self.assembler = FrameAssembler::new();
+    }
 }
 
 pub fn unix_time_micros() -> u64 {
@@ -285,6 +418,83 @@ mod tests {
     use st_protocol::packet::MAX_UDP;
     use st_protocol::tcp_tunnel::TCP_TUNNEL_MAX_MEDIA;
     use st_protocol::FrameSlicer;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn audio_packet(seq: u16) -> AudioPacket {
+        AudioPacket {
+            seq,
+            data: vec![seq as u8],
+            redundant_prev: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn stalled_audio_consumer_gets_only_latest_packet_with_resync_marker() {
+        let queue = AudioPacketQueue::new(8, 1);
+        queue.push_latest(audio_packet(10));
+        queue.push_latest(audio_packet(11));
+        queue.push_latest(audio_packet(12));
+
+        let packet = queue.recv_timeout(Duration::ZERO).unwrap();
+        assert_eq!(packet.seq, 12);
+        assert!(packet.local_discontinuity);
+        assert!(queue.try_recv().is_none());
+        assert_eq!(
+            queue.stats(),
+            AudioQueueStats {
+                occupancy: 0,
+                local_drops: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn latency_limit_trim_marks_the_oldest_surviving_packet() {
+        let queue = AudioPacketQueue::new(8, 8);
+        for seq in 1..=5 {
+            queue.push_latest(audio_packet(seq));
+        }
+
+        queue.set_limit(2);
+
+        let first = queue.try_recv().unwrap();
+        let second = queue.try_recv().unwrap();
+        assert_eq!(first.seq, 4);
+        assert!(first.local_discontinuity);
+        assert_eq!(second.seq, 5);
+        assert!(!second.local_discontinuity);
+        assert_eq!(queue.stats().local_drops, 3);
+    }
+
+    #[test]
+    fn concurrent_audio_eviction_never_over_evicts_or_duplicates() {
+        const PACKETS: u16 = 10_000;
+        let queue = Arc::new(AudioPacketQueue::new(8, 4));
+        let producer_queue = Arc::clone(&queue);
+        let producer_done = Arc::new(AtomicBool::new(false));
+        let producer_done_signal = Arc::clone(&producer_done);
+        let producer = std::thread::spawn(move || {
+            for seq in 0..PACKETS {
+                producer_queue.push_latest(audio_packet(seq));
+            }
+            producer_done_signal.store(true, Ordering::Release);
+        });
+
+        let mut received = Vec::new();
+        while !producer_done.load(Ordering::Acquire) || queue.stats().occupancy > 0 {
+            if let Some(packet) = queue.recv_timeout(Duration::from_millis(1)) {
+                received.push(packet.seq);
+            }
+        }
+        producer.join().unwrap();
+
+        assert!(received.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            received.len() as u64 + queue.stats().local_drops,
+            PACKETS as u64
+        );
+    }
 
     #[test]
     fn tcp_sized_slicer_packets_roundtrip_through_demux() {

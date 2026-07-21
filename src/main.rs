@@ -1692,6 +1692,7 @@ impl StreamApp {
         let next = (absolute_x, absolute_y);
         if force || self.last_sent_absolute_cursor != Some(next) {
             self.last_sent_absolute_cursor = Some(next);
+            self.last_local_cursor_prediction_at = Some(Instant::now());
             self.send_input_packet(InputPacket::MouseAbsolute(MouseAbsoluteInput {
                 client_id,
                 x: absolute_x,
@@ -1858,18 +1859,29 @@ impl StreamApp {
             snap(texture.hotspot.y * display_scale),
         );
 
-        // The two modes have exactly one source of position each — no merging,
-        // no fallback, no timer arbitration. That is what stops the jumping.
-        //   * Desktop (HoverAbsolute): the local pointer, 1:1. The server cursor
-        //     follows via absolute injection but is never read back here.
-        //   * Game (CapturedRelative): the server-reported position, scaled into
-        //     the video rect.
+        // Local input predicts immediately. Once another client remains the
+        // reported mouse owner and this client is idle, use the reliable server
+        // cursor so its overlay follows that client instead.
         let (cursor_pos, using_local_pos) = match self.capture_mode {
             LocalCaptureMode::HoverAbsolute => {
-                let pos = self
+                let local_pos = self
                     .hover_cursor_pos
-                    .filter(|pos| video_rect.expand(1.0).contains(*pos))?;
-                (pos, true)
+                    .filter(|pos| video_rect.expand(1.0).contains(*pos));
+                let server_top_left = self.server_cursor_stream_top_left(input_snapshot);
+                let server_pos = egui::pos2(
+                    video_rect.left() + server_top_left.x * scale_x + hotspot.x,
+                    video_rect.top() + server_top_left.y * scale_y + hotspot.y,
+                );
+                let recent_local_prediction = self
+                    .last_local_cursor_prediction_at
+                    .is_some_and(|at| at.elapsed() < LOCAL_CURSOR_PREDICTION_TTL);
+                hover_absolute_tracking_anchor(
+                    input_snapshot.controller_state,
+                    input_snapshot.capabilities.cursor_position_reliable,
+                    Some(server_pos),
+                    local_pos,
+                    recent_local_prediction,
+                )?
             }
             LocalCaptureMode::CapturedRelative => {
                 // While the user is actively moving, draw at the locally
@@ -3727,7 +3739,9 @@ struct MediaThreads {
     audio_stop_tx: crossbeam_channel::Sender<()>,
     audio_thread: std::thread::JoinHandle<()>,
     feedback_rx: crossbeam_channel::Receiver<TransportFeedback>,
-    decode_started_rx: crossbeam_channel::Receiver<()>,
+    decode_started_rx: crossbeam_channel::Receiver<pipeline::VideoDecodeProgress>,
+    stream_config_tx: crossbeam_channel::Sender<StreamConfig>,
+    profile_error_rx: crossbeam_channel::Receiver<pipeline::VideoProfileError>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3769,9 +3783,10 @@ fn start_media_threads(
     let (audio_data_tx, audio_data_rx) = crossbeam_channel::bounded::<AudioPacket>(16);
     let audio_drop_rx = audio_data_rx.clone();
     let (feedback_tx, feedback_rx) = crossbeam_channel::bounded::<TransportFeedback>(8);
-    let (decode_started_tx, decode_started_rx) = crossbeam_channel::bounded::<()>(1);
-    let present_refresh_millihz =
-        display::desired_present_refresh_millihz(display_refresh_millihz, stream_config.framerate);
+    let (decode_started_tx, decode_started_rx) =
+        crossbeam_channel::unbounded::<pipeline::VideoDecodeProgress>();
+    let (stream_config_tx, stream_config_rx) = crossbeam_channel::unbounded();
+    let (profile_error_tx, profile_error_rx) = crossbeam_channel::bounded(1);
 
     let (video_stop_tx, video_stop_rx) = crossbeam_channel::bounded(1);
     let pipeline_frame = Arc::clone(&frame_buf);
@@ -3793,7 +3808,9 @@ fn start_media_threads(
             pipeline_audio_flag,
             native_surfaces,
             control_tx,
-            present_refresh_millihz,
+            stream_config_rx,
+            profile_error_tx,
+            display_refresh_millihz,
             stream_config,
             receiver,
         );
@@ -3821,6 +3838,8 @@ fn start_media_threads(
         audio_thread,
         feedback_rx,
         decode_started_rx,
+        stream_config_tx,
+        profile_error_rx,
     })
 }
 
@@ -3842,9 +3861,10 @@ fn start_punched_media_threads(
     let (audio_data_tx, audio_data_rx) = crossbeam_channel::bounded::<AudioPacket>(16);
     let audio_drop_rx = audio_data_rx.clone();
     let (feedback_tx, feedback_rx) = crossbeam_channel::bounded::<TransportFeedback>(8);
-    let (decode_started_tx, decode_started_rx) = crossbeam_channel::bounded::<()>(1);
-    let present_refresh_millihz =
-        display::desired_present_refresh_millihz(display_refresh_millihz, stream_config.framerate);
+    let (decode_started_tx, decode_started_rx) =
+        crossbeam_channel::unbounded::<pipeline::VideoDecodeProgress>();
+    let (stream_config_tx, stream_config_rx) = crossbeam_channel::unbounded();
+    let (profile_error_tx, profile_error_rx) = crossbeam_channel::bounded(1);
 
     let (video_stop_tx, video_stop_rx) = crossbeam_channel::bounded(1);
     let pipeline_frame = Arc::clone(&frame_buf);
@@ -3866,7 +3886,9 @@ fn start_punched_media_threads(
             pipeline_audio_flag,
             native_surfaces,
             control_tx,
-            present_refresh_millihz,
+            stream_config_rx,
+            profile_error_tx,
+            display_refresh_millihz,
             stream_config,
             receiver,
         );
@@ -3894,6 +3916,8 @@ fn start_punched_media_threads(
         audio_thread,
         feedback_rx,
         decode_started_rx,
+        stream_config_tx,
+        profile_error_rx,
     }
 }
 
@@ -3907,6 +3931,26 @@ fn stop_media_threads(media_threads: MediaThreads) {
     let _ = media_threads.audio_thread.join();
     if let Some(input_thread) = media_threads.input_thread {
         let _ = input_thread.join();
+    }
+}
+
+fn queue_latest_tunnel_media_packet(
+    tx: &crossbeam_channel::Sender<Vec<u8>>,
+    drop_rx: &crossbeam_channel::Receiver<Vec<u8>>,
+    mut packet: Vec<u8>,
+) -> bool {
+    loop {
+        match tx.try_send(packet) {
+            Ok(()) => return true,
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => return false,
+            Err(crossbeam_channel::TrySendError::Full(returned)) => {
+                packet = returned;
+                match drop_rx.try_recv() {
+                    Ok(_) | Err(crossbeam_channel::TryRecvError::Empty) => {}
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => return false,
+                }
+            }
+        }
     }
 }
 
@@ -4537,6 +4581,8 @@ fn run_connection(
                                 if trace_enabled() {
                                     eprintln!("[trace][client] sent ClientReadyForMedia");
                                 }
+                            } else if let Some(media) = media_threads.as_ref() {
+                                let _ = media.stream_config_tx.send(cfg);
                             }
                         }
                         ControlMessage::SessionDebugInfo(info) => {
@@ -4672,10 +4718,11 @@ fn run_connection(
             }
         }
     }
-    let stream_config = stream_config.unwrap();
+    let mut stream_config = stream_config.unwrap();
     let media_threads = media_threads.expect("media threads not started");
     let feedback_rx = media_threads.feedback_rx.clone();
     let decode_started_rx = media_threads.decode_started_rx.clone();
+    let profile_error_rx = media_threads.profile_error_rx.clone();
     let (clipboard_control_tx, clipboard_control_rx) =
         crossbeam_channel::bounded::<ControlMessage>(8);
     let (file_detect_tx, file_detect_rx) = crossbeam_channel::bounded::<std::path::PathBuf>(8);
@@ -4724,7 +4771,7 @@ fn run_connection(
     // B1: last clock-sync RTT (ms) stamped onto outgoing TransportFeedback.
     let mut last_rtt_ms: u32 = 0;
     let mut startup_decode_ok = false;
-    let startup_deadline = Instant::now() + STARTUP_DECODE_TIMEOUT;
+    let mut startup_deadline = Instant::now() + STARTUP_DECODE_TIMEOUT;
     // B1: media-stall watchdog state. `video_arrival` counts every media
     // datagram (video, audio, AND keepalive — see run_receive_pipeline), so it
     // doubles as the UDP-liveness signal for the UDP-blocked detector below.
@@ -4783,8 +4830,23 @@ fn run_connection(
         while let Ok(msg) = pipeline_control_rx.try_recv() {
             let _ = tcp.write_all(&msg.serialize());
         }
-        while decode_started_rx.try_recv().is_ok() {
-            startup_decode_ok = true;
+        while let Ok(progress) = decode_started_rx.try_recv() {
+            if progress.matches_config(stream_config) {
+                startup_decode_ok = true;
+            }
+        }
+        if let Ok(failure) = profile_error_rx.try_recv() {
+            eprintln!(
+                "[codec] live {:?} decoder failed: {}; reconnecting with codec excluded",
+                failure.codec, failure.message
+            );
+            excluded_video_codecs.lock().unwrap().insert(failure.codec);
+            *state.lock().unwrap() = ConnectionState::Disconnected;
+            ctx.request_repaint();
+            clipboard_sync.stop();
+            ft_manager.stop();
+            stop_media_threads(media_threads);
+            return;
         }
         while let Ok(mut feedback) = feedback_rx.try_recv() {
             // B1: stamp the latest clock-sync RTT so the wire field is live
@@ -4857,6 +4919,12 @@ fn run_connection(
                     match msg {
                         ControlMessage::StreamConfig(cfg) => {
                             shared_input.set_stream_config(cfg);
+                            if pipeline::decode_progress_resets(stream_config, cfg) {
+                                startup_decode_ok = false;
+                                startup_deadline = Instant::now() + STARTUP_DECODE_TIMEOUT;
+                            }
+                            stream_config = cfg;
+                            let _ = media_threads.stream_config_tx.send(cfg);
                         }
                         ControlMessage::SessionDebugInfo(info) => {
                             debug_state.set_session_info(info);
@@ -5356,7 +5424,7 @@ fn run_tunnel_session(
             break;
         }
     }
-    let stream_config = match stream_config {
+    let mut stream_config = match stream_config {
         Some(cfg) => cfg,
         None => {
             set_error(
@@ -5385,6 +5453,10 @@ fn run_tunnel_session(
                 offset += used;
                 match message {
                     ControlMessage::StreamStarted => stream_started = true,
+                    ControlMessage::StreamConfig(config) => {
+                        shared_input.set_stream_config(config);
+                        stream_config = config;
+                    }
                     ControlMessage::Error(error) => {
                         set_error(
                             &state,
@@ -5428,7 +5500,10 @@ fn run_tunnel_session(
     }
 
     eprintln!("[{via}] Stream started, entering unified session loop");
-    let (media_packet_tx, media_packet_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+    const TUNNEL_MEDIA_QUEUE_CAPACITY: usize = 512;
+    let (media_packet_tx, media_packet_rx) =
+        crossbeam_channel::bounded::<Vec<u8>>(TUNNEL_MEDIA_QUEUE_CAPACITY);
+    let media_packet_drop_rx = media_packet_rx.clone();
     let _ = punched.set_nonblocking(true);
     let _ = punched.set_read_timeout(None);
 
@@ -5462,8 +5537,9 @@ fn run_tunnel_session(
 
     // --- Control + input forwarding loop ---
     let decode_started_rx = media.decode_started_rx.clone();
+    let profile_error_rx = media.profile_error_rx.clone();
     let mut startup_decode_ok = false;
-    let startup_deadline = Instant::now() + STARTUP_DECODE_TIMEOUT;
+    let mut startup_deadline = Instant::now() + STARTUP_DECODE_TIMEOUT;
     let initial_audio =
         audio_enabled.load(Ordering::SeqCst) && stream_supports_client_audio(&stream_config);
     audio_enabled.store(initial_audio, Ordering::SeqCst);
@@ -5530,6 +5606,7 @@ fn run_tunnel_session(
         // Forward input from UI thread to server via punched socket media channel.
         let now = Instant::now();
         let mut did_work = false;
+        let mut stop_session = false;
         let current_audio = audio_enabled.load(Ordering::SeqCst);
         if current_audio != last_audio_state {
             last_audio_state = current_audio;
@@ -5604,6 +5681,16 @@ fn run_tunnel_session(
             did_work = true;
             let _ = punched.send_control(&ctrl.serialize());
         }
+        if let Ok(failure) = profile_error_rx.try_recv() {
+            eprintln!(
+                "[codec] live {:?} decoder failed over tunnel: {}; reconnecting with codec excluded",
+                failure.codec, failure.message
+            );
+            excluded_video_codecs.lock().unwrap().insert(failure.codec);
+            *state.lock().unwrap() = ConnectionState::Disconnected;
+            ctx.request_repaint();
+            stop_session = true;
+        }
         // Clock-sync ping runs always (B1) so RTT on feedback stays fresh.
         if Instant::now() >= next_clock_ping {
             let ping = ControlMessage::ClockSyncPing(ClockSyncPing {
@@ -5615,7 +5702,6 @@ fn run_tunnel_session(
         }
 
         punched.tick();
-        let mut stop_session = false;
         loop {
             let incoming = punched.try_recv_all();
             if incoming.is_empty() {
@@ -5626,7 +5712,11 @@ fn run_tunnel_session(
             for msg in incoming {
                 match msg {
                     PunchedMessage::Media(data) => {
-                        if media_packet_tx.send(data).is_err() {
+                        if !queue_latest_tunnel_media_packet(
+                            &media_packet_tx,
+                            &media_packet_drop_rx,
+                            data,
+                        ) {
                             stop_session = true;
                             break;
                         }
@@ -5638,6 +5728,12 @@ fn run_tunnel_session(
                             match msg {
                                 ControlMessage::StreamConfig(cfg) => {
                                     shared_input.set_stream_config(cfg);
+                                    if pipeline::decode_progress_resets(stream_config, cfg) {
+                                        startup_decode_ok = false;
+                                        startup_deadline = Instant::now() + STARTUP_DECODE_TIMEOUT;
+                                    }
+                                    stream_config = cfg;
+                                    let _ = media.stream_config_tx.send(cfg);
                                 }
                                 ControlMessage::SessionDebugInfo(info) => {
                                     debug_state.set_session_info(info);
@@ -5794,8 +5890,10 @@ fn run_tunnel_session(
             break;
         }
 
-        while decode_started_rx.try_recv().is_ok() {
-            startup_decode_ok = true;
+        while let Ok(progress) = decode_started_rx.try_recv() {
+            if progress.matches_config(stream_config) {
+                startup_decode_ok = true;
+            }
         }
         if !startup_decode_ok && Instant::now() >= startup_deadline {
             let codec = stream_config.codec;
@@ -6254,7 +6352,10 @@ impl KeyboardInputHeartbeat {
 
 fn mouse_heartbeat_packet(packet: InputPacket) -> Option<InputPacket> {
     match packet {
-        InputPacket::MouseAbsolute(packet) => Some(InputPacket::MouseAbsolute(packet)),
+        InputPacket::MouseAbsolute(packet) => Some(InputPacket::MouseButtons(MouseButtonsInput {
+            client_id: packet.client_id,
+            buttons: packet.buttons,
+        })),
         InputPacket::MouseRelative(packet) => Some(InputPacket::MouseButtons(MouseButtonsInput {
             client_id: packet.client_id,
             buttons: packet.buttons,
@@ -6270,7 +6371,6 @@ fn mouse_heartbeat_packet(packet: InputPacket) -> Option<InputPacket> {
 
 fn mouse_heartbeat_buttons(packet: InputPacket) -> u8 {
     match packet {
-        InputPacket::MouseAbsolute(packet) => packet.buttons,
         InputPacket::MouseButtons(packet) => packet.buttons,
         _ => 0,
     }
@@ -6647,6 +6747,27 @@ fn relative_capture_tracking_anchor(
         local_prediction.or(remote_pos)
     } else {
         remote_pos.or(local_prediction)
+    }
+}
+
+fn hover_absolute_tracking_anchor(
+    controller_state: ControllerState,
+    cursor_position_reliable: bool,
+    remote_pos: Option<egui::Pos2>,
+    local_prediction: Option<egui::Pos2>,
+    local_prediction_recent: bool,
+) -> Option<(egui::Pos2, bool)> {
+    let prefer_remote = controller_state == ControllerState::OwnedByOther
+        && cursor_position_reliable
+        && !local_prediction_recent;
+    if prefer_remote {
+        remote_pos
+            .map(|pos| (pos, false))
+            .or_else(|| local_prediction.map(|pos| (pos, true)))
+    } else {
+        local_prediction
+            .map(|pos| (pos, true))
+            .or_else(|| remote_pos.map(|pos| (pos, false)))
     }
 }
 
@@ -8337,6 +8458,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bounded_tunnel_media_handoff_keeps_latest_packets() {
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let drop_rx = rx.clone();
+
+        for value in 1..=4 {
+            assert!(queue_latest_tunnel_media_packet(&tx, &drop_rx, vec![value]));
+        }
+
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![vec![3], vec![4]]);
+    }
+
+    #[test]
     fn advertised_video_codec_support_disables_yuv444_when_toggle_is_off() {
         let report = decode::VideoCodecSupportReport {
             supported: VideoCodecSupport::all(),
@@ -8378,7 +8511,13 @@ mod tests {
             y: 200,
             buttons: MOUSE_BUTTON_PRIMARY,
         });
-        assert_eq!(mouse_heartbeat_packet(absolute), Some(absolute));
+        assert_eq!(
+            mouse_heartbeat_packet(absolute),
+            Some(InputPacket::MouseButtons(MouseButtonsInput {
+                client_id: 7,
+                buttons: MOUSE_BUTTON_PRIMARY,
+            }))
+        );
 
         let relative = InputPacket::MouseRelative(MouseRelativeInput {
             client_id: 7,
@@ -8556,6 +8695,41 @@ mod tests {
         assert_eq!(
             relative_capture_tracking_anchor(Some(remote), Some(predicted), false),
             Some(remote)
+        );
+    }
+
+    #[test]
+    fn hover_prediction_uses_remote_when_another_owner_is_stable() {
+        let remote = egui::pos2(100.0, 200.0);
+        let predicted = egui::pos2(120.0, 205.0);
+
+        assert_eq!(
+            hover_absolute_tracking_anchor(
+                ControllerState::OwnedByOther,
+                true,
+                Some(remote),
+                Some(predicted),
+                false,
+            ),
+            Some((remote, false))
+        );
+    }
+
+    #[test]
+    fn hover_prediction_keeps_immediate_local_reclaim_without_blocking_input() {
+        let remote = egui::pos2(100.0, 200.0);
+        let predicted = egui::pos2(120.0, 205.0);
+
+        assert!(controller_state_allows_input(ControllerState::OwnedByOther));
+        assert_eq!(
+            hover_absolute_tracking_anchor(
+                ControllerState::OwnedByOther,
+                true,
+                Some(remote),
+                Some(predicted),
+                true,
+            ),
+            Some((predicted, true))
         );
     }
 }

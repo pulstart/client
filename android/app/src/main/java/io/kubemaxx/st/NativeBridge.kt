@@ -33,6 +33,7 @@ internal object NativeBridge {
     @JvmStatic external fun nativeStop(handle: Long)
     @JvmStatic external fun nativeDestroy(handle: Long)
     @JvmStatic external fun nativeGetStatus(handle: Long): String
+    @JvmStatic external fun nativeGetAudioQueueStats(handle: Long, epoch: Long): Long
     @JvmStatic external fun nativeTakeStreamConfig(handle: Long, epoch: Long): IntArray?
     @JvmStatic external fun nativePollCursorSnapshot(handle: Long, epoch: Long): ByteArray?
     @JvmStatic external fun nativePollAccessUnit(handle: Long, epoch: Long, timeoutMs: Int): ByteArray?
@@ -82,6 +83,7 @@ internal object NativeBridge {
         handle: Long,
         epoch: Long,
         generation: Int,
+        videoEpoch: Long,
     ): Boolean
     @JvmStatic external fun nativeGetDiscoveredServers(handle: Long, token: String): String
 }
@@ -108,6 +110,7 @@ internal object PackedTrackpadRoute {
 internal data class StreamDescription(
     val transportGeneration: Int,
     val generation: Int,
+    val videoEpoch: Long,
     val width: Int,
     val height: Int,
     val cursorWidth: Int,
@@ -127,22 +130,26 @@ internal data class StreamDescription(
 
         companion object {
             fun from(values: IntArray): StreamDescription? {
-            if (values.size != 10 || values[0] <= 0 || values[2] <= 0 || values[3] <= 0 ||
-                values[4] <= 0 || values[5] <= 0
+            if (values.size != 12 || values[0] <= 0 || values[1] <= 0 ||
+                values[4] <= 0 || values[5] <= 0 || values[6] <= 0 || values[7] <= 0
             ) {
                 return null
             }
+            val videoEpoch = ((values[2].toLong() and 0xffffffffL) shl 32) or
+                (values[3].toLong() and 0xffffffffL)
+            if (videoEpoch <= 0L) return null
             return StreamDescription(
                 transportGeneration = values[0],
                 generation = values[1],
-                width = values[2],
-                height = values[3],
-                cursorWidth = values[4],
-                cursorHeight = values[5],
-                framerate = values[6].coerceAtLeast(1),
-                audioSampleRate = values[7],
-                audioChannels = values[8],
-                packetDurationMs = values[9],
+                videoEpoch = videoEpoch,
+                width = values[4],
+                height = values[5],
+                cursorWidth = values[6],
+                cursorHeight = values[7],
+                framerate = values[8].coerceAtLeast(1),
+                audioSampleRate = values[9],
+                audioChannels = values[10],
+                packetDurationMs = values[11],
             )
         }
     }

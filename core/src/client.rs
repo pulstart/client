@@ -1,5 +1,7 @@
 use crate::control_stream::{drain_control_messages, normalize_server_address};
-use crate::media::{AudioPacket, MediaDemux, ReceivedData};
+use crate::media::{
+    AudioPacket, AudioPacketQueue, AudioQueueStats, MediaDemux, QueuedAudioPacket, ReceivedData,
+};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use st_protocol::packet::frame_type;
 use st_protocol::reliable_udp::PunchedMessage;
@@ -13,7 +15,7 @@ use st_protocol::{
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -115,6 +117,7 @@ pub struct ClientConfig {
 pub struct StreamEvent {
     pub transport_generation: u32,
     pub generation: u32,
+    pub video_epoch: u64,
     pub width: u32,
     pub height: u32,
     pub cursor_width: u32,
@@ -220,10 +223,7 @@ impl Default for InputEligibility {
 
 impl InputEligibility {
     fn has_control(self) -> bool {
-        matches!(
-            self.controller_state,
-            ControllerState::Available | ControllerState::OwnedByYou
-        )
+        self.controller_state != ControllerState::Unavailable
     }
 
     fn allows_absolute(self) -> bool {
@@ -272,6 +272,7 @@ pub struct AccessUnit {
 enum Command {
     AcceptStream {
         generation: u32,
+        video_epoch: u64,
         acknowledgement: Sender<bool>,
     },
     RequestKeyframe,
@@ -309,15 +310,14 @@ struct Shared {
     trackpad_router: Mutex<TrackpadRouter>,
     video_tx: Sender<AccessUnit>,
     video_rx: Receiver<AccessUnit>,
-    audio_tx: Sender<AudioPacket>,
-    audio_rx: Receiver<AudioPacket>,
+    audio_queue: AudioPacketQueue,
     command_rx: Receiver<Command>,
     mouse_rx: Receiver<MouseState>,
     accepted_generation: AtomicU32,
+    accepted_video_epoch: AtomicU64,
     last_stream_generation: AtomicU32,
     transport_generation: AtomicU32,
     audio_enabled_requested: AtomicBool,
-    audio_queue_limit: AtomicUsize,
 }
 
 pub struct Client {
@@ -342,7 +342,6 @@ impl Client {
         }
 
         let (video_tx, video_rx) = crossbeam_channel::bounded(VIDEO_QUEUE_CAPACITY);
-        let (audio_tx, audio_rx) = crossbeam_channel::bounded(AUDIO_QUEUE_MAX_CAPACITY);
         let (command_tx, command_rx) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
         let (mouse_tx, mouse_rx) = crossbeam_channel::unbounded();
         let shared = Arc::new(Shared {
@@ -353,15 +352,14 @@ impl Client {
             trackpad_router: Mutex::new(TrackpadRouter::default()),
             video_tx,
             video_rx,
-            audio_tx,
-            audio_rx,
+            audio_queue: AudioPacketQueue::new(AUDIO_QUEUE_MAX_CAPACITY, 1),
             command_rx,
             mouse_rx,
             accepted_generation: AtomicU32::new(0),
+            accepted_video_epoch: AtomicU64::new(0),
             last_stream_generation: AtomicU32::new(0),
             transport_generation: AtomicU32::new(1),
             audio_enabled_requested: AtomicBool::new(false),
-            audio_queue_limit: AtomicUsize::new(1),
         });
         let client = Arc::new(Self {
             shared: Arc::clone(&shared),
@@ -410,16 +408,20 @@ impl Client {
         self.shared.video_rx.recv_timeout(timeout).ok()
     }
 
-    pub fn recv_audio_packet(&self, timeout: Duration) -> Option<AudioPacket> {
-        self.shared.audio_rx.recv_timeout(timeout).ok()
+    pub fn recv_audio_packet(&self, timeout: Duration) -> Option<QueuedAudioPacket> {
+        self.shared.audio_queue.recv_timeout(timeout)
     }
 
-    pub fn try_recv_audio_packet(&self) -> Option<AudioPacket> {
-        self.shared.audio_rx.try_recv().ok()
+    pub fn try_recv_audio_packet(&self) -> Option<QueuedAudioPacket> {
+        self.shared.audio_queue.try_recv()
     }
 
     pub fn audio_backlog(&self) -> usize {
-        self.shared.audio_rx.len()
+        self.shared.audio_queue.stats().occupancy
+    }
+
+    pub fn audio_queue_stats(&self) -> AudioQueueStats {
+        self.shared.audio_queue.stats()
     }
 
     pub fn clear_audio_queue(&self) {
@@ -568,13 +570,14 @@ impl Client {
             .map_err(|error| format!("text input queue unavailable: {error}"))
     }
 
-    pub fn accept_stream_generation(&self, generation: u32) -> bool {
+    pub fn accept_stream_generation(&self, generation: u32, video_epoch: u64) -> bool {
         let (acknowledgement, accepted) = crossbeam_channel::bounded(1);
         if self
             .command_tx
             .send_timeout(
                 Command::AcceptStream {
                     generation,
+                    video_epoch,
                     acknowledgement,
                 },
                 STREAM_ACCEPT_TIMEOUT,
@@ -717,6 +720,7 @@ fn reset_for_transport_fallback(shared: &Shared, status: &str) {
     }
     *shared.trackpad_router.lock().unwrap() = TrackpadRouter::default();
     shared.accepted_generation.store(0, Ordering::Release);
+    shared.accepted_video_epoch.store(0, Ordering::Release);
     clear_video_queue(shared);
     clear_audio_queue(shared);
 }
@@ -1106,8 +1110,14 @@ impl TrackpadRouter {
     fn set_controller_state(&mut self, controller_state: ControllerState) {
         let was_eligible = self.eligibility().allows_trackpad_delta();
         let was_absolute_mode = self.absolute_mode();
+        let ownership_moved_away = self.controller_state != ControllerState::OwnedByOther
+            && controller_state == ControllerState::OwnedByOther;
         self.controller_state = controller_state;
         self.finish_mode_update(was_eligible, was_absolute_mode);
+        if ownership_moved_away && self.capabilities.cursor_position_reliable {
+            self.reset_absolute_target();
+            self.seed_absolute_target();
+        }
     }
 
     fn set_cursor_shape(&mut self, shape: CursorShape) {
@@ -1305,6 +1315,9 @@ fn handle_control_message(
     match message {
         ControlMessage::StreamConfig(config) => {
             validate_stream_config(config)?;
+            let video_epoch_changed = session
+                .stream_config
+                .is_none_or(|previous| previous.video_epoch != config.video_epoch);
             let decoder_changed = session
                 .stream_config
                 .is_none_or(|previous| !decoder_configs_compatible(previous, config));
@@ -1317,22 +1330,26 @@ fn handle_control_message(
                 .lock()
                 .unwrap()
                 .set_stream_config(config);
-            shared.audio_queue_limit.store(
-                audio_queue_limit(config.packet_duration_ms),
-                Ordering::Release,
-            );
-            if decoder_changed {
-                session.generation = next_stream_generation(shared);
-                session.last_frame_id = None;
-                session.waiting_for_recovery = true;
-                clear_video_queue(shared);
-            }
             if audio_changed {
                 clear_audio_queue(shared);
+            }
+            shared
+                .audio_queue
+                .set_limit(audio_queue_limit(config.packet_duration_ms));
+            if decoder_changed {
+                session.generation = next_stream_generation(shared);
+            }
+            if decoder_changed || video_epoch_changed {
+                session.last_frame_id = None;
+                session.waiting_for_recovery = true;
+                session.demux.reset_video();
+                clear_video_queue(shared);
+                shared.accepted_video_epoch.store(0, Ordering::Release);
             }
             *shared.stream_event.lock().unwrap() = Some(StreamEvent {
                 transport_generation: shared.transport_generation.load(Ordering::Acquire),
                 generation: session.generation,
+                video_epoch: config.video_epoch,
                 width: config.width,
                 height: config.height,
                 // CursorState uses these same stream-space dimensions today,
@@ -1426,6 +1443,9 @@ fn handle_control_message(
 }
 
 fn validate_stream_config(config: StreamConfig) -> Result<(), String> {
+    if config.video_epoch == 0 {
+        return Err("server supplied an invalid video epoch".into());
+    }
     if config.codec != VideoCodec::H264 {
         return Err(format!(
             "server selected unsupported codec {:?}; Android MVP supports H.264 only",
@@ -1526,7 +1546,12 @@ fn queue_video_frame(
     session: &mut SessionState,
     shared: &Shared,
 ) -> Result<bool, String> {
-    if shared.accepted_generation.load(Ordering::Acquire) != session.generation {
+    if shared.accepted_generation.load(Ordering::Acquire) != session.generation
+        || shared.accepted_video_epoch.load(Ordering::Acquire) != frame.video_epoch
+        || session
+            .stream_config
+            .is_none_or(|config| config.video_epoch != frame.video_epoch)
+    {
         return Ok(false);
     }
     let recovery = matches!(frame.frame_type, frame_type::IDR | frame_type::RECOVERY);
@@ -1632,15 +1657,23 @@ fn drain_commands(
         match shared.command_rx.try_recv() {
             Ok(Command::AcceptStream {
                 generation,
+                video_epoch,
                 acknowledgement,
             }) => {
-                if generation != session.generation {
+                if generation != session.generation
+                    || session
+                        .stream_config
+                        .is_none_or(|config| config.video_epoch != video_epoch)
+                {
                     let _ = acknowledgement.try_send(false);
                     continue;
                 }
                 shared
                     .accepted_generation
                     .store(generation, Ordering::Release);
+                shared
+                    .accepted_video_epoch
+                    .store(video_epoch, Ordering::Release);
                 clear_video_queue(shared);
                 session.waiting_for_recovery = true;
                 session.last_frame_id = None;
@@ -1682,6 +1715,10 @@ struct MouseHeartbeat {
 impl MouseHeartbeat {
     fn new(packet: InputPacket, buttons: u8) -> Self {
         let packet = match packet {
+            InputPacket::MouseAbsolute(absolute) => InputPacket::MouseButtons(MouseButtonsInput {
+                client_id: absolute.client_id,
+                buttons,
+            }),
             InputPacket::MouseRelative(relative) => InputPacket::MouseButtons(MouseButtonsInput {
                 client_id: relative.client_id,
                 buttons,
@@ -1928,25 +1965,8 @@ fn clear_video_queue(shared: &Shared) {
     while shared.video_rx.try_recv().is_ok() {}
 }
 
-fn queue_audio_packet(mut packet: AudioPacket, shared: &Shared) {
-    let limit = shared
-        .audio_queue_limit
-        .load(Ordering::Acquire)
-        .clamp(1, AUDIO_QUEUE_MAX_CAPACITY);
-    while shared.audio_rx.len() >= limit {
-        if shared.audio_rx.try_recv().is_err() {
-            break;
-        }
-    }
-    loop {
-        match shared.audio_tx.try_send(packet) {
-            Ok(()) | Err(TrySendError::Disconnected(_)) => return,
-            Err(TrySendError::Full(returned)) => {
-                packet = returned;
-                let _ = shared.audio_rx.try_recv();
-            }
-        }
-    }
+fn queue_audio_packet(packet: AudioPacket, shared: &Shared) {
+    shared.audio_queue.push_latest(packet);
 }
 
 fn audio_queue_limit(packet_duration_ms: u8) -> usize {
@@ -1956,7 +1976,7 @@ fn audio_queue_limit(packet_duration_ms: u8) -> usize {
 }
 
 fn clear_audio_queue(shared: &Shared) {
-    while shared.audio_rx.try_recv().is_ok() {}
+    shared.audio_queue.clear();
 }
 
 fn should_stop(shared: &Shared) -> bool {
@@ -2139,7 +2159,6 @@ mod tests {
 
     fn test_shared() -> (Arc<Shared>, Sender<Command>, Sender<MouseState>) {
         let (video_tx, video_rx) = crossbeam_channel::bounded(VIDEO_QUEUE_CAPACITY);
-        let (audio_tx, audio_rx) = crossbeam_channel::bounded(AUDIO_QUEUE_MAX_CAPACITY);
         let (command_tx, command_rx) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
         let (mouse_tx, mouse_rx) = crossbeam_channel::unbounded();
         (
@@ -2151,15 +2170,14 @@ mod tests {
                 trackpad_router: Mutex::new(TrackpadRouter::default()),
                 video_tx,
                 video_rx,
-                audio_tx,
-                audio_rx,
+                audio_queue: AudioPacketQueue::new(AUDIO_QUEUE_MAX_CAPACITY, 1),
                 command_rx,
                 mouse_rx,
                 accepted_generation: AtomicU32::new(0),
+                accepted_video_epoch: AtomicU64::new(0),
                 last_stream_generation: AtomicU32::new(0),
                 transport_generation: AtomicU32::new(1),
                 audio_enabled_requested: AtomicBool::new(false),
-                audio_queue_limit: AtomicUsize::new(1),
             }),
             command_tx,
             mouse_tx,
@@ -2168,6 +2186,7 @@ mod tests {
 
     fn test_stream_config(width: u32, height: u32) -> StreamConfig {
         StreamConfig {
+            video_epoch: 1,
             codec: VideoCodec::H264,
             width,
             height,
@@ -2312,6 +2331,28 @@ mod tests {
     }
 
     #[test]
+    fn ownership_moving_away_reseeds_trackpad_from_reliable_server_cursor() {
+        let state = CursorState {
+            serial: 1,
+            x: 100,
+            y: 200,
+            visible: true,
+            app_grab: false,
+        };
+        let mut router = trackpad_router(800, 600, true, state);
+        router.set_controller_state(ControllerState::OwnedByYou);
+        router.note_absolute_input(u16::MAX, u16::MAX);
+
+        router.set_controller_state(ControllerState::OwnedByOther);
+
+        assert!(!router.local_absolute_control);
+        assert_eq!(router.absolute_target, Some((100.0, 200.0)));
+        let (route, _) = router.route_trackpad_delta(5, -10, 0).unwrap();
+        assert_tip_near(absolute_tip(route, 800, 600), (105.0, 190.0));
+        assert!(router.local_absolute_control);
+    }
+
+    #[test]
     fn unreliable_cursor_ignores_bogus_state_and_continues_from_center() {
         let state = CursorState {
             serial: 1,
@@ -2411,6 +2452,7 @@ mod tests {
     #[test]
     fn validates_android_stream_subset() {
         let valid = StreamConfig {
+            video_epoch: 1,
             codec: VideoCodec::H264,
             width: 1920,
             height: 1080,
@@ -2440,6 +2482,9 @@ mod tests {
         shared
             .accepted_generation
             .store(first.generation, Ordering::Release);
+        shared
+            .accepted_video_epoch
+            .store(first.video_epoch, Ordering::Release);
         session.waiting_for_recovery = false;
         shared
             .video_tx
@@ -2472,7 +2517,7 @@ mod tests {
         assert_eq!(fps_event.generation, first.generation);
         assert_eq!(fps_event.framerate, 90);
         assert_eq!(shared.video_rx.len(), 1);
-        assert_eq!(shared.audio_rx.len(), 1);
+        assert_eq!(shared.audio_queue.stats().occupancy, 1);
         assert!(!session.waiting_for_recovery);
 
         let audio_only = StreamConfig {
@@ -2488,7 +2533,7 @@ mod tests {
         let audio_event = shared.stream_event.lock().unwrap().take().unwrap();
         assert_eq!(audio_event.generation, first.generation);
         assert_eq!(shared.video_rx.len(), 1);
-        assert!(shared.audio_rx.is_empty());
+        assert_eq!(shared.audio_queue.stats().occupancy, 0);
         assert!(!session.waiting_for_recovery);
 
         queue_audio_packet(
@@ -2509,8 +2554,100 @@ mod tests {
         let resize_event = shared.stream_event.lock().unwrap().take().unwrap();
         assert_eq!(resize_event.generation, first.generation + 1);
         assert!(shared.video_rx.is_empty());
-        assert_eq!(shared.audio_rx.len(), 1);
+        assert_eq!(shared.audio_queue.stats().occupancy, 1);
         assert!(session.waiting_for_recovery);
+    }
+
+    #[test]
+    fn incompatible_stream_config_discards_partial_old_video_epoch() {
+        let (shared, _, _) = test_shared();
+        let mut session = SessionState::new("127.0.0.1".parse().unwrap());
+        let initial = test_stream_config(1920, 1080);
+        handle_control_message(ControlMessage::StreamConfig(initial), &mut session, &shared)
+            .unwrap();
+
+        let mut slicer = st_protocol::FrameSlicer::new();
+        slicer.set_parity_enabled(false);
+        let packets = slicer.slice(&vec![0x65; 4_000], 77).to_vec();
+        assert!(packets.len() > 1);
+        assert!(session.demux.process_packet(&packets[0], None).is_none());
+
+        handle_control_message(
+            ControlMessage::StreamConfig(StreamConfig {
+                width: 1280,
+                height: 720,
+                ..initial
+            }),
+            &mut session,
+            &shared,
+        )
+        .unwrap();
+        for packet in &packets[1..] {
+            assert!(
+                session.demux.process_packet(packet, None).is_none(),
+                "old-epoch remainder must not complete after assembler reset"
+            );
+        }
+    }
+
+    #[test]
+    fn media_waits_for_matching_stream_config_epoch_acceptance() {
+        let (shared, _, _) = test_shared();
+        let mut session = SessionState::new("127.0.0.1".parse().unwrap());
+        let initial = test_stream_config(1920, 1080);
+        handle_control_message(ControlMessage::StreamConfig(initial), &mut session, &shared)
+            .unwrap();
+        let initial_event = shared.stream_event.lock().unwrap().take().unwrap();
+        shared
+            .accepted_generation
+            .store(initial_event.generation, Ordering::Release);
+        shared
+            .accepted_video_epoch
+            .store(initial_event.video_epoch, Ordering::Release);
+        session.waiting_for_recovery = false;
+
+        let packet_for = |frame_id, video_epoch| {
+            let mut slicer = FrameSlicer::new();
+            slicer
+                .slice_with_meta_parts(
+                    &[0, 0, 0, 1, 0x65, frame_id as u8],
+                    frame_id,
+                    st_protocol::FrameTimingMeta {
+                        video_epoch,
+                        ..Default::default()
+                    },
+                    frame_type::IDR,
+                )
+                .0[0]
+                .clone()
+        };
+
+        process_media_packet(&packet_for(1, 2), None, &mut session, &shared).unwrap();
+        assert!(
+            shared.video_rx.is_empty(),
+            "future epoch arrived before config"
+        );
+
+        let next = StreamConfig {
+            video_epoch: 2,
+            ..initial
+        };
+        handle_control_message(ControlMessage::StreamConfig(next), &mut session, &shared).unwrap();
+        let next_event = shared.stream_event.lock().unwrap().take().unwrap();
+        assert_eq!(next_event.generation, initial_event.generation);
+        assert_eq!(shared.accepted_video_epoch.load(Ordering::Acquire), 0);
+
+        process_media_packet(&packet_for(2, 2), None, &mut session, &shared).unwrap();
+        assert!(
+            shared.video_rx.is_empty(),
+            "epoch was not accepted by the UI"
+        );
+
+        shared
+            .accepted_video_epoch
+            .store(next_event.video_epoch, Ordering::Release);
+        process_media_packet(&packet_for(3, 2), None, &mut session, &shared).unwrap();
+        assert_eq!(shared.video_rx.try_recv().unwrap().frame_id, 3);
     }
 
     #[test]
@@ -2556,6 +2693,9 @@ mod tests {
         shared
             .accepted_generation
             .store(direct_event.generation, Ordering::Release);
+        shared
+            .accepted_video_epoch
+            .store(direct_event.video_epoch, Ordering::Release);
 
         reset_for_transport_fallback(&shared, "connecting through API punch");
         let reset_control = shared
@@ -2582,6 +2722,7 @@ mod tests {
         assert_eq!(reset_control.transport_generation, 2);
         assert!(reset_control.is_empty());
         assert_eq!(shared.accepted_generation.load(Ordering::Acquire), 0);
+        assert_eq!(shared.accepted_video_epoch.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -2597,9 +2738,11 @@ mod tests {
         shared
             .accepted_generation
             .store(session.generation, Ordering::Release);
+        shared.accepted_video_epoch.store(1, Ordering::Release);
 
         let p_with_parameter_sets = st_protocol::CompletedFrame {
             frame_id: 1,
+            video_epoch: 1,
             data: vec![
                 0, 0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x68, 3, 4, 0, 0, 0, 1, 0x41, 5, 6,
             ],
@@ -2612,6 +2755,7 @@ mod tests {
 
         let idr = st_protocol::CompletedFrame {
             frame_id: 2,
+            video_epoch: 1,
             data: vec![0, 0, 0, 1, 0x65, 7, 8],
             timing: Default::default(),
             frame_type: frame_type::IDR,
@@ -2634,9 +2778,11 @@ mod tests {
         shared
             .accepted_generation
             .store(session.generation, Ordering::Release);
+        shared.accepted_video_epoch.store(1, Ordering::Release);
 
         let frame = |frame_id, frame_type| st_protocol::CompletedFrame {
             frame_id,
+            video_epoch: 1,
             data: vec![frame_id as u8],
             timing: Default::default(),
             frame_type,
@@ -2665,10 +2811,12 @@ mod tests {
         shared
             .accepted_generation
             .store(session.generation, Ordering::Release);
+        shared.accepted_video_epoch.store(1, Ordering::Release);
 
         for frame_id in 0..=VIDEO_QUEUE_CAPACITY as u32 {
             let frame = st_protocol::CompletedFrame {
                 frame_id,
+                video_epoch: 1,
                 data: vec![frame_id as u8],
                 timing: Default::default(),
                 frame_type: if frame_id == 0 {
@@ -2708,7 +2856,6 @@ mod tests {
     #[test]
     fn control_messages_publish_revisioned_latest_cursor_snapshot() {
         let (video_tx, video_rx) = crossbeam_channel::bounded(1);
-        let (audio_tx, audio_rx) = crossbeam_channel::bounded(1);
         let (_command_tx, command_rx) = crossbeam_channel::bounded(1);
         let (_mouse_tx, mouse_rx) = crossbeam_channel::unbounded();
         let shared = Shared {
@@ -2719,15 +2866,14 @@ mod tests {
             trackpad_router: Mutex::new(TrackpadRouter::default()),
             video_tx,
             video_rx,
-            audio_tx,
-            audio_rx,
+            audio_queue: AudioPacketQueue::new(AUDIO_QUEUE_MAX_CAPACITY, 1),
             command_rx,
             mouse_rx,
             accepted_generation: AtomicU32::new(0),
+            accepted_video_epoch: AtomicU64::new(0),
             last_stream_generation: AtomicU32::new(0),
             transport_generation: AtomicU32::new(1),
             audio_enabled_requested: AtomicBool::new(false),
-            audio_queue_limit: AtomicUsize::new(1),
         };
         let mut session = SessionState::new("127.0.0.1".parse().unwrap());
         let capabilities = InputCapabilities {
@@ -2822,7 +2968,6 @@ mod tests {
     #[test]
     fn full_audio_queue_evicts_oldest_packets() {
         let (video_tx, video_rx) = crossbeam_channel::bounded(1);
-        let (audio_tx, audio_rx) = crossbeam_channel::bounded(AUDIO_QUEUE_MAX_CAPACITY);
         let (_command_tx, command_rx) = crossbeam_channel::bounded(1);
         let (_mouse_tx, mouse_rx) = crossbeam_channel::unbounded();
         let shared = Shared {
@@ -2833,15 +2978,14 @@ mod tests {
             trackpad_router: Mutex::new(TrackpadRouter::default()),
             video_tx,
             video_rx,
-            audio_tx,
-            audio_rx,
+            audio_queue: AudioPacketQueue::new(AUDIO_QUEUE_MAX_CAPACITY, AUDIO_QUEUE_MAX_CAPACITY),
             command_rx,
             mouse_rx,
             accepted_generation: AtomicU32::new(0),
+            accepted_video_epoch: AtomicU64::new(0),
             last_stream_generation: AtomicU32::new(0),
             transport_generation: AtomicU32::new(1),
             audio_enabled_requested: AtomicBool::new(true),
-            audio_queue_limit: AtomicUsize::new(AUDIO_QUEUE_MAX_CAPACITY),
         };
         for seq in 0..AUDIO_QUEUE_MAX_CAPACITY as u16 + 3 {
             queue_audio_packet(
@@ -2854,14 +2998,14 @@ mod tests {
             );
         }
 
-        let queued: Vec<_> = shared
-            .audio_rx
-            .try_iter()
-            .map(|packet| packet.seq)
-            .collect();
+        let mut queued = Vec::new();
+        while let Some(packet) = shared.audio_queue.try_recv() {
+            queued.push((packet.seq, packet.local_discontinuity));
+        }
         assert_eq!(queued.len(), AUDIO_QUEUE_MAX_CAPACITY);
-        assert_eq!(queued[0], 3);
-        assert_eq!(queued[AUDIO_QUEUE_MAX_CAPACITY - 1], 10);
+        assert_eq!(queued[0], (3, true));
+        assert_eq!(queued[AUDIO_QUEUE_MAX_CAPACITY - 1].0, 10);
+        assert_eq!(shared.audio_queue.stats().local_drops, 3);
     }
 
     #[test]
@@ -2875,7 +3019,7 @@ mod tests {
     }
 
     #[test]
-    fn input_eligibility_requires_supported_path_and_control() {
+    fn input_eligibility_allows_every_available_ownership_state() {
         let mut eligibility = InputEligibility {
             capabilities: InputCapabilities {
                 mouse_absolute: true,
@@ -2883,11 +3027,10 @@ mod tests {
             },
             controller_state: ControllerState::OwnedByOther,
         };
-        assert!(!eligibility.allows_absolute());
-        assert!(!eligibility.allows_trackpad_delta());
-        assert!(!eligibility.allows_buttons());
+        assert!(eligibility.allows_absolute());
+        assert!(eligibility.allows_trackpad_delta());
+        assert!(eligibility.allows_buttons());
         assert!(!eligibility.allows_keyboard());
-        assert!(!eligibility.allows_text_input());
 
         eligibility.controller_state = ControllerState::Available;
         assert!(eligibility.allows_absolute());
@@ -2901,6 +3044,21 @@ mod tests {
         eligibility.capabilities.text_input = true;
         assert!(eligibility.allows_text_input());
 
+        eligibility.controller_state = ControllerState::OwnedByOther;
+        assert!(eligibility.allows_absolute());
+        assert!(eligibility.allows_trackpad_delta());
+        assert!(eligibility.allows_buttons());
+        assert!(eligibility.allows_keyboard());
+        assert!(eligibility.allows_text_input());
+
+        eligibility.controller_state = ControllerState::Unavailable;
+        assert!(!eligibility.allows_absolute());
+        assert!(!eligibility.allows_trackpad_delta());
+        assert!(!eligibility.allows_buttons());
+        assert!(!eligibility.allows_keyboard());
+        assert!(!eligibility.allows_text_input());
+
+        eligibility.controller_state = ControllerState::Available;
         eligibility.capabilities = InputCapabilities::default();
         assert!(!eligibility.allows_absolute());
         assert!(!eligibility.allows_trackpad_delta());
@@ -2992,6 +3150,67 @@ mod tests {
     }
 
     #[test]
+    fn absolute_heartbeat_preserves_only_buttons_without_replaying_position() {
+        let heartbeat = MouseHeartbeat::new(
+            InputPacket::MouseAbsolute(MouseAbsoluteInput {
+                client_id: 7,
+                x: 10,
+                y: 20,
+                buttons: 1,
+            }),
+            1,
+        );
+        assert_eq!(
+            heartbeat.packet,
+            InputPacket::MouseButtons(MouseButtonsInput {
+                client_id: 7,
+                buttons: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn ownership_handoff_does_not_clear_held_input_heartbeats() {
+        let mut session = SessionState::new("127.0.0.1".parse().unwrap());
+        session.input_capabilities = InputCapabilities {
+            mouse_absolute: true,
+            keyboard: true,
+            ..InputCapabilities::default()
+        };
+        session.controller_state = ControllerState::OwnedByYou;
+        session.mouse_heartbeat = Some(MouseHeartbeat::new(
+            InputPacket::MouseAbsolute(MouseAbsoluteInput {
+                client_id: 7,
+                x: 10,
+                y: 20,
+                buttons: 1,
+            }),
+            1,
+        ));
+        let mut pressed = [0u8; KEYBOARD_STATE_BYTES];
+        let (byte, bit) = KeyboardKey::A.bit();
+        pressed[byte] = bit;
+        session
+            .keyboard_heartbeat
+            .observe(InputPacket::KeyboardState(KeyboardStateInput {
+                client_id: 7,
+                pressed,
+            }));
+
+        session.controller_state = ControllerState::OwnedByOther;
+        session.clear_unsupported_input_heartbeats();
+
+        assert!(session.mouse_heartbeat.is_some());
+        assert_eq!(
+            session.keyboard_heartbeat.packet,
+            Some(InputPacket::KeyboardState(KeyboardStateInput {
+                client_id: 7,
+                pressed,
+            }))
+        );
+    }
+
+    #[test]
     fn punched_session_routes_control_media_and_input() {
         let client_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -3078,7 +3297,10 @@ mod tests {
                                         let (packets, _) = slicer.slice_with_meta_parts(
                                             &access_unit,
                                             1,
-                                            Default::default(),
+                                            st_protocol::FrameTimingMeta {
+                                                video_epoch: 1,
+                                                ..Default::default()
+                                            },
                                             frame_type::IDR,
                                         );
                                         for packet in packets {
@@ -3145,6 +3367,7 @@ mod tests {
         command_tx
             .send(Command::AcceptStream {
                 generation: stream.generation,
+                video_epoch: stream.video_epoch,
                 acknowledgement,
             })
             .unwrap();
@@ -3198,6 +3421,7 @@ mod tests {
                 }
             };
             let config = StreamConfig {
+                video_epoch: 1,
                 codec: VideoCodec::H264,
                 width: 1280,
                 height: 720,
@@ -3245,8 +3469,15 @@ mod tests {
             }
             let access_unit = vec![0, 0, 0, 1, 0x65, 1, 2, 3];
             let mut slicer = FrameSlicer::new();
-            let (packets, _) =
-                slicer.slice_with_meta_parts(&access_unit, 1, Default::default(), frame_type::IDR);
+            let (packets, _) = slicer.slice_with_meta_parts(
+                &access_unit,
+                1,
+                st_protocol::FrameTimingMeta {
+                    video_epoch: 1,
+                    ..Default::default()
+                },
+                frame_type::IDR,
+            );
             for packet in packets {
                 media
                     .send_to(packet, SocketAddr::new(server_addr.ip(), display.udp_port))
@@ -3332,7 +3563,7 @@ mod tests {
             assert!(Instant::now() < deadline, "stream config did not arrive");
             thread::sleep(Duration::from_millis(5));
         };
-        assert!(client.accept_stream_generation(stream.generation));
+        assert!(client.accept_stream_generation(stream.generation, stream.video_epoch));
         let unit = client
             .recv_access_unit(Duration::from_secs(3))
             .expect("video access unit did not arrive");

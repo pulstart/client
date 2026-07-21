@@ -393,6 +393,12 @@ impl UdpReceiver {
         self.inner.take_stats()
     }
 
+    fn reset_video(&mut self) {
+        self.inner.reset_video();
+        self.pending
+            .retain(|data| !matches!(data, ReceivedData::Video(_, _, _)));
+    }
+
     #[cfg(target_os = "linux")]
     fn refill_pending(&mut self) {
         use std::os::fd::AsRawFd;
@@ -557,6 +563,10 @@ impl PacketReceiver {
     pub fn take_stats(&mut self) -> Option<TransportWindowStats> {
         self.inner.take_stats()
     }
+
+    fn reset_video(&mut self) {
+        self.inner.reset_video();
+    }
 }
 
 impl MediaReceiver {
@@ -589,6 +599,13 @@ impl MediaReceiver {
         match self {
             Self::Udp(receiver) => receiver.take_stats(),
             Self::Packets(receiver) => receiver.take_stats(),
+        }
+    }
+
+    pub fn reset_video(&mut self) {
+        match self {
+            Self::Udp(receiver) => receiver.reset_video(),
+            Self::Packets(receiver) => receiver.reset_video(),
         }
     }
 }

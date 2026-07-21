@@ -96,6 +96,125 @@ class RemoteKeyboardTest {
     }
 
     @Test
+    fun virtualNumpadUsesDifferentWireKeysFromTopRow() {
+        val snapshots = mutableListOf<ByteArray>()
+        val controller = VirtualKeyboardController(RemoteKeyboardState { snapshot ->
+            snapshots += snapshot
+            true
+        })
+
+        controller.press(RemoteKey.Num1)
+        controller.release(RemoteKey.Num1)
+        controller.press(RemoteKey.Numpad1)
+
+        assertTrue(snapshots[0].isPressed(RemoteKey.Num1))
+        assertFalse(snapshots[0].isPressed(RemoteKey.Numpad1))
+        assertTrue(snapshots.last().isPressed(RemoteKey.Numpad1))
+        assertFalse(snapshots.last().isPressed(RemoteKey.Num1))
+        assertFalse(RemoteKey.Num1.wireId == RemoteKey.Numpad1.wireId)
+    }
+
+    @Test
+    fun latchedModifiersPublishCtrlAltDeleteChord() {
+        val snapshots = mutableListOf<ByteArray>()
+        val controller = VirtualKeyboardController(RemoteKeyboardState { snapshot ->
+            snapshots += snapshot
+            true
+        })
+
+        controller.toggleLatch(RemoteKey.LeftCtrl)
+        controller.toggleLatch(RemoteKey.LeftAlt)
+        controller.press(RemoteKey.Delete)
+
+        assertTrue(controller.isLatched(RemoteKey.LeftCtrl))
+        assertTrue(controller.isLatched(RemoteKey.LeftAlt))
+        assertTrue(snapshots.last().isPressed(RemoteKey.LeftCtrl))
+        assertTrue(snapshots.last().isPressed(RemoteKey.LeftAlt))
+        assertTrue(snapshots.last().isPressed(RemoteKey.Delete))
+
+        controller.release(RemoteKey.Delete)
+        assertTrue(snapshots.last().isPressed(RemoteKey.LeftCtrl))
+        assertTrue(snapshots.last().isPressed(RemoteKey.LeftAlt))
+        assertFalse(snapshots.last().isPressed(RemoteKey.Delete))
+    }
+
+    @Test
+    fun failedVirtualKeyPublicationRemainsRetryable() {
+        val attempts = mutableListOf<ByteArray>()
+        var accept = false
+        val controller = VirtualKeyboardController(RemoteKeyboardState { snapshot ->
+            attempts += snapshot
+            accept
+        })
+
+        controller.toggleLatch(RemoteKey.LeftCtrl)
+        accept = true
+        controller.retryPublication()
+
+        assertEquals(2, attempts.size)
+        assertTrue(attempts.all { it.isPressed(RemoteKey.LeftCtrl) })
+    }
+
+    @Test
+    fun closingVirtualKeyboardReleasesHeldKeysAndLatches() {
+        val snapshots = mutableListOf<ByteArray>()
+        val controller = VirtualKeyboardController(RemoteKeyboardState { snapshot ->
+            snapshots += snapshot
+            true
+        })
+        controller.toggleLatch(RemoteKey.LeftCtrl)
+        controller.press(RemoteKey.Delete)
+
+        controller.releaseAll()
+
+        assertFalse(controller.isLatched(RemoteKey.LeftCtrl))
+        assertTrue(snapshots.last().all { it == 0.toByte() })
+    }
+
+    @Test
+    fun accessibleVirtualClickHoldsThroughRepairWindowThenReleases() {
+        val snapshots = mutableListOf<ByteArray>()
+        val controller = VirtualKeyboardController(RemoteKeyboardState { snapshot ->
+            snapshots += snapshot
+            true
+        })
+        var release: (() -> Unit)? = null
+        var delayMs = 0L
+
+        performVirtualKeyClick(controller, RemoteKey.Delete) { delay, action ->
+            delayMs = delay
+            release = action
+        }
+
+        assertTrue(delayMs >= KEYBOARD_REPAIR_WINDOW_MS)
+        assertTrue(snapshots.single().isPressed(RemoteKey.Delete))
+        requireNotNull(release).invoke()
+        assertFalse(snapshots.last().isPressed(RemoteKey.Delete))
+    }
+
+    @Test
+    fun heldRepeatableVirtualKeyEmitsBalancedEdgesWithoutCountDrift() {
+        val snapshots = mutableListOf<ByteArray>()
+        val controller = VirtualKeyboardController(RemoteKeyboardState { snapshot ->
+            snapshots += snapshot
+            true
+        })
+
+        controller.press(RemoteKey.Backspace)
+        controller.repeat(RemoteKey.Backspace)
+        controller.repeat(RemoteKey.Backspace)
+        controller.release(RemoteKey.Backspace)
+
+        assertTrue(RemoteKey.Backspace.isRepeatable())
+        assertTrue(RemoteKey.ArrowLeft.isRepeatable())
+        assertTrue(RemoteKey.PageDown.isRepeatable())
+        assertFalse(RemoteKey.CapsLock.isRepeatable())
+        assertEquals(6, snapshots.size)
+        assertEquals(3, snapshots.count { it.isPressed(RemoteKey.Backspace) })
+        assertTrue(snapshots.last().all { it == 0.toByte() })
+    }
+
+    @Test
     fun failedPublicationIsRetriedAndReleaseCanStillPublish() {
         val attempts = mutableListOf<ByteArray>()
         var accept = false

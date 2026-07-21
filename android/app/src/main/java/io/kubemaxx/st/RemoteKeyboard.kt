@@ -1,18 +1,28 @@
 package io.kubemaxx.st
 
 import android.content.Context
+import android.content.res.Configuration
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.text.InputType
+import android.view.Gravity
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
+import android.widget.HorizontalScrollView
+import android.widget.LinearLayout
+import android.widget.TextView
 import java.util.ArrayDeque
+import kotlin.math.roundToInt
 
 internal enum class RemoteKey(val wireId: Int) {
     Escape(0),
@@ -327,6 +337,10 @@ internal class RemoteKeyboardState(private val publish: (ByteArray) -> Boolean) 
         publishIfChanged(force = true)
     }
 
+    fun retryPublication() {
+        publishIfChanged()
+    }
+
     private fun publishIfChanged(force: Boolean = false) {
         val next = ByteArray(KEYBOARD_STATE_BYTES)
         RemoteKey.entries.forEach { key ->
@@ -347,6 +361,355 @@ internal class RemoteKeyboardState(private val publish: (ByteArray) -> Boolean) 
     }
 }
 
+internal class VirtualKeyboardController(private val state: RemoteKeyboardState) {
+    private val latched = BooleanArray(RemoteKey.entries.size)
+    private val pressed = BooleanArray(RemoteKey.entries.size)
+    private var stateChanged: () -> Unit = {}
+
+    fun setOnStateChanged(listener: () -> Unit) {
+        stateChanged = listener
+    }
+
+    fun isLatched(key: RemoteKey): Boolean = latched[key.ordinal]
+
+    fun isPressed(key: RemoteKey): Boolean = pressed[key.ordinal]
+
+    fun toggleLatch(key: RemoteKey) {
+        require(key.isModifier()) { "$key is not a modifier" }
+        val next = !latched[key.ordinal]
+        latched[key.ordinal] = next
+        state.setSynthetic(key, next)
+        stateChanged()
+    }
+
+    fun press(key: RemoteKey) {
+        if (pressed[key.ordinal]) {
+            state.retryPublication()
+            return
+        }
+        pressed[key.ordinal] = true
+        state.setSynthetic(key, true)
+        stateChanged()
+    }
+
+    fun release(key: RemoteKey) {
+        if (!pressed[key.ordinal]) {
+            state.retryPublication()
+            return
+        }
+        pressed[key.ordinal] = false
+        state.setSynthetic(key, false)
+        stateChanged()
+    }
+
+    fun repeat(key: RemoteKey) {
+        if (!pressed[key.ordinal]) {
+            press(key)
+            return
+        }
+        state.setSynthetic(key, false)
+        state.setSynthetic(key, true)
+        stateChanged()
+    }
+
+    fun retryPublication() {
+        state.retryPublication()
+    }
+
+    fun releaseAll() {
+        latched.fill(false)
+        pressed.fill(false)
+        state.releaseAll()
+        stateChanged()
+    }
+}
+
+internal class RemoteKeyboardPanel(
+    context: Context,
+    private val controller: VirtualKeyboardController,
+    restoreIme: () -> Unit,
+) : LinearLayout(context) {
+    private data class KeySpec(val label: String, val key: RemoteKey? = null)
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val modifierButtons = mutableMapOf<RemoteKey, TextView>()
+    private val keyTouches = mutableListOf<VirtualKeyTouch>()
+
+    init {
+        orientation = if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
+            HORIZONTAL
+        } else {
+            VERTICAL
+        }
+        setPadding(dp(4), dp(4), dp(4), dp(4))
+        background = keyBackground(PANEL_COLOR, dp(10).toFloat())
+        elevation = dp(12).toFloat()
+        contentDescription = "Remote PC keyboard controls"
+
+        addKeyRow(buildList {
+            add(KeySpec("IME"))
+            add(KeySpec("Esc", RemoteKey.Escape))
+            val functionKeys = RemoteKey.entries
+                .subList(RemoteKey.F1.ordinal, RemoteKey.F12.ordinal + 1) +
+                RemoteKey.entries.subList(RemoteKey.F13.ordinal, RemoteKey.F24.ordinal + 1)
+            functionKeys.forEach { add(KeySpec(it.name, it)) }
+            add(KeySpec("PrtSc", RemoteKey.PrintScreen))
+            add(KeySpec("ScrLk", RemoteKey.ScrollLock))
+            add(KeySpec("Pause", RemoteKey.Pause))
+            add(KeySpec("Ins", RemoteKey.Insert))
+            add(KeySpec("Del", RemoteKey.Delete))
+            add(KeySpec("Home", RemoteKey.Home))
+            add(KeySpec("End", RemoteKey.End))
+            add(KeySpec("PgUp", RemoteKey.PageUp))
+            add(KeySpec("PgDn", RemoteKey.PageDown))
+            add(KeySpec("Menu", RemoteKey.Application))
+            add(KeySpec("Prev", RemoteKey.MediaPrevious))
+            add(KeySpec("Play", RemoteKey.MediaPlayPause))
+            add(KeySpec("Next", RemoteKey.MediaNext))
+            add(KeySpec("Stop", RemoteKey.MediaStop))
+            add(KeySpec("Mute", RemoteKey.VolumeMute))
+            add(KeySpec("Vol-", RemoteKey.VolumeDown))
+            add(KeySpec("Vol+", RemoteKey.VolumeUp))
+        }, restoreIme)
+        addKeyRow(
+            listOf(
+                KeySpec("Ctrl", RemoteKey.LeftCtrl),
+                KeySpec("Shift", RemoteKey.LeftShift),
+                KeySpec("Alt", RemoteKey.LeftAlt),
+                KeySpec("Win", RemoteKey.LeftMeta),
+                KeySpec("Tab", RemoteKey.Tab),
+                KeySpec("Bksp", RemoteKey.Backspace),
+                KeySpec("Enter", RemoteKey.Enter),
+                KeySpec("Left", RemoteKey.ArrowLeft),
+                KeySpec("Up", RemoteKey.ArrowUp),
+                KeySpec("Down", RemoteKey.ArrowDown),
+                KeySpec("Right", RemoteKey.ArrowRight),
+                KeySpec("Num", RemoteKey.NumLock),
+                KeySpec("N/", RemoteKey.NumpadDivide),
+                KeySpec("N*", RemoteKey.NumpadMultiply),
+                KeySpec("N-", RemoteKey.NumpadSubtract),
+                KeySpec("N+", RemoteKey.NumpadAdd),
+                KeySpec("N7", RemoteKey.Numpad7),
+                KeySpec("N8", RemoteKey.Numpad8),
+                KeySpec("N9", RemoteKey.Numpad9),
+                KeySpec("N4", RemoteKey.Numpad4),
+                KeySpec("N5", RemoteKey.Numpad5),
+                KeySpec("N6", RemoteKey.Numpad6),
+                KeySpec("N1", RemoteKey.Numpad1),
+                KeySpec("N2", RemoteKey.Numpad2),
+                KeySpec("N3", RemoteKey.Numpad3),
+                KeySpec("N0", RemoteKey.Numpad0),
+                KeySpec("N.", RemoteKey.NumpadDecimal),
+                KeySpec("NEnt", RemoteKey.NumpadEnter),
+            ),
+            restoreIme,
+        )
+        controller.setOnStateChanged(::refreshModifiers)
+    }
+
+    fun cancelTouches() {
+        keyTouches.forEach(VirtualKeyTouch::cancel)
+        handler.removeCallbacksAndMessages(null)
+    }
+
+    private fun addKeyRow(keys: List<KeySpec>, restoreIme: () -> Unit) {
+        val row = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        keys.forEach { spec ->
+            val button = keyButton(spec.label)
+            val params = LayoutParams(buttonWidth(spec.label), dp(KEY_HEIGHT_DP)).apply {
+                marginEnd = dp(3)
+            }
+            row.addView(button, params)
+            if (spec.key == null) {
+                button.setOnClickListener { restoreIme() }
+            } else {
+                val touch = VirtualKeyTouch(button, spec.key)
+                keyTouches += touch
+                button.setOnTouchListener(touch)
+                button.setOnClickListener { touch.performKeyClick() }
+                if (spec.key.isModifier()) modifierButtons[spec.key] = button
+            }
+        }
+        val scroll = HorizontalScrollView(context).apply {
+            isHorizontalScrollBarEnabled = false
+            isFillViewport = true
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+            addView(
+                row,
+                ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+        }
+        val params = if (orientation == HORIZONTAL) {
+            LayoutParams(0, dp(KEY_HEIGHT_DP + 3), 1f).apply { marginEnd = dp(3) }
+        } else {
+            LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(KEY_HEIGHT_DP + 3))
+        }
+        addView(scroll, params)
+    }
+
+    private fun keyButton(label: String) = TextView(context).apply {
+        text = label
+        gravity = Gravity.CENTER
+        setTextColor(Color.WHITE)
+        textSize = 12f
+        isClickable = true
+        isFocusable = false
+        isFocusableInTouchMode = false
+        contentDescription = if (label == "IME") "Show Android text keyboard" else "$label remote key"
+        background = keyBackground(KEY_COLOR, dp(6).toFloat())
+    }
+
+    private fun refreshModifiers() {
+        modifierButtons.forEach { (key, button) ->
+            button.background = keyBackground(
+                if (controller.isLatched(key)) LATCHED_COLOR else KEY_COLOR,
+                dp(6).toFloat(),
+            )
+            button.isSelected = controller.isLatched(key)
+        }
+    }
+
+    private fun setPressed(button: TextView, key: RemoteKey, pressed: Boolean) {
+        if (key.isModifier()) return
+        button.background = keyBackground(
+            if (pressed) PRESSED_COLOR else KEY_COLOR,
+            dp(6).toFloat(),
+        )
+    }
+
+    private fun keyBackground(color: Int, radius: Float) = GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = radius
+        setStroke(dp(1), KEY_BORDER_COLOR)
+    }
+
+    private fun buttonWidth(label: String): Int = dp((label.length * 9 + 20).coerceAtLeast(46))
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).roundToInt()
+
+    private inner class VirtualKeyTouch(
+        private val button: TextView,
+        private val key: RemoteKey,
+    ) : OnTouchListener {
+        private var active = false
+        private var downSent = false
+        private var pressedAtMs = 0L
+        private var pendingRelease: Runnable? = null
+        private val repeatKey = object : Runnable {
+            override fun run() {
+                if (!active || !downSent || !key.isRepeatable()) return
+                controller.repeat(key)
+                handler.postDelayed(this, VIRTUAL_KEY_REPEAT_INTERVAL_MS)
+            }
+        }
+
+        override fun onTouch(view: View, event: MotionEvent): Boolean {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    cancelPendingRelease()
+                    handler.removeCallbacks(repeatKey)
+                    active = true
+                    pressedAtMs = event.eventTime
+                    button.isPressed = true
+                    setPressed(button, key, true)
+                    if (!key.isModifier()) {
+                        if (downSent || controller.isPressed(key)) {
+                            controller.repeat(key)
+                        } else {
+                            controller.press(key)
+                        }
+                        downSent = true
+                        if (key.isRepeatable()) {
+                            handler.postDelayed(repeatKey, VIRTUAL_KEY_REPEAT_DELAY_MS)
+                        }
+                    }
+                }
+
+                MotionEvent.ACTION_UP -> {
+                    if (active) {
+                        view.performClick()
+                    }
+                }
+
+                MotionEvent.ACTION_CANCEL -> cancel()
+            }
+            return true
+        }
+
+        fun performKeyClick() {
+            handler.removeCallbacks(repeatKey)
+            if (active) {
+                if (key.isModifier()) {
+                    controller.toggleLatch(key)
+                } else {
+                    val heldMs = (SystemClock.uptimeMillis() - pressedAtMs).coerceAtLeast(0)
+                    scheduleRelease((VIRTUAL_KEY_MIN_HOLD_MS - heldMs).coerceAtLeast(0)) {
+                        controller.release(key)
+                    }
+                }
+                resetVisualState()
+                return
+            }
+            if (key.isModifier()) {
+                controller.toggleLatch(key)
+                return
+            }
+            cancelPendingRelease()
+            performVirtualKeyClick(controller, key) { delayMs, release ->
+                downSent = true
+                scheduleRelease(delayMs, release)
+            }
+        }
+
+        fun cancel() {
+            cancelPendingRelease()
+            handler.removeCallbacks(repeatKey)
+            if (downSent) controller.release(key)
+            downSent = false
+            resetVisualState()
+        }
+
+        private fun resetVisualState() {
+            active = false
+            button.isPressed = false
+            setPressed(button, key, false)
+        }
+
+        private fun scheduleRelease(delayMs: Long, release: () -> Unit) {
+            cancelPendingRelease()
+            lateinit var task: Runnable
+            task = Runnable {
+                if (pendingRelease !== task) return@Runnable
+                pendingRelease = null
+                release()
+                downSent = false
+            }
+            pendingRelease = task
+            handler.postDelayed(task, delayMs)
+        }
+
+        private fun cancelPendingRelease() {
+            pendingRelease?.let(handler::removeCallbacks)
+            pendingRelease = null
+        }
+    }
+
+    private companion object {
+        const val KEY_HEIGHT_DP = 38
+        val PANEL_COLOR = Color.argb(238, 18, 22, 29)
+        val KEY_COLOR = Color.rgb(49, 55, 67)
+        val PRESSED_COLOR = Color.rgb(35, 111, 149)
+        val LATCHED_COLOR = Color.rgb(29, 139, 184)
+        val KEY_BORDER_COLOR = Color.argb(140, 150, 158, 175)
+    }
+}
+
 internal class RemoteKeyboardView(
     context: Context,
     publish: (ByteArray) -> Boolean,
@@ -356,6 +719,7 @@ internal class RemoteKeyboardView(
 ) : View(context) {
     private val handler = Handler(Looper.getMainLooper())
     private val state = RemoteKeyboardState(publish)
+    val virtualKeys = VirtualKeyboardController(state)
     private val pendingStrokes = ArrayDeque<RemoteKeyStroke>()
     private val eventModifiers = mutableMapOf<Int, List<RemoteKey>>()
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -443,16 +807,15 @@ internal class RemoteKeyboardView(
         currentStroke = null
         composingText = ""
         composingCursor = 0
-        state.releaseAll()
+        virtualKeys.releaseAll()
     }
 
     override fun onCheckIsTextEditor(): Boolean = true
 
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
-        outAttrs.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
-            InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        outAttrs.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
         outAttrs.imeOptions = EditorInfo.IME_ACTION_NONE or EditorInfo.IME_FLAG_NO_FULLSCREEN or
-            EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+            EditorInfo.IME_FLAG_NO_EXTRACT_UI
         outAttrs.initialSelStart = 0
         outAttrs.initialSelEnd = 0
         return object : BaseInputConnection(this, true) {
@@ -631,7 +994,7 @@ internal class RemoteKeyboardView(
     }
 
     private companion object {
-        const val KEY_HOLD_MS = 60L
+        const val KEY_HOLD_MS = VIRTUAL_KEY_MIN_HOLD_MS
         const val KEY_GAP_MS = 8L
         const val MAX_QUEUED_DELETES = 128
     }
@@ -717,6 +1080,15 @@ internal fun committedTextChunks(text: String, maxBytes: Int = MAX_TEXT_INPUT_BY
     return chunks
 }
 
+internal fun performVirtualKeyClick(
+    controller: VirtualKeyboardController,
+    key: RemoteKey,
+    scheduleRelease: (Long, () -> Unit) -> Unit,
+) {
+    if (controller.isPressed(key)) controller.repeat(key) else controller.press(key)
+    scheduleRelease(VIRTUAL_KEY_MIN_HOLD_MS) { controller.release(key) }
+}
+
 private inline fun String.countCodePoints(predicate: (Int) -> Boolean): Int {
     var count = 0
     var index = 0
@@ -728,7 +1100,7 @@ private inline fun String.countCodePoints(predicate: (Int) -> Boolean): Int {
     return count
 }
 
-private fun RemoteKey.isModifier(): Boolean = when (this) {
+internal fun RemoteKey.isModifier(): Boolean = when (this) {
     RemoteKey.LeftShift,
     RemoteKey.LeftCtrl,
     RemoteKey.LeftAlt,
@@ -741,4 +1113,45 @@ private fun RemoteKey.isModifier(): Boolean = when (this) {
     else -> false
 }
 
+internal fun RemoteKey.isRepeatable(): Boolean = when (this) {
+    RemoteKey.Tab,
+    RemoteKey.Backspace,
+    RemoteKey.Enter,
+    RemoteKey.Space,
+    RemoteKey.Insert,
+    RemoteKey.Delete,
+    RemoteKey.Home,
+    RemoteKey.End,
+    RemoteKey.PageUp,
+    RemoteKey.PageDown,
+    RemoteKey.ArrowUp,
+    RemoteKey.ArrowDown,
+    RemoteKey.ArrowLeft,
+    RemoteKey.ArrowRight,
+    RemoteKey.Numpad0,
+    RemoteKey.Numpad1,
+    RemoteKey.Numpad2,
+    RemoteKey.Numpad3,
+    RemoteKey.Numpad4,
+    RemoteKey.Numpad5,
+    RemoteKey.Numpad6,
+    RemoteKey.Numpad7,
+    RemoteKey.Numpad8,
+    RemoteKey.Numpad9,
+    RemoteKey.NumpadDecimal,
+    RemoteKey.NumpadDivide,
+    RemoteKey.NumpadMultiply,
+    RemoteKey.NumpadSubtract,
+    RemoteKey.NumpadAdd,
+    RemoteKey.NumpadEnter,
+    RemoteKey.NumpadEquals,
+    RemoteKey.NumpadComma,
+    -> true
+    else -> false
+}
+
 private const val MAX_TEXT_INPUT_BYTES = 4096
+internal const val KEYBOARD_REPAIR_WINDOW_MS = 200L
+internal const val VIRTUAL_KEY_MIN_HOLD_MS = KEYBOARD_REPAIR_WINDOW_MS
+internal const val VIRTUAL_KEY_REPEAT_DELAY_MS = 400L
+internal const val VIRTUAL_KEY_REPEAT_INTERVAL_MS = 80L

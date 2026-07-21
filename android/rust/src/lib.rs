@@ -2,8 +2,8 @@ use jni::objects::{JByteArray, JByteBuffer, JClass, JString};
 use jni::sys::{jboolean, jbyteArray, jint, jintArray, jlong, jstring};
 use jni::JNIEnv;
 use st_client_core::{
-    ApiConnectionConfig, AudioPacket, Client, ClientConfig, ControlSnapshot, ControllerState,
-    InputCapabilities, LanDiscovery, TrackpadRoute, KEYBOARD_STATE_BYTES,
+    ApiConnectionConfig, Client, ClientConfig, ControlSnapshot, ControllerState, InputCapabilities,
+    LanDiscovery, QueuedAudioPacket as AudioPacket, TrackpadRoute, KEYBOARD_STATE_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -14,6 +14,7 @@ use std::time::Duration;
 
 const AUDIO_SAMPLE_RATE: u32 = 48_000;
 const AUDIO_CHANNELS: usize = 2;
+const AUDIO_SMOOTHING_MS: usize = 2;
 const MAX_RECOVERY_MS: usize = 60;
 const MAX_AUDIO_POLL_MS: u64 = 50;
 const AUDIO_FILL_BUFFER_ERROR: jint = -1;
@@ -247,6 +248,19 @@ enum RecoveryStep {
     Plc,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoverySource {
+    Redundant,
+    Fec,
+    Plc,
+}
+
+impl RecoverySource {
+    fn is_synthetic(self) -> bool {
+        matches!(self, Self::Fec | Self::Plc)
+    }
+}
+
 fn plan_recovery(
     expected_seq: Option<u16>,
     primary_seq: u16,
@@ -322,6 +336,21 @@ impl AudioDecoder {
 
     fn decode_packet(&mut self, packet: &AudioPacket) -> Result<DecodedAudio<'_>, String> {
         self.output.clear();
+        if packet.local_discontinuity {
+            self.reset()?;
+            if let Err(error) = self.decode_frame(&packet.data, false) {
+                let _ = self.reset();
+                return Err(format!("failed to decode Opus primary packet: {error}"));
+            }
+            fade_in_audio(&mut self.output, AUDIO_CHANNELS, audio_smoothing_frames());
+            self.expected_seq = Some(packet.seq.wrapping_add(1));
+            return Ok(DecodedAudio {
+                pcm: &self.output,
+                hard_resync: true,
+            });
+        }
+
+        let mut previous_recovery = None;
         let hard_resync = match plan_recovery(
             self.expected_seq,
             packet.seq,
@@ -331,7 +360,21 @@ impl AudioDecoder {
             RecoveryPlan::InOrder => false,
             RecoveryPlan::Recover(steps) => {
                 for step in steps {
-                    self.recover_frame(step, packet)?;
+                    let start = self.output.len();
+                    let source = self.recover_frame(step, packet)?;
+                    let end = self.output.len();
+                    if let Some((previous_start, previous_end, previous_source)) = previous_recovery
+                    {
+                        smooth_synthetic_to_next(
+                            &mut self.output,
+                            previous_start,
+                            previous_end,
+                            start,
+                            end,
+                            previous_source,
+                        );
+                    }
+                    previous_recovery = Some((start, end, source));
                 }
                 false
             }
@@ -347,10 +390,25 @@ impl AudioDecoder {
             }
         };
 
+        let primary_start = self.output.len();
         if let Err(error) = self.decode_frame(&packet.data, false) {
             self.output.clear();
             let _ = self.reset();
             return Err(format!("failed to decode Opus primary packet: {error}"));
+        }
+        if let Some((previous_start, previous_end, previous_source)) = previous_recovery {
+            let primary_end = self.output.len();
+            smooth_synthetic_to_next(
+                &mut self.output,
+                previous_start,
+                previous_end,
+                primary_start,
+                primary_end,
+                previous_source,
+            );
+        }
+        if hard_resync {
+            fade_in_audio(&mut self.output, AUDIO_CHANNELS, audio_smoothing_frames());
         }
         self.expected_seq = Some(packet.seq.wrapping_add(1));
         Ok(DecodedAudio {
@@ -359,31 +417,37 @@ impl AudioDecoder {
         })
     }
 
-    fn recover_frame(&mut self, step: RecoveryStep, packet: &AudioPacket) -> Result<(), String> {
-        let recovered = match step {
+    fn recover_frame(
+        &mut self,
+        step: RecoveryStep,
+        packet: &AudioPacket,
+    ) -> Result<RecoverySource, String> {
+        match step {
             RecoveryStep::Redundant {
                 index,
                 immediate_before_primary,
             } => {
                 let redundant = packet.redundant_prev.get(index).map(Vec::as_slice);
-                let decoded = redundant.is_some_and(|data| self.decode_frame(data, false).is_ok());
-                if decoded {
-                    true
-                } else if immediate_before_primary {
-                    self.decode_frame(&packet.data, true).is_ok()
+                if redundant.is_some_and(|data| self.decode_frame(data, false).is_ok()) {
+                    Ok(RecoverySource::Redundant)
+                } else if immediate_before_primary && self.decode_frame(&packet.data, true).is_ok()
+                {
+                    Ok(RecoverySource::Fec)
                 } else {
-                    false
+                    self.decode_plc()
                 }
             }
-            RecoveryStep::Fec => self.decode_frame(&packet.data, true).is_ok(),
-            RecoveryStep::Plc => false,
-        };
-        if recovered {
-            Ok(())
-        } else {
-            self.decode_frame(&[], false)
-                .map_err(|error| format!("Opus packet-loss concealment failed: {error}"))
+            RecoveryStep::Fec if self.decode_frame(&packet.data, true).is_ok() => {
+                Ok(RecoverySource::Fec)
+            }
+            RecoveryStep::Fec | RecoveryStep::Plc => self.decode_plc(),
         }
+    }
+
+    fn decode_plc(&mut self) -> Result<RecoverySource, String> {
+        self.decode_frame(&[], false)
+            .map(|()| RecoverySource::Plc)
+            .map_err(|error| format!("Opus packet-loss concealment failed: {error}"))
     }
 
     fn decode_frame(&mut self, data: &[u8], fec: bool) -> Result<(), String> {
@@ -411,6 +475,80 @@ impl AudioDecoder {
         }
         self.output.extend_from_slice(&self.scratch);
         Ok(())
+    }
+}
+
+fn audio_smoothing_frames() -> usize {
+    AUDIO_SAMPLE_RATE as usize * AUDIO_SMOOTHING_MS / 1_000
+}
+
+fn smooth_audio_transition(
+    previous: &mut [i16],
+    current: &[i16],
+    channels: usize,
+    max_frames: usize,
+) {
+    if channels == 0 {
+        return;
+    }
+    let frames = (previous.len() / channels)
+        .min(current.len() / channels)
+        .min(max_frames);
+    if frames == 0 {
+        return;
+    }
+    let previous_start = previous.len() - frames * channels;
+    let denominator = (frames + 1) as i32;
+    for frame in 0..frames {
+        let current_weight = (frame + 1) as i32;
+        let previous_weight = denominator - current_weight;
+        for (channel, current_sample) in current.iter().take(channels).enumerate() {
+            let previous_index = previous_start + frame * channels + channel;
+            let previous_sample = previous[previous_index] as i32;
+            previous[previous_index] = ((previous_sample * previous_weight
+                + i32::from(*current_sample) * current_weight)
+                / denominator) as i16;
+        }
+    }
+}
+
+fn smooth_synthetic_to_next(
+    output: &mut [i16],
+    previous_start: usize,
+    previous_end: usize,
+    next_start: usize,
+    next_end: usize,
+    previous_source: RecoverySource,
+) {
+    if !previous_source.is_synthetic()
+        || previous_start > previous_end
+        || previous_end > next_start
+        || next_start > next_end
+        || next_end > output.len()
+    {
+        return;
+    }
+    let (previous, next) = output.split_at_mut(next_start);
+    smooth_audio_transition(
+        &mut previous[previous_start..previous_end],
+        &next[..next_end - next_start],
+        AUDIO_CHANNELS,
+        audio_smoothing_frames(),
+    );
+}
+
+fn fade_in_audio(current: &mut [i16], channels: usize, max_frames: usize) {
+    if channels == 0 {
+        return;
+    }
+    let frames = (current.len() / channels).min(max_frames);
+    let denominator = (frames + 1) as i32;
+    for frame in 0..frames {
+        let weight = (frame + 1) as i32;
+        for channel in 0..channels {
+            let index = frame * channels + channel;
+            current[index] = (current[index] as i32 * weight / denominator) as i16;
+        }
     }
 }
 
@@ -699,6 +837,25 @@ pub extern "system" fn Java_io_kubemaxx_st_NativeBridge_nativeGetStatus(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_io_kubemaxx_st_NativeBridge_nativeGetAudioQueueStats(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    epoch: jlong,
+) -> jlong {
+    jni_boundary!(0, {
+        let Some(stats) = session(handle)
+            .and_then(|session| session.with_client(epoch, |client| client.audio_queue_stats()))
+        else {
+            return 0;
+        };
+        let occupancy = stats.occupancy.min(u32::MAX as usize) as u64;
+        let local_drops = stats.local_drops.min(u32::MAX as u64);
+        ((local_drops << 32) | occupancy) as jlong
+    })
+}
+
+#[no_mangle]
 pub extern "system" fn Java_io_kubemaxx_st_NativeBridge_nativeTakeStreamConfig(
     env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -712,12 +869,14 @@ pub extern "system" fn Java_io_kubemaxx_st_NativeBridge_nativeTakeStreamConfig(
         else {
             return ptr::null_mut();
         };
-        let Ok(array) = env.new_int_array(10) else {
+        let Ok(array) = env.new_int_array(12) else {
             return ptr::null_mut();
         };
         let values = [
             config.transport_generation as jint,
             config.generation as jint,
+            (config.video_epoch >> 32) as u32 as jint,
+            config.video_epoch as u32 as jint,
             config.width as jint,
             config.height as jint,
             config.cursor_width as jint,
@@ -1123,12 +1282,16 @@ pub extern "system" fn Java_io_kubemaxx_st_NativeBridge_nativeAcceptStreamGenera
     handle: jlong,
     epoch: jlong,
     generation: jint,
+    video_epoch: jlong,
 ) -> jboolean {
     jni_boundary!(0, {
         if let Some(session) = session(handle) {
             return session
                 .with_client(epoch, |client| {
-                    client.accept_stream_generation(generation.max(0) as u32)
+                    client.accept_stream_generation(
+                        generation.max(0) as u32,
+                        video_epoch.max(0) as u64,
+                    )
                 })
                 .map_or(0, u8::from);
         }
@@ -1180,6 +1343,20 @@ mod tests {
 
     fn config(packet_duration_ms: u8) -> AudioConfig {
         AudioConfig::new(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS as u8, packet_duration_ms).unwrap()
+    }
+
+    fn encoded_silence(config: AudioConfig) -> Vec<u8> {
+        let pcm = vec![0i16; config.frame_samples()];
+        let mut encoded = vec![0u8; 4_000];
+        let mut encoder = opus::Encoder::new(
+            AUDIO_SAMPLE_RATE,
+            opus::Channels::Stereo,
+            opus::Application::LowDelay,
+        )
+        .unwrap();
+        let encoded_len = encoder.encode(&pcm, &mut encoded).unwrap();
+        encoded.truncate(encoded_len);
+        encoded
     }
 
     #[test]
@@ -1332,6 +1509,9 @@ mod tests {
             plan_recovery(Some(20), 22, 0, config(20)),
             RecoveryPlan::Recover(vec![RecoveryStep::Plc, RecoveryStep::Fec])
         );
+        assert!(!RecoverySource::Redundant.is_synthetic());
+        assert!(RecoverySource::Fec.is_synthetic());
+        assert!(RecoverySource::Plc.is_synthetic());
     }
 
     #[test]
@@ -1376,6 +1556,70 @@ mod tests {
     }
 
     #[test]
+    fn local_discontinuity_decodes_only_primary_and_resets_sequence() {
+        let config = config(5);
+        let encoded = encoded_silence(config);
+        let mut decoder = AudioDecoder::new(config).unwrap();
+        decoder
+            .decode_packet(&AudioPacket {
+                seq: 7,
+                data: encoded.clone(),
+                redundant_prev: Vec::new(),
+                local_discontinuity: false,
+            })
+            .unwrap();
+
+        let output = decoder
+            .decode_packet(&AudioPacket {
+                seq: 20,
+                data: encoded.clone(),
+                redundant_prev: vec![encoded.clone(), encoded],
+                local_discontinuity: true,
+            })
+            .unwrap();
+        assert!(output.hard_resync);
+        assert_eq!(output.pcm.len(), config.frame_samples());
+        assert_eq!(decoder.expected_seq, Some(21));
+    }
+
+    #[test]
+    fn smoothing_keeps_interleaved_channels_isolated_and_next_frame_exact() {
+        let mut previous = [1_000, -10_000, 3_000, -12_000];
+        let current = [4_000, 2_000, 6_000, 4_000];
+
+        smooth_audio_transition(&mut previous, &current, 2, 2);
+
+        assert_eq!(previous, [2_000, -6_000, 3_666, -2_666]);
+        assert_eq!(current, [4_000, 2_000, 6_000, 4_000]);
+    }
+
+    #[test]
+    fn hard_resync_fades_in_without_a_discarded_previous_tail() {
+        let mut current = [3_000, -12_000, 6_000, -15_000];
+
+        fade_in_audio(&mut current, 2, 2);
+
+        assert_eq!(current, [1_000, -4_000, 4_000, -10_000]);
+    }
+
+    #[test]
+    fn every_synthetic_boundary_is_smoothed_without_changing_redundancy() {
+        let mut output = [
+            1_000, -10_000, 3_000, -12_000, // PLC
+            4_000, 2_000, 6_000, 4_000, // FEC
+            7_000, -7_000, 8_000, -8_000, // verbatim redundancy
+        ];
+        let redundancy = output[8..].to_vec();
+
+        smooth_synthetic_to_next(&mut output, 0, 4, 4, 8, RecoverySource::Plc);
+        smooth_synthetic_to_next(&mut output, 4, 8, 8, 12, RecoverySource::Fec);
+
+        assert_ne!(&output[0..4], &[1_000, -10_000, 3_000, -12_000]);
+        assert_ne!(&output[4..8], &[4_000, 2_000, 6_000, 4_000]);
+        assert_eq!(&output[8..], redundancy);
+    }
+
+    #[test]
     fn jni_boundary_returns_its_safe_sentinel_after_panic() {
         let value = jni_boundary!(17, { panic!("test JNI panic") });
         assert_eq!(value, 17);
@@ -1398,16 +1642,7 @@ mod tests {
     #[test]
     fn opus_decode_produces_exact_negotiated_slice() {
         let config = config(5);
-        let pcm = vec![0i16; config.frame_samples()];
-        let mut encoded = vec![0u8; 4_000];
-        let mut encoder = opus::Encoder::new(
-            AUDIO_SAMPLE_RATE,
-            opus::Channels::Stereo,
-            opus::Application::LowDelay,
-        )
-        .unwrap();
-        let encoded_len = encoder.encode(&pcm, &mut encoded).unwrap();
-        encoded.truncate(encoded_len);
+        let encoded = encoded_silence(config);
 
         let mut decoder = AudioDecoder::new(config).unwrap();
         let output = decoder
@@ -1415,6 +1650,7 @@ mod tests {
                 seq: u16::MAX,
                 data: encoded.clone(),
                 redundant_prev: Vec::new(),
+                local_discontinuity: false,
             })
             .unwrap();
         assert_eq!(output.pcm.len(), config.frame_samples());
@@ -1425,6 +1661,7 @@ mod tests {
                 seq: 0,
                 data: encoded.clone(),
                 redundant_prev: Vec::new(),
+                local_discontinuity: false,
             })
             .unwrap();
         assert_eq!(output.pcm.len(), config.frame_samples());
@@ -1437,6 +1674,7 @@ mod tests {
                 seq: 400,
                 data: encoded,
                 redundant_prev: Vec::new(),
+                local_discontinuity: false,
             })
             .unwrap();
         assert!(output.hard_resync);

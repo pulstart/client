@@ -81,6 +81,7 @@ internal class CursorOverlayView(
         }
         val wasInputEligible = inputEligible()
         val wasDrawable = cursorIsDrawable()
+        var reseedForOwnership = false
         update.capabilities?.let {
             if (it.revision != capabilitiesRevision) {
                 capabilitiesRevision = it.revision
@@ -98,6 +99,11 @@ internal class CursorOverlayView(
         update.controllerState?.let {
             if (it.revision != controllerRevision) {
                 controllerRevision = it.revision
+                reseedForOwnership = shouldReseedPredictionForOwnership(
+                    controllerState,
+                    it.value,
+                    capabilities?.cursorPositionReliable == true,
+                )
                 controllerState = it.value
             }
         }
@@ -120,6 +126,10 @@ internal class CursorOverlayView(
         val drawable = cursorIsDrawable()
         when {
             !inputEligible || !drawable -> resetPrediction()
+            reseedForOwnership -> {
+                resetPrediction()
+                initializePrediction()
+            }
             !wasInputEligible || !wasDrawable -> {
                 resetPrediction()
                 initializePrediction()
@@ -356,8 +366,7 @@ internal class CursorOverlayView(
 
     private fun inputEligible(): Boolean {
         val capabilities = capabilities ?: return false
-        val ownershipEligible = controllerState == ControllerOwnership.AVAILABLE ||
-            controllerState == ControllerOwnership.OWNED_BY_YOU
+        val ownershipEligible = controllerState?.let(::controllerOwnershipAllowsInput) == true
         return ownershipEligible && (capabilities.mouseRelative || capabilities.mouseAbsolute)
     }
 

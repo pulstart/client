@@ -1,11 +1,66 @@
 package io.kubemaxx.st
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 class ResourceLifecycleTest {
+    @Test
+    fun audioStopSignalsWithoutWaitingForBlockedWorker() {
+        val running = AtomicBoolean(true)
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val worker = Thread {
+            entered.countDown()
+            while (release.count > 0) {
+                try {
+                    release.await()
+                } catch (_: InterruptedException) {
+                    // Simulate a platform write that does not unblock on interrupt.
+                }
+            }
+        }.apply { start() }
+        try {
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+
+            val startedAt = System.nanoTime()
+            requestAudioWorkerStop(running, worker)
+            val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+
+            assertTrue("stop took ${elapsedMs}ms", elapsedMs < 100)
+            assertFalse(running.get())
+            assertTrue(worker.isAlive)
+        } finally {
+            release.countDown()
+            worker.join(1_000)
+        }
+        assertFalse(worker.isAlive)
+    }
+
+    @Test
+    fun audioRuntimeTerminationClearsSlotForOneRetryAndOneRelease() {
+        val slot = AudioPlayerSlot<Any>()
+        val player = Any()
+        slot.started(player, 7)
+
+        assertTrue(slot.terminated(player))
+        assertFalse(slot.terminated(player))
+        assertTrue(slot.canStart(7))
+
+        val replacement = Any()
+        slot.started(replacement, 7)
+        assertSame(replacement, slot.retireActive())
+        assertFalse(slot.canStart(8))
+        assertTrue(slot.terminated(replacement))
+        assertTrue(slot.canStart(8))
+    }
+
     @Test
     fun invalidAudioTrackIsReleasedBeforeValidationFailureEscapes() {
         val track = Any()

@@ -24,10 +24,14 @@ internal class AvcSurfaceDecoder(
         worker.start()
     }
 
-    @Synchronized
     fun stop(): Boolean {
         running.set(false)
-        worker.join(500)
+        return !worker.isAlive
+    }
+
+    fun stopAndWait(timeoutMs: Long): Boolean {
+        running.set(false)
+        worker.join(timeoutMs.coerceAtLeast(0))
         return !worker.isAlive
     }
 

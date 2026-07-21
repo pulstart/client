@@ -4,10 +4,13 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.os.Build
+import android.os.Process
 import android.os.SystemClock
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 import kotlin.math.min
 
@@ -16,14 +19,19 @@ internal class AndroidAudioPlayer(
     private val sessionEpoch: Long,
     private val stream: StreamDescription,
     private val onStatus: (String) -> Unit,
+    private val onTerminated: (String?) -> Unit,
 ) {
+    private val started = AtomicBoolean(false)
+    private val stopRequested = AtomicBoolean(false)
     private val running = AtomicBoolean(false)
     private val resetRequested = AtomicBoolean(false)
+    private val underrunEvents = AtomicLong(0)
+    private val activePrebufferMs = AtomicInteger(MIN_PREBUFFER_MS)
+    @Volatile
     private var worker: Thread? = null
 
-    @Synchronized
     fun start(): String? {
-        if (running.get()) return null
+        if (!started.compareAndSet(false, true)) return null
         val configureError = NativeBridge.nativeConfigureAudio(
             nativeHandle,
             sessionEpoch,
@@ -32,10 +40,15 @@ internal class AndroidAudioPlayer(
             stream.packetDurationMs,
         )
         if (configureError != null) return configureError
+        if (stopRequested.get()) return "audio start cancelled"
         val track = try {
             createAudioTrack()
         } catch (error: Exception) {
             return "audio output error: ${error.message ?: error.javaClass.simpleName}"
+        }
+        if (stopRequested.get()) {
+            releaseTrack(track)
+            return "audio start cancelled"
         }
         val enableError = NativeBridge.nativeSetAudioEnabled(nativeHandle, sessionEpoch, true)
         if (enableError != null) {
@@ -46,33 +59,22 @@ internal class AndroidAudioPlayer(
         running.set(true)
         val nextWorker = Thread({ playbackLoop(track) }, "st-audiotrack")
         worker = nextWorker
+        if (stopRequested.get()) running.set(false)
         try {
             nextWorker.start()
         } catch (error: RuntimeException) {
             worker = null
             running.set(false)
-            NativeBridge.nativeSetAudioEnabled(nativeHandle, sessionEpoch, false)
+            runCatching { NativeBridge.nativeSetAudioEnabled(nativeHandle, sessionEpoch, false) }
             releaseTrack(track)
             return "audio worker error: ${error.message ?: error.javaClass.simpleName}"
         }
         return null
     }
 
-    @Synchronized
     fun stop() {
-        running.set(false)
-        NativeBridge.nativeSetAudioEnabled(nativeHandle, sessionEpoch, false)
-        val activeWorker = worker
-        var interrupted = false
-        while (activeWorker?.isAlive == true) {
-            try {
-                activeWorker.join()
-            } catch (_: InterruptedException) {
-                interrupted = true
-            }
-        }
-        worker = null
-        if (interrupted) Thread.currentThread().interrupt()
+        stopRequested.set(true)
+        requestAudioWorkerStop(running, worker)
     }
 
     fun resetForTransport() {
@@ -81,14 +83,23 @@ internal class AndroidAudioPlayer(
         }
     }
 
+    fun debugStatus(): String {
+        val queueStats = NativeBridge.nativeGetAudioQueueStats(nativeHandle, sessionEpoch)
+        return "queue=${audioQueueOccupancy(queueStats)}, underruns=${underrunEvents.get()}, " +
+            "localDrops=${audioLocalDropCount(queueStats)}, prebuffer=${activePrebufferMs.get()}ms"
+    }
+
     private fun playbackLoop(initialTrack: AudioTrack) {
+        runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO) }
         val packetBytes = SAMPLE_RATE * CHANNELS * PCM_BYTES_PER_SAMPLE * stream.packetDurationMs / 1_000
         val recoveryPackets = MAX_RECOVERY_MS / stream.packetDurationMs + 1
-        val prebufferTargetBytes = audioPrebufferTargetBytes(
+        val maxWriteBytes = audioPrebufferTargetBytes(
             SAMPLE_RATE,
             CHANNELS,
             PCM_BYTES_PER_SAMPLE,
+            MAX_NONBLOCKING_WRITE_MS,
         )
+        val prebuffer = AdaptiveAudioPrebuffer()
         var track: AudioTrack? = initialTrack
         val buffer = ByteBuffer.allocateDirect(packetBytes * recoveryPackets)
             .order(ByteOrder.nativeOrder())
@@ -96,6 +107,8 @@ internal class AndroidAudioPlayer(
         var playing = false
         var primedBytes = 0
         var observedUnderruns = track?.let(::underrunCount) ?: 0
+        var adaptationClockMs = SystemClock.elapsedRealtime()
+        var terminalFailure: String? = null
 
         try {
             while (running.get()) {
@@ -106,6 +119,9 @@ internal class AndroidAudioPlayer(
                     primedBytes = 0
                     reportedActive = false
                     observedUnderruns = track?.let(::underrunCount) ?: 0
+                    prebuffer.reset()
+                    activePrebufferMs.set(prebuffer.targetMs)
+                    adaptationClockMs = SystemClock.elapsedRealtime()
                     continue
                 }
                 if (track == null) {
@@ -120,18 +136,30 @@ internal class AndroidAudioPlayer(
                     playing = false
                     primedBytes = 0
                     observedUnderruns = underrunCount(track)
+                    adaptationClockMs = SystemClock.elapsedRealtime()
                 }
 
+                val adaptationNowMs = SystemClock.elapsedRealtime()
+                val stableElapsedMs = (adaptationNowMs - adaptationClockMs).coerceAtLeast(0)
+                adaptationClockMs = adaptationNowMs
                 val currentUnderruns = underrunCount(track)
-                if (playing && audioUnderrunAdvanced(observedUnderruns, currentUnderruns)) {
+                val underrunPlan = planAudioUnderrun(observedUnderruns, currentUnderruns)
+                if (playing && underrunPlan.rebuffer) {
+                    val addedUnderruns = (currentUnderruns - observedUnderruns).coerceAtLeast(1)
+                    underrunEvents.addAndGet(addedUnderruns.toLong())
+                    prebuffer.onUnderrun(addedUnderruns)
+                    activePrebufferMs.set(prebuffer.targetMs)
                     onStatus("audio underrun; rebuffering")
-                    NativeBridge.nativeResetAudio(nativeHandle, sessionEpoch)
                     pauseAndFlush(track)
                     playing = false
                     primedBytes = 0
                     reportedActive = false
                     observedUnderruns = currentUnderruns
                     continue
+                }
+                if (playing) {
+                    prebuffer.onStablePlayback(stableElapsedMs)
+                    activePrebufferMs.set(prebuffer.targetMs)
                 }
                 observedUnderruns = max(observedUnderruns, currentUnderruns)
 
@@ -184,8 +212,14 @@ internal class AndroidAudioPlayer(
 
                 var rebuild = false
                 while (running.get() && buffer.hasRemaining()) {
+                    val prebufferTargetBytes = audioPrebufferTargetBytes(
+                        SAMPLE_RATE,
+                        CHANNELS,
+                        PCM_BYTES_PER_SAMPLE,
+                        prebuffer.targetMs,
+                    )
                     val requestedBytes = if (playing) {
-                        buffer.remaining()
+                        min(buffer.remaining(), maxWriteBytes)
                     } else {
                         min(buffer.remaining(), (prebufferTargetBytes - primedBytes).coerceAtLeast(0))
                     }
@@ -210,7 +244,7 @@ internal class AndroidAudioPlayer(
                             }
                         }
                         written == 0 -> {
-                            SystemClock.sleep(1)
+                            SystemClock.sleep(WRITE_RETRY_DELAY_MS)
                         }
                         written == AudioTrack.ERROR_DEAD_OBJECT -> {
                             onStatus("audio output restarting")
@@ -232,10 +266,14 @@ internal class AndroidAudioPlayer(
                 }
             }
         } catch (error: Exception) {
-            onStatus("audio error: ${error.message ?: error.javaClass.simpleName}")
+            terminalFailure = "audio error: ${error.message ?: error.javaClass.simpleName}"
+            onStatus(terminalFailure)
         } finally {
+            running.set(false)
             releaseTrack(track)
-            NativeBridge.nativeSetAudioEnabled(nativeHandle, sessionEpoch, false)
+            runCatching { NativeBridge.nativeSetAudioEnabled(nativeHandle, sessionEpoch, false) }
+            worker = null
+            onTerminated(terminalFailure)
         }
     }
 
@@ -251,6 +289,7 @@ internal class AndroidAudioPlayer(
             SAMPLE_RATE,
             CHANNELS,
             PCM_BYTES_PER_SAMPLE,
+            MAX_PREBUFFER_MS,
         )
         val builder = AudioTrack.Builder()
             .setAudioAttributes(
@@ -302,11 +341,60 @@ internal class AndroidAudioPlayer(
         const val CHANNELS = 2
         const val PCM_BYTES_PER_SAMPLE = 2
         const val MAX_RECOVERY_MS = 60
+        const val MIN_PREBUFFER_MS = 25
+        const val MAX_PREBUFFER_MS = 60
+        const val MAX_NONBLOCKING_WRITE_MS = 10
         const val POLL_TIMEOUT_MS = 10
         const val REBUILD_DELAY_MS = 50L
+        const val WRITE_RETRY_DELAY_MS = 2L
         const val FILL_BUFFER_ERROR = -1
         const val FILL_DECODE_ERROR = -2
         const val FILL_RESYNC_FLAG = 1 shl 30
+    }
+}
+
+internal fun requestAudioWorkerStop(running: AtomicBoolean, worker: Thread?) {
+    running.set(false)
+    runCatching { worker?.interrupt() }
+}
+
+internal class AudioPlayerSlot<T : Any> {
+    var active: T? = null
+        private set
+    private var retiring: T? = null
+    private var attemptGeneration = 0
+
+    fun canStart(generation: Int): Boolean =
+        active == null && retiring == null && attemptGeneration != generation
+
+    fun started(player: T, generation: Int) {
+        check(active == null && retiring == null)
+        active = player
+        attemptGeneration = generation
+    }
+
+    fun failedToStart(player: T) {
+        if (active === player) active = null
+    }
+
+    fun retireActive(): T? {
+        if (retiring != null) return null
+        return active?.also {
+            active = null
+            retiring = it
+        }
+    }
+
+    fun terminated(player: T): Boolean {
+        val owned = active === player || retiring === player
+        if (active === player) active = null
+        if (retiring === player) retiring = null
+        if (owned) attemptGeneration = 0
+        return owned
+    }
+
+    fun resetAttempt() {
+        attemptGeneration = 0
     }
 }
 
@@ -314,9 +402,54 @@ internal fun audioPrebufferTargetBytes(
     sampleRate: Int,
     channels: Int,
     bytesPerSample: Int,
-): Int = sampleRate * channels * bytesPerSample * 25 / 1_000
+    targetMs: Int = 25,
+): Int = sampleRate * channels * bytesPerSample * targetMs / 1_000
 
 internal fun audioUnderrunAdvanced(previous: Int, current: Int): Boolean = current > previous
+
+internal data class AudioUnderrunPlan(
+    val rebuffer: Boolean,
+    val retainCompressedPackets: Boolean,
+)
+
+internal fun planAudioUnderrun(previous: Int, current: Int): AudioUnderrunPlan = AudioUnderrunPlan(
+    rebuffer = audioUnderrunAdvanced(previous, current),
+    retainCompressedPackets = true,
+)
+
+internal class AdaptiveAudioPrebuffer(
+    private val minimumMs: Int = 25,
+    private val maximumMs: Int = 60,
+    private val stepMs: Int = 5,
+    private val stableDecayMs: Long = 5_000,
+) {
+    var targetMs: Int = minimumMs
+        private set
+    private var stablePlaybackMs = 0L
+
+    fun onUnderrun(count: Int = 1) {
+        targetMs = (targetMs + stepMs * count.coerceAtLeast(1)).coerceAtMost(maximumMs)
+        stablePlaybackMs = 0
+    }
+
+    fun onStablePlayback(elapsedMs: Long) {
+        if (elapsedMs <= 0 || targetMs <= minimumMs) return
+        stablePlaybackMs += elapsedMs
+        while (stablePlaybackMs >= stableDecayMs && targetMs > minimumMs) {
+            targetMs = (targetMs - stepMs).coerceAtLeast(minimumMs)
+            stablePlaybackMs -= stableDecayMs
+        }
+    }
+
+    fun reset() {
+        targetMs = minimumMs
+        stablePlaybackMs = 0
+    }
+}
+
+internal fun audioQueueOccupancy(packed: Long): Long = packed and 0xffff_ffffL
+
+internal fun audioLocalDropCount(packed: Long): Long = packed ushr 32
 
 internal inline fun <T> buildValidatedAudioTrack(
     build: () -> T,

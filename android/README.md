@@ -20,8 +20,10 @@ platform are both API 24 because the Rust network interface discovery path uses
 - Server cursor metadata with locally predicted movement; a visible trackpad
   cursor uses cumulative absolute positioning to stay aligned with the host
 - Notebook-style trackpad input across the screen: swipe to move, tap to
-  left-click, two-finger tap to right-click, and two-finger swipe to scroll
-- Floating `K` keyboard control with soft-IME and hardware-key forwarding,
+  left-click, long-press then move or double-tap then move to drag, two-finger
+  tap to right-click, and two-finger swipe to scroll
+- Floating `K` keyboard control with the Android IME plus a visible, compact,
+  horizontally scrollable PC-key panel above it, hardware-key forwarding,
   full-state repair heartbeats, and video resizing above the IME
 - Loss feedback and keyframe recovery
 - Live LAN server discovery with token filtering
@@ -43,9 +45,18 @@ back to the API tunnel on transport failure. Clipboard, file transfer, output
 selection, and game-style pointer capture are not yet
 implemented; trackpad input does not provide game-capture mode.
 
-The keyboard keeps physical keys separate from committed text. Android IME text
-is sent as exact Unicode on server input backends that support it; other
-backends retain the explicitly US-layout-dependent ASCII fallback.
+The keyboard keeps physical keys separate from committed text. Android's
+installed IME continues to provide its language layout, composition, and
+prediction, and committed text is sent as exact Unicode on server input
+backends that support it; other backends retain the explicitly
+US-layout-dependent ASCII fallback. The PC-key panel exposes latchable
+Ctrl/Shift/Alt/Win keys, navigation and function keys through F24, media keys,
+and a true numpad. Its `IME` button restores text-keyboard focus. Closing the
+panel, disconnecting, or leaving the activity releases all held remote keys.
+
+A stationary long-press sends one left-button hold and releases it on finger
+up; it does not add a second click. Moving beyond Android's long-press slop
+before activation cancels the hold while preserving normal pointer movement.
 
 The floating menu reports connection, decoder, and audio state. Decoder progress
 includes `waiting for H.264 keyframe`, `decoder configured`, and `video active`.

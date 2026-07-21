@@ -11,7 +11,8 @@ pub use client::{
 pub use control_stream::{drain_control_messages, normalize_server_address};
 pub use discovery::{DiscoveredServer, LanDiscovery};
 pub use media::{
-    mono_micros, unix_time_micros, AudioPacket, MediaDemux, ReceivedData, TransportWindowStats,
+    mono_micros, unix_time_micros, AudioPacket, AudioQueueStats, MediaDemux, QueuedAudioPacket,
+    ReceivedData, TransportWindowStats,
 };
 pub use st_protocol::{
     ControllerState, CursorShape, CursorState, InputCapabilities, KeyboardKey, KEYBOARD_STATE_BYTES,
