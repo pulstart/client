@@ -251,10 +251,20 @@ impl VideoPlayoutBuffer {
         let now = Instant::now();
         self.observe_arrival(now);
         let candidate = now + self.min_delay;
+        // Space frames at least one interval apart — but never schedule past the
+        // adaptive delay ceiling. Without that clamp `last_scheduled_at` is a
+        // ratchet: every enqueue pushes it forward by a full interval, so any
+        // sustained arrival rate above the advertised framerate (a burst drain,
+        // or an encoder emitting two units per captured frame) walks the
+        // schedule further into the future every frame and never recovers. That
+        // shows up as playout latency that only grows, and eventually as a
+        // permanently frozen picture. The ceiling is already the declared
+        // maximum acceptable playout delay, so it is the right bound here.
+        let ceiling = now + self.delay_ceiling.max(self.min_delay);
         let present_at = self
             .last_scheduled_at
             .zip(self.frame_interval)
-            .map(|(last, interval)| candidate.max(last + interval))
+            .map(|(last, interval)| candidate.max(last + interval).min(ceiling))
             .unwrap_or(candidate);
         self.last_scheduled_at = Some(present_at);
         self.queued.push_back(QueuedVideoFrame {
@@ -696,6 +706,105 @@ fn configured_video_jitter_max_frames() -> (usize, bool) {
     }
 }
 
+/// Escalating, in-session recovery for a video path that has gone dark while
+/// media is still arriving.
+///
+/// Several stages of the receive path drop video *silently*: units for a
+/// video_epoch we haven't been told about yet, units the decoder skips while
+/// waiting for a recovery point, decoded frames the playout buffer rejects as
+/// stale. Each of those is meant to be a brief transient, but each can latch,
+/// and none of them is visible to the connection-level media watchdog — that
+/// watchdog is fed by *datagram* arrival, and the server emits a keepalive every
+/// 500ms, so a frozen picture looks exactly like a healthy idle path.
+///
+/// The discriminator this uses is "units are arriving but nothing reaches the
+/// screen". A genuinely static screen produces no video units at all, so it
+/// never trips. Everything up to the last stage is silent: same TCP session,
+/// same UDP socket, no UI state change.
+struct VideoStallRecovery {
+    last_presented_at: Instant,
+    /// Video units received since the last frame actually reached the screen.
+    /// Zero means "nothing to present" (idle/static), not "stalled".
+    units_since_present: u32,
+    stage: u8,
+}
+
+/// What the receive loop should do about a stalled video path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StallAction {
+    /// Ask the server for a fresh keyframe.
+    RequestKeyframe,
+    /// Drop local video state (assembler, playout latches, decoder references)
+    /// and ask for a keyframe to rebuild from.
+    ResyncLocalState,
+    /// Rebuild the decoder in place — still no reconnect.
+    RebuildDecoder,
+    /// Nothing local worked; let the connection loop reconnect.
+    Reconnect,
+}
+
+impl VideoStallRecovery {
+    /// Enough headroom to ride out an ordinary keyframe round-trip plus a
+    /// jitter-buffer's worth of scheduling before deciding anything is wrong.
+    const FIRST: Duration = Duration::from_millis(700);
+    const RESYNC: Duration = Duration::from_millis(1_500);
+    const REBUILD: Duration = Duration::from_millis(3_000);
+    const GIVE_UP: Duration = Duration::from_millis(6_000);
+
+    fn new(now: Instant) -> Self {
+        Self {
+            last_presented_at: now,
+            units_since_present: 0,
+            stage: 0,
+        }
+    }
+
+    /// A video unit arrived. Counted before any profile/epoch filtering, so
+    /// units dropped by the epoch gate still register as "the server is sending".
+    fn note_unit(&mut self) {
+        self.units_since_present = self.units_since_present.saturating_add(1);
+    }
+
+    /// A frame reached the screen — the path is healthy.
+    fn note_presented(&mut self, now: Instant) {
+        self.last_presented_at = now;
+        self.units_since_present = 0;
+        self.stage = 0;
+    }
+
+    /// A deliberate discontinuity (profile change, decoder rebuild) is in
+    /// progress; restart the clock so the transition isn't mistaken for a stall.
+    fn note_transition(&mut self, now: Instant) {
+        self.last_presented_at = now;
+        self.units_since_present = 0;
+        self.stage = 0;
+    }
+
+    fn evaluate(&mut self, now: Instant) -> Option<StallAction> {
+        if self.units_since_present == 0 {
+            // Nothing is arriving to present: idle or static screen, not a stall.
+            return None;
+        }
+        let stalled_for = now.saturating_duration_since(self.last_presented_at);
+        let (stage, action) = if stalled_for >= Self::GIVE_UP {
+            (4, StallAction::Reconnect)
+        } else if stalled_for >= Self::REBUILD {
+            (3, StallAction::RebuildDecoder)
+        } else if stalled_for >= Self::RESYNC {
+            (2, StallAction::ResyncLocalState)
+        } else if stalled_for >= Self::FIRST {
+            (1, StallAction::RequestKeyframe)
+        } else {
+            return None;
+        };
+        if stage <= self.stage {
+            return None;
+        }
+        self.stage = stage;
+        Some(action)
+    }
+}
+
 fn recycle_video_frame(recycled_frames: &mut Vec<VideoFrameBuffer>, mut frame: VideoFrameBuffer) {
     if recycled_frames.len() >= 3 {
         return;
@@ -706,9 +815,16 @@ fn recycle_video_frame(recycled_frames: &mut Vec<VideoFrameBuffer>, mut frame: V
     recycled_frames.push(frame);
 }
 
-/// Presents the newest due frame and recycles any it superseded. Returns the
-/// number of decoded frames the playout buffer dropped (skipped before display)
-/// so the caller can surface playout/jitter churn in the debug HUD.
+#[derive(Clone, Copy, Debug, Default)]
+struct PresentOutcome {
+    /// A frame actually reached the shared frame buffer this call.
+    presented: bool,
+    /// Decoded frames the playout buffer skipped before display, surfaced in the
+    /// debug HUD as playout/jitter churn.
+    dropped: usize,
+}
+
+/// Presents the newest due frame and recycles any it superseded.
 fn present_due_video_frames(
     playout: &mut VideoPlayoutBuffer,
     recycled_frames: &mut Vec<VideoFrameBuffer>,
@@ -722,15 +838,18 @@ fn present_due_video_frames(
     // ready frame by up to one display interval (~16.6ms @60Hz). The pacer is
     // still used for the idle/no-new-data re-present path.
     immediate: bool,
-) -> usize {
+) -> PresentOutcome {
     let due = playout.take_due_frames();
-    let dropped_count = due.dropped.len();
+    let mut outcome = PresentOutcome {
+        presented: false,
+        dropped: due.dropped.len(),
+    };
     for dropped in due.dropped {
         recycle_video_frame(recycled_frames, dropped);
     }
 
     let Some(mut frame) = due.present else {
-        return dropped_count;
+        return outcome;
     };
 
     let repaint_pending = {
@@ -742,7 +861,8 @@ fn present_due_video_frames(
     };
     recycle_video_frame(recycled_frames, frame);
     repaint_pacer.request_video(ctx, immediate, repaint_pending);
-    dropped_count
+    outcome.presented = true;
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -760,6 +880,11 @@ pub fn run_receive_pipeline(
     // a mid-session media stall (TCP alive but UDP video dead — wifi switch /
     // NAT rebind) and trigger reconnect instead of freezing on the last frame.
     video_arrival: Arc<AtomicU64>,
+    // Set when the video path stalled and every in-session repair failed. The
+    // connection loop turns this into a plain reconnect. Distinct from
+    // `video_arrival`, which counts datagrams (including keepalives) and so
+    // cannot tell a frozen picture from an idle one.
+    video_stalled: Arc<AtomicBool>,
     audio_enabled: Arc<AtomicBool>,
     native_surfaces: Arc<NativeSurfaceControl>,
     control_tx: Sender<ControlMessage>,
@@ -803,6 +928,7 @@ pub fn run_receive_pipeline(
         display_refresh_millihz,
         profile.config.framerate,
     ));
+    let mut stall = VideoStallRecovery::new(Instant::now());
 
     loop {
         if shutdown_rx.try_recv().is_ok() {
@@ -814,6 +940,10 @@ pub fn run_receive_pipeline(
             next_config = Some(config);
         }
         if let Some(next_config) = next_config {
+            // A profile change is a deliberate discontinuity — units for the old
+            // epoch get dropped and the decoder may be rebuilt. Restart the
+            // stall clock so the transition isn't mistaken for a wedge.
+            stall.note_transition(Instant::now());
             let transition = profile.apply(next_config, Instant::now());
             let discontinuity = matches!(
                 transition.update,
@@ -886,6 +1016,7 @@ pub fn run_receive_pipeline(
             );
             decoder = Some(next_decoder);
             receiver.reset_video();
+            stall.note_transition(Instant::now());
             request_recovery_keyframe(
                 &control_tx,
                 &mut last_recovery_keyframe_request,
@@ -906,6 +1037,74 @@ pub fn run_receive_pipeline(
                 message,
             });
             return;
+        }
+
+        // Video units are arriving but nothing is reaching the screen: something
+        // in the receive path has latched. Escalate through progressively more
+        // disruptive in-session repairs; only the last rung is user-visible.
+        match stall.evaluate(Instant::now()) {
+            None => {}
+            Some(StallAction::RequestKeyframe) => {
+                eprintln!("[media] video stalled with units still arriving — requesting keyframe");
+                request_recovery_keyframe(
+                    &control_tx,
+                    &mut last_recovery_keyframe_request,
+                    trace,
+                    "video stall",
+                );
+            }
+            Some(StallAction::ResyncLocalState) => {
+                eprintln!("[media] video still stalled — resyncing local video state");
+                // Clears the reassembly state, the playout buffer's frame-id and
+                // scheduling latches, and puts the decoder back into recovery so
+                // the next keyframe is taken as a fresh reference.
+                receiver.reset_video();
+                for frame in playout.reset_for_discontinuity(profile.config.framerate) {
+                    recycle_video_frame(&mut recycled_frames, frame);
+                }
+                decoded_frame = VideoFrameBuffer::default();
+                if let Some(decoder) = decoder.as_mut() {
+                    decoder.enter_recovery_mode("video stall resync");
+                }
+                last_recovery_keyframe_request = Instant::now() - Duration::from_secs(1);
+                request_recovery_keyframe(
+                    &control_tx,
+                    &mut last_recovery_keyframe_request,
+                    trace,
+                    "video stall resync",
+                );
+            }
+            Some(StallAction::RebuildDecoder) => {
+                eprintln!("[media] video still stalled after resync — rebuilding decoder in place");
+                decoder = None;
+                receiver.reset_video();
+                for frame in playout.reset_for_discontinuity(profile.config.framerate) {
+                    recycle_video_frame(&mut recycled_frames, frame);
+                }
+                decoded_frame = VideoFrameBuffer::default();
+                let token = profile.begin_rebuild(Instant::now());
+                decoder_builder.request(DecoderBuildRequest {
+                    token,
+                    mode: DecoderBuildMode::Automatic,
+                });
+                last_recovery_keyframe_request = Instant::now() - Duration::from_secs(1);
+                request_recovery_keyframe(
+                    &control_tx,
+                    &mut last_recovery_keyframe_request,
+                    trace,
+                    "video stall decoder rebuild",
+                );
+            }
+            Some(StallAction::Reconnect) => {
+                eprintln!(
+                    "[media] video stalled for {}s despite local recovery — reconnecting",
+                    VideoStallRecovery::GIVE_UP.as_secs()
+                );
+                // Plain media-path failure, not a codec fault: flag it for the
+                // connection loop rather than excluding the codec.
+                video_stalled.store(true, Ordering::Relaxed);
+                return;
+            }
         }
 
         let data = receiver.try_receive();
@@ -931,7 +1130,7 @@ pub fn run_receive_pipeline(
 
         match data {
             None => {
-                let drops = present_due_video_frames(
+                let present = present_due_video_frames(
                     &mut playout,
                     &mut recycled_frames,
                     &frame_buf,
@@ -939,8 +1138,11 @@ pub fn run_receive_pipeline(
                     &mut repaint_pacer,
                     false,
                 );
-                if drops > 0 && debug_enabled.load(Ordering::Relaxed) {
-                    debug_state.record_playout_drop(drops as u32);
+                if present.presented {
+                    stall.note_presented(Instant::now());
+                }
+                if present.dropped > 0 && debug_enabled.load(Ordering::Relaxed) {
+                    debug_state.record_playout_drop(present.dropped as u32);
                 }
                 // Block until data, the next playout deadline, or the bounded
                 // maintenance cadence for shutdown and transport feedback.
@@ -966,6 +1168,10 @@ pub fn run_receive_pipeline(
             Some(ReceivedData::Video(completed, assembled_micros, assembled_mono)) => {
                 // B1: signal liveness to the connection loop's media watchdog.
                 video_arrival.fetch_add(1, Ordering::Relaxed);
+                // Counted before the epoch filter: a unit the epoch gate rejects
+                // is still evidence the server is streaming, which is exactly
+                // what distinguishes a wedged client from a static screen.
+                stall.note_unit();
                 if !frame_matches_profile(&completed, &profile) {
                     continue;
                 }
@@ -995,6 +1201,7 @@ pub fn run_receive_pipeline(
                     match receiver.try_receive() {
                         Some(ReceivedData::Video(newer, newer_wall, newer_mono)) => {
                             video_arrival.fetch_add(1, Ordering::Relaxed);
+                            stall.note_unit();
                             if frame_matches_profile(&newer, &profile) {
                                 pending_video.push((newer, newer_wall, newer_mono));
                             }
@@ -1128,7 +1335,7 @@ pub fn run_receive_pipeline(
                     if debug_on {
                         debug_state.set_jitter_delay(playout.current_delay_ms());
                     }
-                    let drops = present_due_video_frames(
+                    let present = present_due_video_frames(
                         &mut playout,
                         &mut recycled_frames,
                         &frame_buf,
@@ -1136,8 +1343,11 @@ pub fn run_receive_pipeline(
                         &mut repaint_pacer,
                         true,
                     );
-                    if drops > 0 && debug_on {
-                        debug_state.record_playout_drop(drops as u32);
+                    if present.presented {
+                        stall.note_presented(Instant::now());
+                    }
+                    if present.dropped > 0 && debug_on {
+                        debug_state.record_playout_drop(present.dropped as u32);
                     }
                 }
             }
@@ -1203,7 +1413,8 @@ fn request_recovery_keyframe(
 mod tests {
     use super::{
         adaptive_delay_ceiling, frame_id_is_newer, frame_matches_profile, queue_latest_audio,
-        VideoPlayoutBuffer, VideoProfileState, VideoProfileUpdate, LIVE_DECODE_OUTPUT_TIMEOUT,
+        StallAction, VideoPlayoutBuffer, VideoProfileState, VideoProfileUpdate, VideoStallRecovery,
+        LIVE_DECODE_OUTPUT_TIMEOUT,
     };
     use crate::transport::AudioPacket;
     use crate::video_frame::{FrameDebugTiming, VideoFrameBuffer};
@@ -1547,6 +1758,80 @@ mod tests {
         assert_eq!(
             adaptive_delay_ceiling(Duration::from_millis(18), None),
             Duration::from_millis(63)
+        );
+    }
+
+    #[test]
+    fn video_stall_ladder_escalates_once_per_stage_only_while_units_arrive() {
+        let start = Instant::now();
+        let mut stall = VideoStallRecovery::new(start);
+
+        // An idle/static screen sends no video units at all. However long that
+        // lasts it must not be mistaken for a freeze — this is what lets the
+        // ladder be aggressive without false positives.
+        assert_eq!(
+            stall.evaluate(start + VideoStallRecovery::GIVE_UP * 2),
+            None
+        );
+
+        // Units arriving but nothing presented: escalate one rung at a time.
+        stall.note_unit();
+        assert_eq!(
+            stall.evaluate(start + VideoStallRecovery::FIRST),
+            Some(StallAction::RequestKeyframe)
+        );
+        assert_eq!(
+            stall.evaluate(start + VideoStallRecovery::FIRST),
+            None,
+            "one action per stage"
+        );
+        assert_eq!(
+            stall.evaluate(start + VideoStallRecovery::RESYNC),
+            Some(StallAction::ResyncLocalState)
+        );
+        assert_eq!(
+            stall.evaluate(start + VideoStallRecovery::REBUILD),
+            Some(StallAction::RebuildDecoder)
+        );
+        assert_eq!(
+            stall.evaluate(start + VideoStallRecovery::GIVE_UP),
+            Some(StallAction::Reconnect)
+        );
+
+        // A presented frame clears the ladder entirely.
+        let recovered = start + VideoStallRecovery::GIVE_UP;
+        stall.note_presented(recovered);
+        assert_eq!(
+            stall.evaluate(recovered + VideoStallRecovery::GIVE_UP),
+            None
+        );
+    }
+
+    #[test]
+    fn playout_scheduling_never_ratchets_past_the_delay_ceiling() {
+        // Regression guard: `last_scheduled_at` used to be pushed forward a full
+        // frame interval per enqueue with no upper bound, so any arrival rate
+        // above the advertised framerate walked the playout schedule further
+        // into the future every frame and never came back — growing latency that
+        // ends in a frozen picture.
+        let mut playout = VideoPlayoutBuffer::new(60);
+        let ceiling = playout.delay_ceiling.max(playout.min_delay);
+
+        let before = Instant::now();
+        for frame_id in 0..600u32 {
+            let mut frame = VideoFrameBuffer::default();
+            frame.debug_timing = Some(FrameDebugTiming {
+                frame_id,
+                ..Default::default()
+            });
+            playout.enqueue(frame);
+        }
+        let latest = playout.queued.back().expect("frames queued").present_at;
+        assert!(
+            latest <= before + ceiling + Duration::from_millis(50),
+            "playout schedule ran away: {:?} past the {:?} ceiling",
+            latest.saturating_duration_since(before),
+            ceiling
         );
     }
 }

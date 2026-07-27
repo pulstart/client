@@ -3751,6 +3751,7 @@ fn start_media_threads(
     debug_state: Arc<ConnectionDebugState>,
     debug_enabled: Arc<AtomicBool>,
     video_arrival: Arc<AtomicU64>,
+    video_stalled: Arc<AtomicBool>,
     ctx: egui::Context,
     display_refresh_millihz: Option<u32>,
     audio_enabled: Arc<AtomicBool>,
@@ -3805,6 +3806,7 @@ fn start_media_threads(
             feedback_tx,
             decode_started_tx,
             video_arrival,
+            video_stalled,
             pipeline_audio_flag,
             native_surfaces,
             control_tx,
@@ -3849,6 +3851,7 @@ fn start_punched_media_threads(
     debug_state: Arc<ConnectionDebugState>,
     debug_enabled: Arc<AtomicBool>,
     video_arrival: Arc<AtomicU64>,
+    video_stalled: Arc<AtomicBool>,
     ctx: egui::Context,
     display_refresh_millihz: Option<u32>,
     audio_enabled: Arc<AtomicBool>,
@@ -3883,6 +3886,7 @@ fn start_punched_media_threads(
             feedback_tx,
             decode_started_tx,
             video_arrival,
+            video_stalled,
             pipeline_audio_flag,
             native_surfaces,
             control_tx,
@@ -4268,6 +4272,12 @@ fn run_connection(
     // video unit. The control loop reconnects if it stops advancing while TCP
     // is still up (UDP media path silently died — wifi switch / NAT rebind).
     let video_arrival = Arc::new(AtomicU64::new(0));
+    // `video_arrival` counts every media datagram — video, audio, and the
+    // server's 500ms liveness keepalive — so it proves the *path* is alive but
+    // says nothing about whether video reaches the screen. A picture frozen by a
+    // latched decoder/epoch/playout gate looks identical to an idle desktop.
+    // The receive pipeline sets this once it has tried every in-session repair.
+    let video_stalled = Arc::new(AtomicBool::new(false));
 
     // --- Authentication handshake ---
     let _ = tcp.write_all(&ControlMessage::Authenticate(token.clone()).serialize());
@@ -4532,6 +4542,7 @@ fn run_connection(
                                     Arc::clone(&debug_state),
                                     Arc::clone(&debug_enabled),
                                     Arc::clone(&video_arrival),
+                                    Arc::clone(&video_stalled),
                                     ctx.clone(),
                                     display_refresh_millihz,
                                     Arc::clone(&audio_enabled),
@@ -4799,6 +4810,12 @@ fn run_connection(
                 "[media] no video for {}s while TCP alive — media path dead, reconnecting",
                 MEDIA_STALL_TIMEOUT.as_secs()
             );
+            break;
+        }
+        // Datagrams keep arriving but the picture is frozen and the pipeline
+        // exhausted its in-session repairs. Same teardown → auto-reconnect.
+        if video_stalled.load(Ordering::Relaxed) {
+            eprintln!("[media] video path stalled with media still flowing — reconnecting");
             break;
         }
 
@@ -5521,11 +5538,15 @@ fn run_tunnel_session(
     // (PUNCHED_INACTIVITY_TIMEOUT), so this video_arrival counter isn't watched
     // here — it's only required by start_punched_media_threads' signature.
     let video_arrival = Arc::new(AtomicU64::new(0));
+    // A frozen picture is invisible to the inactivity timeout (media keeps
+    // flowing), so the receive pipeline reports it explicitly.
+    let video_stalled = Arc::new(AtomicBool::new(false));
     let media = start_punched_media_threads(
         Arc::clone(&frame_buf),
         Arc::clone(&debug_state),
         Arc::clone(&debug_enabled),
         video_arrival,
+        Arc::clone(&video_stalled),
         ctx.clone(),
         display_refresh_millihz,
         Arc::clone(&audio_enabled),
@@ -5599,6 +5620,19 @@ fn run_tunnel_session(
                     "Server unreachable: no traffic for {}s",
                     PUNCHED_INACTIVITY_TIMEOUT.as_secs()
                 ),
+            );
+            break;
+        }
+        // Traffic is flowing (so the inactivity timeout stays quiet) but the
+        // picture is frozen and the pipeline ran out of in-session repairs.
+        if video_stalled.load(Ordering::Relaxed) {
+            set_error(
+                &state,
+                &ctx,
+                &disconnect,
+                &connection_epoch,
+                session_epoch,
+                "Video stalled — reconnecting".to_string(),
             );
             break;
         }

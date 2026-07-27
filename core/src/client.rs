@@ -24,6 +24,12 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(35);
 const MEDIA_STALL_TIMEOUT: Duration = Duration::from_secs(15);
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Escalation points for a video path that has gone dark while units keep
+/// arriving. See [`SessionState::evaluate_video_stall`].
+const VIDEO_STALL_KEYFRAME: Duration = Duration::from_millis(700);
+const VIDEO_STALL_RESYNC: Duration = Duration::from_millis(1_500);
+const VIDEO_STALL_GIVE_UP: Duration = Duration::from_millis(6_000);
 const INPUT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
 const INPUT_REPAIR_WINDOW: Duration = Duration::from_millis(200);
 const VIDEO_QUEUE_CAPACITY: usize = 8;
@@ -1251,6 +1257,15 @@ struct SessionState {
     input_capabilities: InputCapabilities,
     controller_state: ControllerState,
     last_media_at: Instant,
+    /// When a video unit was last handed to the consumer. Distinct from
+    /// `last_media_at`, which any datagram refreshes — including the server's
+    /// 500ms liveness keepalive, so it cannot tell a frozen picture from an
+    /// idle path.
+    last_video_delivered_at: Instant,
+    /// Units received since the last delivery. Zero means nothing is arriving
+    /// (idle/static screen), which is not a stall.
+    video_units_since_delivery: u32,
+    video_stall_stage: u8,
     last_frame_id: Option<u32>,
     waiting_for_recovery: bool,
     last_keyframe_request: Instant,
@@ -1273,6 +1288,9 @@ impl SessionState {
             input_capabilities: InputCapabilities::default(),
             controller_state: ControllerState::Unavailable,
             last_media_at: Instant::now(),
+            last_video_delivered_at: Instant::now(),
+            video_units_since_delivery: 0,
+            video_stall_stage: 0,
             last_frame_id: None,
             waiting_for_recovery: true,
             last_keyframe_request: Instant::now() - KEYFRAME_REQUEST_INTERVAL,
@@ -1293,6 +1311,46 @@ impl SessionState {
         }
     }
 
+    /// A video unit arrived. Counted before the generation/epoch gate, so units
+    /// that gate rejects still prove the server is streaming — which is exactly
+    /// what separates a wedged client from a static screen.
+    fn note_video_unit(&mut self) {
+        self.video_units_since_delivery = self.video_units_since_delivery.saturating_add(1);
+    }
+
+    /// A unit reached the consumer, or a deliberate discontinuity restarted the
+    /// stream; either way the stall clock goes back to zero.
+    fn note_video_progress(&mut self) {
+        self.last_video_delivered_at = Instant::now();
+        self.video_units_since_delivery = 0;
+        self.video_stall_stage = 0;
+    }
+
+    /// Video units are arriving but none are reaching the consumer: something
+    /// in the receive path has latched (an epoch we were never told about, a
+    /// recovery wait the server never answers, a stream acceptance that raced).
+    /// Returns the next escalation stage to run, at most once per stage.
+    fn evaluate_video_stall(&mut self) -> Option<VideoStallAction> {
+        if self.video_units_since_delivery == 0 {
+            return None;
+        }
+        let stalled_for = self.last_video_delivered_at.elapsed();
+        let (stage, action) = if stalled_for >= VIDEO_STALL_GIVE_UP {
+            (3, VideoStallAction::Reconnect)
+        } else if stalled_for >= VIDEO_STALL_RESYNC {
+            (2, VideoStallAction::ResyncLocalState)
+        } else if stalled_for >= VIDEO_STALL_KEYFRAME {
+            (1, VideoStallAction::RequestKeyframe)
+        } else {
+            return None;
+        };
+        if stage <= self.video_stall_stage {
+            return None;
+        }
+        self.video_stall_stage = stage;
+        Some(action)
+    }
+
     fn clear_unsupported_input_heartbeats(&mut self) {
         let eligibility = self.input_eligibility();
         if self
@@ -1305,6 +1363,41 @@ impl SessionState {
             self.keyboard_heartbeat = KeyboardHeartbeat::default();
         }
     }
+}
+
+/// What the session loop should do about a stalled video path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoStallAction {
+    RequestKeyframe,
+    ResyncLocalState,
+    Reconnect,
+}
+
+/// Publish the current stream configuration to the consumer.
+///
+/// Also used to re-announce an unchanged config: the consumer must answer with
+/// `accept_stream_generation` before any frame of that epoch is delivered, and a
+/// rejected or lost acceptance otherwise leaves video gated off with nothing to
+/// re-trigger it.
+fn publish_stream_event(session: &SessionState, shared: &Shared) {
+    let Some(config) = session.stream_config else {
+        return;
+    };
+    *shared.stream_event.lock().unwrap() = Some(StreamEvent {
+        transport_generation: shared.transport_generation.load(Ordering::Acquire),
+        generation: session.generation,
+        video_epoch: config.video_epoch,
+        width: config.width,
+        height: config.height,
+        // CursorState uses these same stream-space dimensions today,
+        // but presentation needs the two coordinate spaces explicit.
+        cursor_width: config.width,
+        cursor_height: config.height,
+        framerate: config.framerate,
+        audio_sample_rate: config.audio_sample_rate,
+        audio_channels: config.audio_channels,
+        packet_duration_ms: config.packet_duration_ms,
+    });
 }
 
 fn handle_control_message(
@@ -1345,22 +1438,11 @@ fn handle_control_message(
                 session.demux.reset_video();
                 clear_video_queue(shared);
                 shared.accepted_video_epoch.store(0, Ordering::Release);
+                // A deliberate discontinuity — don't let the transition count
+                // against the video-stall clock.
+                session.note_video_progress();
             }
-            *shared.stream_event.lock().unwrap() = Some(StreamEvent {
-                transport_generation: shared.transport_generation.load(Ordering::Acquire),
-                generation: session.generation,
-                video_epoch: config.video_epoch,
-                width: config.width,
-                height: config.height,
-                // CursorState uses these same stream-space dimensions today,
-                // but presentation needs the two coordinate spaces explicit.
-                cursor_width: config.width,
-                cursor_height: config.height,
-                framerate: config.framerate,
-                audio_sample_rate: config.audio_sample_rate,
-                audio_channels: config.audio_channels,
-                packet_duration_ms: config.packet_duration_ms,
-            });
+            publish_stream_event(session, shared);
         }
         ControlMessage::StreamStarted => {
             if session.stream_config.is_none() || !session.media_ready_sent {
@@ -1518,7 +1600,47 @@ fn drain_media(
     if request_recovery {
         request_keyframe(transport, session)?;
     }
+    recover_stalled_video(transport, session, shared)?;
     Ok(())
+}
+
+/// Escalating, in-session repair for a video path that has gone dark while
+/// units keep arriving.
+///
+/// Everything short of the last stage is silent: same transport, same session,
+/// no UI state change. The connection-level media watchdog cannot cover this —
+/// it is fed by datagram arrival, and the server keepalives every 500ms, so a
+/// frozen picture is indistinguishable from an idle one at that layer.
+fn recover_stalled_video(
+    transport: &mut SessionTransport,
+    session: &mut SessionState,
+    shared: &Shared,
+) -> Result<(), String> {
+    match session.evaluate_video_stall() {
+        None => Ok(()),
+        Some(VideoStallAction::RequestKeyframe) => {
+            session.waiting_for_recovery = true;
+            session.last_keyframe_request = Instant::now() - KEYFRAME_REQUEST_INTERVAL;
+            request_keyframe(transport, session)
+        }
+        Some(VideoStallAction::ResyncLocalState) => {
+            // Drop partial reassembly and queued output, then re-announce the
+            // stream so a consumer that never accepted this epoch (or whose
+            // acceptance raced a config change) gets another chance to.
+            session.demux.reset_video();
+            clear_video_queue(shared);
+            session.last_frame_id = None;
+            session.waiting_for_recovery = true;
+            shared.accepted_video_epoch.store(0, Ordering::Release);
+            publish_stream_event(session, shared);
+            session.last_keyframe_request = Instant::now() - KEYFRAME_REQUEST_INTERVAL;
+            request_keyframe(transport, session)
+        }
+        Some(VideoStallAction::Reconnect) => Err(format!(
+            "video stalled for {}s with media still arriving",
+            VIDEO_STALL_GIVE_UP.as_secs()
+        )),
+    }
 }
 
 fn process_media_packet(
@@ -1546,6 +1668,7 @@ fn queue_video_frame(
     session: &mut SessionState,
     shared: &Shared,
 ) -> Result<bool, String> {
+    session.note_video_unit();
     if shared.accepted_generation.load(Ordering::Acquire) != session.generation
         || shared.accepted_video_epoch.load(Ordering::Acquire) != frame.video_epoch
         || session
@@ -1579,7 +1702,10 @@ fn queue_video_frame(
         data: frame.data,
     };
     match shared.video_tx.try_send(unit) {
-        Ok(()) => Ok(false),
+        Ok(()) => {
+            session.note_video_progress();
+            Ok(false)
+        }
         Err(TrySendError::Full(_)) => {
             clear_video_queue(shared);
             session.demux.record_consumer_queue_overflow();
@@ -1677,6 +1803,7 @@ fn drain_commands(
                 clear_video_queue(shared);
                 session.waiting_for_recovery = true;
                 session.last_frame_id = None;
+                session.note_video_progress();
                 session.last_keyframe_request = Instant::now() - KEYFRAME_REQUEST_INTERVAL;
                 let accepted = request_keyframe(transport, session).is_ok();
                 let _ = acknowledgement.try_send(accepted);
@@ -3577,5 +3704,48 @@ mod tests {
         client.send_text_input("e\u{301} 中文 😀".into()).unwrap();
         server.join().unwrap();
         client.stop();
+    }
+
+    #[test]
+    fn video_stall_ladder_escalates_once_per_stage_only_while_units_arrive() {
+        let mut session = SessionState::new("127.0.0.1".parse().unwrap());
+
+        // Nothing arriving: an idle/static screen must never be treated as a
+        // stall, however long it lasts. This is the guard that keeps the ladder
+        // from firing on a perfectly healthy paused desktop.
+        session.last_video_delivered_at = Instant::now() - VIDEO_STALL_GIVE_UP * 2;
+        assert_eq!(session.evaluate_video_stall(), None);
+
+        // Units arriving but nothing delivered: escalate, one rung at a time.
+        session.note_video_unit();
+        session.last_video_delivered_at = Instant::now() - VIDEO_STALL_KEYFRAME;
+        assert_eq!(
+            session.evaluate_video_stall(),
+            Some(VideoStallAction::RequestKeyframe)
+        );
+        assert_eq!(session.evaluate_video_stall(), None, "one action per stage");
+
+        session.last_video_delivered_at = Instant::now() - VIDEO_STALL_RESYNC;
+        assert_eq!(
+            session.evaluate_video_stall(),
+            Some(VideoStallAction::ResyncLocalState)
+        );
+        assert_eq!(session.evaluate_video_stall(), None);
+
+        session.last_video_delivered_at = Instant::now() - VIDEO_STALL_GIVE_UP;
+        assert_eq!(
+            session.evaluate_video_stall(),
+            Some(VideoStallAction::Reconnect)
+        );
+
+        // A delivered unit clears the whole ladder.
+        session.note_video_progress();
+        assert_eq!(session.evaluate_video_stall(), None);
+        session.note_video_unit();
+        session.last_video_delivered_at = Instant::now() - VIDEO_STALL_KEYFRAME;
+        assert_eq!(
+            session.evaluate_video_stall(),
+            Some(VideoStallAction::RequestKeyframe)
+        );
     }
 }
