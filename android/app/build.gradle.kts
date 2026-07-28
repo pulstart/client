@@ -79,6 +79,10 @@ android {
 dependencies {
     implementation("androidx.activity:activity:1.13.0")
     testImplementation("junit:junit:4.13.2")
+    // The android.jar used for local unit tests stubs org.json, so every call
+    // throws "not mocked". Pull in the real implementation so JSON parsing can
+    // be tested without an instrumented device.
+    testImplementation("org.json:json:20250517")
 }
 
 tasks.named("preBuild") {

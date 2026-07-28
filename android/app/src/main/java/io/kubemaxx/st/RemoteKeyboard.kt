@@ -1,7 +1,6 @@
 package io.kubemaxx.st
 
 import android.content.Context
-import android.content.res.Configuration
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -18,8 +17,8 @@ import android.view.ViewGroup
 import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
-import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import java.util.ArrayDeque
 import kotlin.math.roundToInt
@@ -424,9 +423,39 @@ internal class VirtualKeyboardController(private val state: RemoteKeyboardState)
     }
 }
 
+/**
+ * Which screen edge a key column is pinned to.
+ *
+ * The two columns carry different key sets rather than mirroring each other:
+ * the activity is locked to landscape, so in normal use the left thumb chords
+ * modifiers while the right thumb drives the cursor.
+ */
+internal enum class KeyboardSide { LEFT, RIGHT }
+
+/**
+ * Both key columns as one unit, so callers toggle and cancel them together
+ * instead of repeating themselves for each side.
+ */
+internal class RemoteKeyboardPanels(
+    val left: RemoteKeyboardPanel,
+    val right: RemoteKeyboardPanel,
+) {
+    fun setVisible(visible: Boolean) {
+        val value = if (visible) View.VISIBLE else View.GONE
+        left.visibility = value
+        right.visibility = value
+    }
+
+    fun cancelTouches() {
+        left.cancelTouches()
+        right.cancelTouches()
+    }
+}
+
 internal class RemoteKeyboardPanel(
     context: Context,
     private val controller: VirtualKeyboardController,
+    side: KeyboardSide,
     restoreIme: () -> Unit,
 ) : LinearLayout(context) {
     private data class KeySpec(val label: String, val key: RemoteKey? = null)
@@ -436,74 +465,44 @@ internal class RemoteKeyboardPanel(
     private val keyTouches = mutableListOf<VirtualKeyTouch>()
 
     init {
-        orientation = if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
-            HORIZONTAL
-        } else {
-            VERTICAL
-        }
+        // Always a vertical column: the activity is screenOrientation="landscape",
+        // so there is no portrait case to lay out for.
+        orientation = VERTICAL
         setPadding(dp(4), dp(4), dp(4), dp(4))
         background = keyBackground(PANEL_COLOR, dp(10).toFloat())
         elevation = dp(12).toFloat()
         contentDescription = "Remote PC keyboard controls"
 
-        addKeyRow(buildList {
-            add(KeySpec("IME"))
-            add(KeySpec("Esc", RemoteKey.Escape))
-            val functionKeys = RemoteKey.entries
-                .subList(RemoteKey.F1.ordinal, RemoteKey.F12.ordinal + 1) +
-                RemoteKey.entries.subList(RemoteKey.F13.ordinal, RemoteKey.F24.ordinal + 1)
-            functionKeys.forEach { add(KeySpec(it.name, it)) }
-            add(KeySpec("PrtSc", RemoteKey.PrintScreen))
-            add(KeySpec("ScrLk", RemoteKey.ScrollLock))
-            add(KeySpec("Pause", RemoteKey.Pause))
-            add(KeySpec("Ins", RemoteKey.Insert))
-            add(KeySpec("Del", RemoteKey.Delete))
-            add(KeySpec("Home", RemoteKey.Home))
-            add(KeySpec("End", RemoteKey.End))
-            add(KeySpec("PgUp", RemoteKey.PageUp))
-            add(KeySpec("PgDn", RemoteKey.PageDown))
-            add(KeySpec("Menu", RemoteKey.Application))
-            add(KeySpec("Prev", RemoteKey.MediaPrevious))
-            add(KeySpec("Play", RemoteKey.MediaPlayPause))
-            add(KeySpec("Next", RemoteKey.MediaNext))
-            add(KeySpec("Stop", RemoteKey.MediaStop))
-            add(KeySpec("Mute", RemoteKey.VolumeMute))
-            add(KeySpec("Vol-", RemoteKey.VolumeDown))
-            add(KeySpec("Vol+", RemoteKey.VolumeUp))
-        }, restoreIme)
-        addKeyRow(
-            listOf(
-                KeySpec("Ctrl", RemoteKey.LeftCtrl),
-                KeySpec("Shift", RemoteKey.LeftShift),
-                KeySpec("Alt", RemoteKey.LeftAlt),
-                KeySpec("Win", RemoteKey.LeftMeta),
-                KeySpec("Tab", RemoteKey.Tab),
-                KeySpec("Bksp", RemoteKey.Backspace),
-                KeySpec("Enter", RemoteKey.Enter),
-                KeySpec("Left", RemoteKey.ArrowLeft),
+        val keys = when (side) {
+            KeyboardSide.LEFT -> buildList {
+                add(KeySpec("IME"))
+                add(KeySpec("Esc", RemoteKey.Escape))
+                add(KeySpec("Ctrl", RemoteKey.LeftCtrl))
+                add(KeySpec("Shift", RemoteKey.LeftShift))
+                add(KeySpec("Alt", RemoteKey.LeftAlt))
+                add(KeySpec("Win", RemoteKey.LeftMeta))
+                add(KeySpec("Tab", RemoteKey.Tab))
+                RemoteKey.entries
+                    .subList(RemoteKey.F1.ordinal, RemoteKey.F12.ordinal + 1)
+                    .forEach { add(KeySpec(it.name, it)) }
+            }
+            KeyboardSide.RIGHT -> listOf(
                 KeySpec("Up", RemoteKey.ArrowUp),
                 KeySpec("Down", RemoteKey.ArrowDown),
+                KeySpec("Left", RemoteKey.ArrowLeft),
                 KeySpec("Right", RemoteKey.ArrowRight),
-                KeySpec("Num", RemoteKey.NumLock),
-                KeySpec("N/", RemoteKey.NumpadDivide),
-                KeySpec("N*", RemoteKey.NumpadMultiply),
-                KeySpec("N-", RemoteKey.NumpadSubtract),
-                KeySpec("N+", RemoteKey.NumpadAdd),
-                KeySpec("N7", RemoteKey.Numpad7),
-                KeySpec("N8", RemoteKey.Numpad8),
-                KeySpec("N9", RemoteKey.Numpad9),
-                KeySpec("N4", RemoteKey.Numpad4),
-                KeySpec("N5", RemoteKey.Numpad5),
-                KeySpec("N6", RemoteKey.Numpad6),
-                KeySpec("N1", RemoteKey.Numpad1),
-                KeySpec("N2", RemoteKey.Numpad2),
-                KeySpec("N3", RemoteKey.Numpad3),
-                KeySpec("N0", RemoteKey.Numpad0),
-                KeySpec("N.", RemoteKey.NumpadDecimal),
-                KeySpec("NEnt", RemoteKey.NumpadEnter),
-            ),
-            restoreIme,
-        )
+                KeySpec("Home", RemoteKey.Home),
+                KeySpec("End", RemoteKey.End),
+                KeySpec("PgUp", RemoteKey.PageUp),
+                KeySpec("PgDn", RemoteKey.PageDown),
+                KeySpec("Enter", RemoteKey.Enter),
+                KeySpec("Bksp", RemoteKey.Backspace),
+                KeySpec("Del", RemoteKey.Delete),
+                KeySpec("Ins", RemoteKey.Insert),
+                KeySpec("PrtSc", RemoteKey.PrintScreen),
+            )
+        }
+        addKeyColumn(keys, restoreIme)
         controller.setOnStateChanged(::refreshModifiers)
     }
 
@@ -512,17 +511,17 @@ internal class RemoteKeyboardPanel(
         handler.removeCallbacksAndMessages(null)
     }
 
-    private fun addKeyRow(keys: List<KeySpec>, restoreIme: () -> Unit) {
-        val row = LinearLayout(context).apply {
-            orientation = HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+    private fun addKeyColumn(keys: List<KeySpec>, restoreIme: () -> Unit) {
+        val column = LinearLayout(context).apply {
+            orientation = VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
         }
         keys.forEach { spec ->
             val button = keyButton(spec.label)
-            val params = LayoutParams(buttonWidth(spec.label), dp(KEY_HEIGHT_DP)).apply {
-                marginEnd = dp(3)
+            val params = LayoutParams(dp(KEY_WIDTH_DP), dp(KEY_HEIGHT_DP)).apply {
+                bottomMargin = dp(3)
             }
-            row.addView(button, params)
+            column.addView(button, params)
             if (spec.key == null) {
                 button.setOnClickListener { restoreIme() }
             } else {
@@ -533,24 +532,28 @@ internal class RemoteKeyboardPanel(
                 if (spec.key.isModifier()) modifierButtons[spec.key] = button
             }
         }
-        val scroll = HorizontalScrollView(context).apply {
-            isHorizontalScrollBarEnabled = false
+        // The column is taller than the screen on shorter devices, so it scrolls
+        // rather than being clipped. WRAP_CONTENT height lets it shrink to the
+        // key count and stay vertically centred against the screen edge.
+        val scroll = ScrollView(context).apply {
+            isVerticalScrollBarEnabled = false
             isFillViewport = true
             overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
             addView(
-                row,
+                column,
                 ViewGroup.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                 ),
             )
         }
-        val params = if (orientation == HORIZONTAL) {
-            LayoutParams(0, dp(KEY_HEIGHT_DP + 3), 1f).apply { marginEnd = dp(3) }
-        } else {
-            LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(KEY_HEIGHT_DP + 3))
-        }
-        addView(scroll, params)
+        addView(
+            scroll,
+            LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ),
+        )
     }
 
     private fun keyButton(label: String) = TextView(context).apply {
@@ -588,8 +591,6 @@ internal class RemoteKeyboardPanel(
         cornerRadius = radius
         setStroke(dp(1), KEY_BORDER_COLOR)
     }
-
-    private fun buttonWidth(label: String): Int = dp((label.length * 9 + 20).coerceAtLeast(46))
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).roundToInt()
 
@@ -702,6 +703,10 @@ internal class RemoteKeyboardPanel(
 
     private companion object {
         const val KEY_HEIGHT_DP = 38
+
+        /** Fixed so a column reads as a straight edge strip. Wide enough for the
+         * longest label in either set ("Shift", "Right", "PrtSc") at 12sp. */
+        const val KEY_WIDTH_DP = 54
         val PANEL_COLOR = Color.argb(238, 18, 22, 29)
         val KEY_COLOR = Color.rgb(49, 55, 67)
         val PRESSED_COLOR = Color.rgb(35, 111, 149)

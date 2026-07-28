@@ -1,9 +1,12 @@
 package io.kubemaxx.st
 
+import android.content.ActivityNotFoundException
 import android.content.Context
+import android.content.Intent
 import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
@@ -60,11 +63,13 @@ private enum class VideoScaleMode(val label: String) {
 
 internal fun isConnectionPending(status: String): Boolean = status.startsWith("connecting")
 
-/// Version shown in the UI, e.g. `0.12.7 (12007)`. Both halves come from the
-/// git tag: the release workflow stamps `versionName`/`versionCode` in
-/// `app/build.gradle.kts`, and the Android build compiles them into
-/// `BuildConfig`. Local builds show whatever is checked in (`0.1.0`), which is
-/// the honest answer for an untagged build.
+/**
+ * Version shown in the UI, e.g. `0.12.7 (12007)`. Both halves come from the
+ * git tag: the release workflow stamps `versionName`/`versionCode` in
+ * `app/build.gradle.kts`, and the Android build compiles them into
+ * `BuildConfig`. Local builds show whatever is checked in (`0.1.0`), which is
+ * the honest answer for an untagged build.
+ */
 internal fun formatAppVersion(name: String, code: Int): String = "$name ($code)"
 
 internal const val STREAM_STATUS_POLL_MS = 16L
@@ -131,9 +136,24 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private lateinit var menuStatusText: TextView
     private val appVersion: String
         get() = formatAppVersion(BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE)
+    private val appVersionName: String
+        get() = BuildConfig.VERSION_NAME
+    private lateinit var updateStatusText: TextView
+    private lateinit var updateCheckButton: Button
+    private lateinit var updateOpenButton: Button
+    private var latestRelease: ReleaseInfo? = null
+    private val updateCheckExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "st-update-check")
+    }
+    private val updateChecks = LatestAsyncTask<String, UpdateStatus>(
+        executor = updateCheckExecutor,
+        deliver = { action -> handler.post(action) },
+        work = { version, _ -> UpdateCheck.fetchLatest(version) },
+        complete = ::applyUpdateStatus,
+    )
     private lateinit var menuLauncher: FrameLayout
     private lateinit var keyboardLauncher: RemoteKeyboardView
-    private lateinit var keyboardPanel: RemoteKeyboardPanel
+    private lateinit var keyboardPanels: RemoteKeyboardPanels
     private lateinit var floatingMenu: LinearLayout
     private lateinit var settingsAudioToggle: CheckBox
     private lateinit var menuAudioToggle: CheckBox
@@ -392,6 +412,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         apiDiscoveryExecutor.shutdownNow()
         streamTransitions.cancel()
         streamTransitionExecutor.shutdownNow()
+        updateChecks.cancel()
+        updateCheckExecutor.shutdownNow()
         handler.removeCallbacks(pollStatus)
         handler.removeCallbacks(pollCursor)
         currentSessionEpoch = 0L
@@ -497,13 +519,20 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             setAvailable(false)
             setOnClickListener { toggleRemoteKeyboard() }
         }
-        keyboardPanel = RemoteKeyboardPanel(
-            this,
-            keyboardLauncher.virtualKeys,
-            restoreIme = ::restoreRemoteKeyboardIme,
-        ).apply {
-            visibility = View.GONE
-        }
+        keyboardPanels = RemoteKeyboardPanels(
+            left = RemoteKeyboardPanel(
+                this,
+                keyboardLauncher.virtualKeys,
+                KeyboardSide.LEFT,
+                restoreIme = ::restoreRemoteKeyboardIme,
+            ),
+            right = RemoteKeyboardPanel(
+                this,
+                keyboardLauncher.virtualKeys,
+                KeyboardSide.RIGHT,
+                restoreIme = ::restoreRemoteKeyboardIme,
+            ),
+        ).apply { setVisible(false) }
         streamArea = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             clipChildren = true
@@ -535,17 +564,24 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                     Gravity.TOP or Gravity.CENTER_HORIZONTAL,
                 ).apply { topMargin = dp(20) },
             )
+            // Two edge columns rather than one bottom bar: the centre of the
+            // video stays unobstructed, and each column is only as wide as it
+            // needs to be so touches outside them still reach the trackpad.
             addView(
-                keyboardPanel,
+                keyboardPanels.left,
                 FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT,
-                    Gravity.BOTTOM,
-                ).apply {
-                    leftMargin = dp(4)
-                    rightMargin = dp(4)
-                    bottomMargin = dp(4)
-                },
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.START or Gravity.CENTER_VERTICAL,
+                ).apply { leftMargin = dp(4) },
+            )
+            addView(
+                keyboardPanels.right,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.END or Gravity.CENTER_VERTICAL,
+                ).apply { rightMargin = dp(4) },
             )
             addView(
                 floatingMenu,
@@ -858,9 +894,74 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         setPadding(dp(28), dp(22), dp(28), dp(24))
         addView(title("Update"))
         addView(description("Keep the Android client aligned with the server and shared protocol."))
-        addView(infoCard("Current version", "0.1.0"))
-        addView(infoCard("Update channel", "Manual APK installation"))
-        addView(description("Automatic self-update is not available on Android. Install a newer signed APK over this app to retain settings."))
+        addView(infoCard("Current version", appVersion))
+        updateStatusText = description("Tap Check for updates to ask GitHub for the latest release.")
+        addView(updateStatusText)
+        updateCheckButton = Button(this@MainActivity).apply {
+            text = "Check for updates"
+            setOnClickListener { checkForUpdates() }
+        }
+        addView(updateCheckButton, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            dp(48),
+        ))
+        updateOpenButton = Button(this@MainActivity).apply {
+            text = "Open releases page"
+            visibility = View.GONE
+            setOnClickListener { openReleasesPage() }
+        }
+        addView(updateOpenButton, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            dp(48),
+        ).apply { topMargin = dp(8) })
+        addView(description(
+            "Releases are not signed with a stable key yet, so a downloaded APK cannot " +
+                "install over this one. Uninstall this app first, then install the new APK."
+        ))
+    }
+
+    /**
+     * Ask GitHub for the latest release on a background thread.
+     *
+     * [LatestAsyncTask] collapses repeated taps to the newest request, so
+     * impatient tapping cannot stack up connections or deliver a stale result
+     * after a newer one.
+     */
+    private fun checkForUpdates() {
+        updateCheckButton.isEnabled = false
+        updateStatusText.text = "Checking..."
+        updateOpenButton.visibility = View.GONE
+        updateChecks.submit(appVersionName)
+    }
+
+    private fun applyUpdateStatus(@Suppress("UNUSED_PARAMETER") requested: String, status: UpdateStatus) {
+        updateCheckButton.isEnabled = true
+        when (status) {
+            is UpdateStatus.Available -> {
+                latestRelease = status.release
+                updateStatusText.text = "Version ${status.release.version} is available."
+                updateOpenButton.visibility = View.VISIBLE
+            }
+            is UpdateStatus.UpToDate -> {
+                latestRelease = null
+                updateStatusText.text = "Up to date (${status.current})."
+                updateOpenButton.visibility = View.GONE
+            }
+            is UpdateStatus.Failed -> {
+                latestRelease = null
+                updateStatusText.text = "Update check failed: ${status.message}"
+                updateOpenButton.visibility = View.GONE
+            }
+        }
+    }
+
+    private fun openReleasesPage() {
+        val url = latestRelease?.htmlUrl ?: UpdateCheck.RELEASES_PAGE
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (error: ActivityNotFoundException) {
+            updateStatusText.text = "No browser available to open $url"
+        }
     }
 
     private fun buildAboutPanel(): LinearLayout = LinearLayout(this).apply {
@@ -868,7 +969,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         visibility = View.GONE
         setPadding(dp(28), dp(22), dp(28), dp(24))
         addView(title("About"))
-        addView(description("st Android 0.1.0"))
+        addView(description("st Android $appVersion"))
         addView(infoCard("Presentation", "Android MediaCodec to SurfaceView"))
         addView(infoCard("Video", "Hardware H.264, SDR, YUV420"))
         addView(infoCard("Audio", "48 kHz stereo Opus with redundancy, FEC, and PLC"))
@@ -1390,7 +1491,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             View.GONE
         }
         if (!available && keyboardOpen) closeRemoteKeyboard()
-        if (::keyboardPanel.isInitialized && !available) keyboardPanel.visibility = View.GONE
+        if (::keyboardPanels.isInitialized && !available) keyboardPanels.setVisible(false)
         keyboardLauncher.post(::positionKeyboardLauncher)
     }
 
@@ -1562,7 +1663,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         cancelTouchInput()
         if (::menuLauncher.isInitialized) menuLauncher.visibility = View.GONE
         if (::keyboardLauncher.isInitialized) keyboardLauncher.visibility = View.GONE
-        if (::keyboardPanel.isInitialized) keyboardPanel.visibility = View.GONE
+        if (::keyboardPanels.isInitialized) keyboardPanels.setVisible(false)
     }
 
     private fun positionMenuLauncher() {
@@ -1645,7 +1746,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         keyboardShowGeneration += 1
         imeShowRequested = false
         keyboardLauncher.setOpen(true)
-        keyboardPanel.visibility = View.VISIBLE
+        keyboardPanels.setVisible(true)
         requestRemoteKeyboardIme(keyboardShowGeneration, 0)
     }
 
@@ -1656,9 +1757,9 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         keyboardShowGeneration += 1
         imeShowRequested = false
         keyboardLauncher.setOpen(false)
-        if (::keyboardPanel.isInitialized) {
-            keyboardPanel.cancelTouches()
-            keyboardPanel.visibility = View.GONE
+        if (::keyboardPanels.isInitialized) {
+            keyboardPanels.cancelTouches()
+            keyboardPanels.setVisible(false)
         }
         keyboardLauncher.closeKeyboardSession()
         if (hideIme && wasOpen) {
