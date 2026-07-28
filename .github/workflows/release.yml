@@ -204,6 +204,9 @@ jobs:
       # Must match `ndkVersion` in android/app/build.gradle.kts and the fallback
       # path in android/build.gradle.kts.
       ANDROID_NDK_VERSION: "29.0.14206865"
+      # Lifted to the job so the decode step can test it in `if:` — the secrets
+      # context is not available in a step-level condition.
+      ST_ANDROID_KEYSTORE_BASE64: ${{ secrets.ST_ANDROID_KEYSTORE_BASE64 }}
 
     steps:
       - name: Checkout client with submodules
@@ -276,9 +279,7 @@ jobs:
 
       - name: Decode release keystore
         id: keystore
-        if: ${{ secrets.ST_ANDROID_KEYSTORE_BASE64 != '' }}
-        env:
-          ST_ANDROID_KEYSTORE_BASE64: ${{ secrets.ST_ANDROID_KEYSTORE_BASE64 }}
+        if: env.ST_ANDROID_KEYSTORE_BASE64 != ''
         run: |
           keystore="$RUNNER_TEMP/st-release.jks"
           echo "$ST_ANDROID_KEYSTORE_BASE64" | base64 -d > "$keystore"
