@@ -197,10 +197,126 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  android:
+    name: Android
+    runs-on: ubuntu-24.04
+    env:
+      # Must match `ndkVersion` in android/app/build.gradle.kts and the fallback
+      # path in android/build.gradle.kts.
+      ANDROID_NDK_VERSION: "29.0.14206865"
+
+    steps:
+      - name: Checkout client with submodules
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+          token: ${{ secrets.PROTOCOL_CHECKOUT_TOKEN || github.token }}
+
+      - name: Derive version from git tag
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          else
+            version="0.0.0-dev"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          # versionCode must be a monotonically increasing integer, so pack the
+          # semver components into one: major*1e6 + minor*1e3 + patch. Untagged
+          # dev builds get 1, the minimum Android accepts.
+          core="${version%%-*}"
+          IFS='.' read -r major minor patch <<< "$core"
+          if [[ "$version" == "0.0.0-dev" ]]; then
+            code=1
+          else
+            code=$(( ${major:-0} * 1000000 + ${minor:-0} * 1000 + ${patch:-0} ))
+            [[ "$code" -lt 1 ]] && code=1
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $version (versionCode $code)"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Rust with Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            android/rust -> target
+          prefix-key: v1-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Install Android NDK
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${ANDROID_NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Stamp Android version
+        shell: bash
+        working-directory: android
+        run: |
+          sed -i \
+            -e 's/^\( *versionCode *= *\).*/\1${{ steps.version.outputs.code }}/' \
+            -e 's/^\( *versionName *= *\).*/\1"${{ steps.version.outputs.version }}"/' \
+            app/build.gradle.kts
+          grep -E 'versionCode|versionName' app/build.gradle.kts
+
+      - name: Decode release keystore
+        id: keystore
+        if: ${{ secrets.ST_ANDROID_KEYSTORE_BASE64 != '' }}
+        env:
+          ST_ANDROID_KEYSTORE_BASE64: ${{ secrets.ST_ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          keystore="$RUNNER_TEMP/st-release.jks"
+          echo "$ST_ANDROID_KEYSTORE_BASE64" | base64 -d > "$keystore"
+          echo "ST_ANDROID_KEYSTORE=$keystore" >> "$GITHUB_ENV"
+
+      - name: Build release APK
+        working-directory: android
+        env:
+          # When these are unset, app/build.gradle.kts falls back to Android's
+          # local debug key so the APK is still installable outside Play.
+          ST_ANDROID_STORE_PASSWORD: ${{ secrets.ST_ANDROID_STORE_PASSWORD }}
+          ST_ANDROID_KEY_ALIAS: ${{ secrets.ST_ANDROID_KEY_ALIAS }}
+          ST_ANDROID_KEY_PASSWORD: ${{ secrets.ST_ANDROID_KEY_PASSWORD }}
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon assembleRelease
+
+      - name: Package Android artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          apk=android/app/build/outputs/apk/release/app-release.apk
+          test -f "$apk" || { echo "APK not found at $apk"; exit 1; }
+          cp "$apk" "dist/st-client-v${{ steps.version.outputs.version }}-android.apk"
+          ls -l dist
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist/*-android.apk
+          if-no-files-found: error
+          retention-days: 30
+
   publish:
     name: Publish GitHub release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    needs: [build, android]
     runs-on: ubuntu-24.04
 
     steps:
@@ -240,5 +356,6 @@ jobs:
           files: |
             release-artifacts/**/*.tar.gz
             release-artifacts/**/*.zip
+            release-artifacts/**/*.apk
           fail_on_unmatched_files: true
           generate_release_notes: true
