@@ -60,6 +60,13 @@ private enum class VideoScaleMode(val label: String) {
 
 internal fun isConnectionPending(status: String): Boolean = status.startsWith("connecting")
 
+/// Version shown in the UI, e.g. `0.12.7 (12007)`. Both halves come from the
+/// git tag: the release workflow stamps `versionName`/`versionCode` in
+/// `app/build.gradle.kts`, and the Android build compiles them into
+/// `BuildConfig`. Local builds show whatever is checked in (`0.1.0`), which is
+/// the honest answer for an untagged build.
+internal fun formatAppVersion(name: String, code: Int): String = "$name ($code)"
+
 internal const val STREAM_STATUS_POLL_MS = 16L
 
 internal fun shouldShowStartupStatus(
@@ -122,6 +129,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private lateinit var statusDisconnectButton: Button
     private lateinit var statusReconnectButton: Button
     private lateinit var menuStatusText: TextView
+    private val appVersion: String
+        get() = formatAppVersion(BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE)
     private lateinit var menuLauncher: FrameLayout
     private lateinit var keyboardLauncher: RemoteKeyboardView
     private lateinit var keyboardPanel: RemoteKeyboardPanel
@@ -707,6 +716,12 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                 setPadding(dp(4), dp(12), dp(4), dp(4))
             }
             addView(homeStatusText, rowParams())
+            // Readable without connecting — the first thing to ask for in a bug report.
+            addView(TextView(this@MainActivity).apply {
+                text = "st $appVersion"
+                setTextColor(Color.DKGRAY)
+                setPadding(dp(4), dp(4), dp(4), dp(12))
+            }, rowParams())
             post(::refreshServerCards)
         }
     }
@@ -1300,7 +1315,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                 activeStream == null -> "waiting for stream"
                 else -> "waiting for audio"
             }
-            menuStatusText.text = "Connection: $connectionStatus\nDecoder: $decoderDetail\nAudio: $audioDetail"
+            menuStatusText.text =
+                "Connection: $connectionStatus\nDecoder: $decoderDetail\nAudio: $audioDetail\nVersion: $appVersion"
         }
 
         val streaming = isStreamingVisible()
