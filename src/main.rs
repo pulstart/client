@@ -4034,50 +4034,78 @@ fn run_fallback_chain(
     api_discovery: Arc<api_client::ApiDiscoveryShared>,
     ft_shared_state: file_transfer::SharedTransferState,
 ) -> Result<(), String> {
-    let mut punch_failure: String;
-    match api_client::prepare_punch_attempt(api_discovery.as_ref()) {
-        Ok((partner_cands, punched_crypto)) => {
-            eprintln!("[connect] attempting UDP hole punch...");
-            let punched = run_punched_session(
-                partner_cands,
-                punched_crypto,
-                token.clone(),
-                display_refresh_millihz,
-                video_codec_support,
-                Arc::clone(&excluded_video_codecs),
-                Arc::clone(&state),
-                Arc::clone(&frame_buf),
-                Arc::clone(&debug_state),
-                Arc::clone(&disconnect),
-                Arc::clone(&connection_epoch),
-                session_epoch,
-                Arc::clone(&audio_enabled),
-                Arc::clone(&debug_enabled),
-                Arc::clone(&native_surfaces),
-                Arc::clone(&shared_input),
-                control_rx.clone(),
-                input_rx.clone(),
-                ctx.clone(),
-                Arc::clone(&api_discovery),
-                ft_shared_state.clone(),
-            );
-            if punched {
-                return Ok(());
-            }
-            let terminal = match &*state.lock().unwrap() {
-                ConnectionState::Error(message) => connection_error_is_terminal(message),
-                _ => false,
-            };
-            if terminal {
-                // A real server explicitly rejected authentication/startup.
-                // Changing transport cannot make that request valid.
-                return Ok(());
-            }
-            punch_failure = "UDP hole punch failed".into();
+    let cancelled = || {
+        session_cancelled(
+            disconnect.as_ref(),
+            connection_epoch.as_ref(),
+            session_epoch,
+        )
+    };
+    // Two punch rounds before falling back to the relay. The server often
+    // starts probing a few seconds into our 10s window (it only notices the
+    // punch nonce on its next API poll), and the first round's probes warm
+    // the NAT mappings on both sides — so an immediate second round with a
+    // fresh nonce regularly succeeds where round one timed out. Users were
+    // reproducing exactly that by cancelling and reconnecting manually.
+    const PUNCH_ROUNDS: u32 = 2;
+    let mut punch_failure: String = "UDP hole punch failed".into();
+    for round in 1..=PUNCH_ROUNDS {
+        if cancelled() {
+            return Ok(());
         }
-        Err(punch_err) => {
-            punch_failure = format!("Hole punch setup failed: {punch_err}");
+        match api_client::prepare_punch_attempt(api_discovery.as_ref(), &cancelled) {
+            Ok((partner_cands, punched_crypto)) => {
+                eprintln!("[connect] attempting UDP hole punch (round {round}/{PUNCH_ROUNDS})...");
+                let punched = run_punched_session(
+                    partner_cands,
+                    punched_crypto,
+                    token.clone(),
+                    display_refresh_millihz,
+                    video_codec_support,
+                    Arc::clone(&excluded_video_codecs),
+                    Arc::clone(&state),
+                    Arc::clone(&frame_buf),
+                    Arc::clone(&debug_state),
+                    Arc::clone(&disconnect),
+                    Arc::clone(&connection_epoch),
+                    session_epoch,
+                    Arc::clone(&audio_enabled),
+                    Arc::clone(&debug_enabled),
+                    Arc::clone(&native_surfaces),
+                    Arc::clone(&shared_input),
+                    control_rx.clone(),
+                    input_rx.clone(),
+                    ctx.clone(),
+                    Arc::clone(&api_discovery),
+                    ft_shared_state.clone(),
+                );
+                if punched {
+                    return Ok(());
+                }
+                let terminal = match &*state.lock().unwrap() {
+                    ConnectionState::Error(message) => connection_error_is_terminal(message),
+                    _ => false,
+                };
+                if terminal {
+                    // A real server explicitly rejected authentication/startup.
+                    // Changing transport cannot make that request valid.
+                    return Ok(());
+                }
+                punch_failure = "UDP hole punch failed".into();
+            }
+            Err(punch_err) => {
+                if punch_err == api_client::CANCELLED || cancelled() {
+                    return Ok(());
+                }
+                punch_failure = format!("Hole punch setup failed: {punch_err}");
+                // Signaling problems (API unreachable, host not registered)
+                // won't heal within a retry round — go straight to the relay.
+                break;
+            }
         }
+    }
+    if cancelled() {
+        return Ok(());
     }
     // Last resort: end-to-end encrypted TCP tunnel through the API server's
     // relay (works when UDP is blocked entirely).
@@ -5204,11 +5232,20 @@ fn run_punched_session(
     api_discovery.set_punch_session_active(true);
     let _session_guard = PunchSessionGuard(Arc::clone(&api_discovery));
 
-    let peer = match st_protocol::tunnel::hole_punch(
+    // Cancellable: a user cancel must stop this thread from consuming
+    // datagrams off the shared punch socket underneath the next attempt.
+    let peer = match st_protocol::tunnel::hole_punch_cancellable(
         &socket,
         &partner_candidates,
         &crypto,
         Duration::from_secs(10),
+        || {
+            session_cancelled(
+                disconnect.as_ref(),
+                connection_epoch.as_ref(),
+                session_epoch,
+            )
+        },
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -6090,7 +6127,13 @@ fn run_relay_tunnel_session(
     ctx.request_repaint();
 
     let (crypto, relay_addr, relay_ticket) =
-        match api_client::prepare_relay_attempt(api_discovery.as_ref()) {
+        match api_client::prepare_relay_attempt(api_discovery.as_ref(), &|| {
+            session_cancelled(
+                disconnect.as_ref(),
+                connection_epoch.as_ref(),
+                session_epoch,
+            )
+        }) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[relay] Relay setup failed: {e}");

@@ -417,6 +417,7 @@ pub fn start_port_mapping(shared: Arc<ApiDiscoveryShared>) {
 pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::Context) {
     std::thread::spawn(move || {
         let mut failures: u32 = 0;
+        let mut warmed = false;
         loop {
             let url = shared.api_url.lock().unwrap().clone();
             let token = shared.token.lock().unwrap().clone();
@@ -456,6 +457,22 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
                     eprintln!("[api] Discovery connection restored");
                 }
                 failures = 0;
+                // Warm the punch socket once the API is reachable: binding it
+                // now (instead of lazily inside the first connect attempt)
+                // lets the port-mapping thread acquire a PCP/NAT-PMP mapping
+                // and STUN discover our external port *before* the user hits
+                // Connect. Without this, the first cross-network attempt
+                // always advertised candidates with no router-forwarded port
+                // — the main reason attempt #1 failed where the retry worked.
+                if !warmed && shared.punch_socket_port().is_none() {
+                    warmed = true;
+                    let warm = Arc::clone(&shared);
+                    std::thread::spawn(move || {
+                        if let Err(e) = warm.ensure_punch_socket() {
+                            eprintln!("[api] punch socket warm-up failed: {e}");
+                        }
+                    });
+                }
                 std::thread::sleep(Duration::from_secs(3));
             } else {
                 let wait = retry_interval(failures);
@@ -535,9 +552,21 @@ fn crypto_from_signal_response(
     Ok(shared.crypto_for_session_key(session_key))
 }
 
+/// Error string returned when `should_cancel` fires inside a signaling
+/// helper. Callers match on it to distinguish a user cancel from a real
+/// failure (a cancel must not fall through to the relay chain).
+pub const CANCELLED: &str = "connection attempt cancelled";
+
 /// Refresh candidates and key material immediately before a punched connection attempt.
+///
+/// `should_cancel` is polled between the (potentially slow, up to 15s each)
+/// signaling steps so a user cancel aborts promptly instead of leaving a
+/// zombie connect thread that keeps registering and punching on the shared
+/// punch socket underneath the next attempt — its stale-generation recv loop
+/// would consume the fresh attempt's STPUNCH datagrams.
 pub fn prepare_punch_attempt(
     shared: &ApiDiscoveryShared,
+    should_cancel: &dyn Fn() -> bool,
 ) -> Result<(Vec<SocketAddr>, Arc<CryptoContext>), String> {
     let url = shared.api_url.lock().unwrap().clone();
     let token = shared.token.lock().unwrap().clone();
@@ -549,6 +578,9 @@ pub fn prepare_punch_attempt(
     }
 
     let local_candidates = shared.ensure_punch_socket()?;
+    if should_cancel() {
+        return Err(CANCELLED.into());
+    }
 
     let reg_body = serde_json::json!({
         "token": token,
@@ -564,6 +596,9 @@ pub fn prepare_punch_attempt(
         .set("Content-Type", "application/json")
         .send_string(&reg_body)
         .map_err(|e| format!("register with API: {e}"))?;
+    if should_cancel() {
+        return Err(CANCELLED.into());
+    }
 
     let key_body = serde_json::json!({
         "token": token,
@@ -587,6 +622,9 @@ pub fn prepare_punch_attempt(
         serde_json::from_str(&key_text).map_err(|e| format!("parse key response: {e}"))?;
     validate_partner_response(&key_json, &expected_host_peer_id, &expected_host_lease_id)?;
     shared.update_shared_key_from_partner_b64(key_json["partner_key"].as_str());
+    if should_cancel() {
+        return Err(CANCELLED.into());
+    }
 
     let cand_body = serde_json::json!({
         "token": token,
@@ -621,6 +659,9 @@ pub fn prepare_punch_attempt(
         return Err("API session does not have any host punch candidates yet".into());
     }
     *shared.partner_candidates.lock().unwrap() = partner_candidates.clone();
+    if should_cancel() {
+        return Err(CANCELLED.into());
+    }
 
     let punch_nonce = shared.next_punch_nonce.fetch_add(1, Ordering::Relaxed);
     let punch_body = serde_json::json!({
@@ -663,6 +704,7 @@ pub fn prepare_punch_attempt(
 /// blocked entirely by a firewall or proxy).
 pub fn prepare_relay_attempt(
     shared: &ApiDiscoveryShared,
+    should_cancel: &dyn Fn() -> bool,
 ) -> Result<(Arc<CryptoContext>, String, String), String> {
     let url = shared.api_url.lock().unwrap().clone();
     let token = shared.token.lock().unwrap().clone();
@@ -688,6 +730,9 @@ pub fn prepare_relay_attempt(
         .set("Content-Type", "application/json")
         .send_string(&reg_body)
         .map_err(|e| format!("register with API: {e}"))?;
+    if should_cancel() {
+        return Err(CANCELLED.into());
+    }
 
     // Key exchange — the relay only ever carries ciphertext.
     let key_body = serde_json::json!({
@@ -712,6 +757,9 @@ pub fn prepare_relay_attempt(
         serde_json::from_str(&key_text).map_err(|e| format!("parse key response: {e}"))?;
     validate_partner_response(&key_json, &expected_host_peer_id, &expected_host_lease_id)?;
     shared.update_shared_key_from_partner_b64(key_json["partner_key"].as_str());
+    if should_cancel() {
+        return Err(CANCELLED.into());
+    }
 
     // Create a real relay request and obtain a short-lived ticket over HTTPS.
     let relay_nonce = shared.next_relay_nonce.fetch_add(1, Ordering::Relaxed);

@@ -1819,11 +1819,13 @@ mod tests {
 
         let before = Instant::now();
         for frame_id in 0..600u32 {
-            let mut frame = VideoFrameBuffer::default();
-            frame.debug_timing = Some(FrameDebugTiming {
-                frame_id,
+            let frame = VideoFrameBuffer {
+                debug_timing: Some(FrameDebugTiming {
+                    frame_id,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            });
+            };
             playout.enqueue(frame);
         }
         let latest = playout.queued.back().expect("frames queued").present_at;
