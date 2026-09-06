@@ -410,25 +410,6 @@ fn addr_ip(addr: &str) -> Option<std::net::IpAddr> {
     addr_host(addr).parse().ok()
 }
 
-fn is_privateish_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            if v4.is_private() || v4.is_loopback() || v4.is_link_local() {
-                return true;
-            }
-            // CGNAT range (100.64.0.0/10), which includes Tailscale's typical
-            // address space. stdlib's Ipv4Addr::is_private() doesn't cover it,
-            // and we don't want hole-punch fallback firing on a Tailscale IP
-            // since punching to a CGNAT address has no chance of working.
-            let o = v4.octets();
-            o[0] == 100 && (64..=127).contains(&o[1])
-        }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
-        }
-    }
-}
-
 /// Reachability class of a server address, used for the connection-path badge.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PathClass {
@@ -469,18 +450,11 @@ fn classify_path(addr: &str) -> PathClass {
     }
 }
 
-fn allow_hole_punch_fallback(socket_addr: std::net::SocketAddr) -> bool {
-    !is_privateish_ip(socket_addr.ip())
-}
-
 /// Choose the host candidate a *remote* client can actually reach.
 ///
 /// Server candidates arrive sorted LAN-first (the server's own best path), but
 /// an API-discovered host with no LAN beacon means the client is almost
-/// certainly not on the server's LAN. The server's 192.168/172.16 address is
-/// then both unreachable AND — being private-ish — would suppress the
-/// hole-punch fallback in `connect()` (`allow_hole_punch_fallback`), so a
-/// connect attempt just hard-fails. Prefer a shared VPN address
+/// certainly not on the server's LAN. Prefer a shared VPN address
 /// (Tailscale/CGNAT, directly routable across networks), else a public address
 /// (which routes via hole punch), and fall back to a LAN address only when the
 /// host advertised nothing better. When the client *is* co-LAN, `best_path`
@@ -4196,7 +4170,10 @@ fn run_connection(
     }
 
     // Try direct TCP first. If it fails and we have tunnel state, fall back to
-    // hole punch, then to the API server's TCP relay.
+    // hole punch, then to the API server's TCP relay. A private/CGNAT direct
+    // address must not suppress fallback: STUN may have failed, or that VPN
+    // may be unreachable here. Signaling refreshes the full candidate list
+    // and the relay can work even when no public UDP candidate exists.
     let force_tcp = force_tcp_media.lock().unwrap().contains(&addr) || force_tcp_env();
     let tcp_timeout = if punch_fallback_available { 3 } else { 5 };
     let tcp_result = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(tcp_timeout));
@@ -4242,7 +4219,7 @@ fn run_connection(
             s
         }
         Err(tcp_err) => {
-            if allow_hole_punch_fallback(socket_addr) && punch_fallback_available {
+            if punch_fallback_available {
                 eprintln!(
                     "[connect] Direct TCP to {socket_addr} failed ({tcp_err}); trying punch/relay fallback..."
                 );
@@ -4377,7 +4354,7 @@ fn run_connection(
         dead
     };
     if let Some(reason) = auth_dead {
-        if allow_hole_punch_fallback(socket_addr) && punch_fallback_available {
+        if punch_fallback_available {
             eprintln!(
                 "[connect] TCP to {socket_addr} accepted but handshake dead ({reason}); \
                  trying punch/relay fallback..."

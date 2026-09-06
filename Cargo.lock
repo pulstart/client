@@ -3489,7 +3489,7 @@ dependencies = [
 
 [[package]]
 name = "st-client"
-version = "0.1.0"
+version = "0.12.11"
 dependencies = [
  "arboard",
  "ash",
@@ -3541,7 +3541,7 @@ dependencies = [
 
 [[package]]
 name = "st-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chacha20poly1305",
  "hkdf",
