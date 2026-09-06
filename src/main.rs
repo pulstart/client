@@ -8412,6 +8412,11 @@ fn pick_wgpu_present_mode() -> eframe::wgpu::PresentMode {
 }
 
 fn main() {
+    // Also used by packaging to verify the app loads without opening a GUI.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--version")) {
+        println!("st-client {}", updater::current_version());
+        return;
+    }
     match updater::maybe_run_apply_update_from_args() {
         Ok(true) => return,
         Ok(false) => {}
