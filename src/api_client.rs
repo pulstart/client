@@ -4,7 +4,7 @@ use st_protocol::tunnel::{
 };
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 /// Shared ureq agent for all signaling calls. The default ureq agent has no
@@ -17,9 +17,10 @@ fn http_agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
         ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(5))
-            .timeout_read(Duration::from_secs(10))
-            .timeout_write(Duration::from_secs(10))
+            .timeout(Duration::from_secs(5))
+            .timeout_connect(Duration::from_secs(3))
+            .timeout_read(Duration::from_secs(5))
+            .timeout_write(Duration::from_secs(5))
             .build()
     })
 }
@@ -87,6 +88,8 @@ pub struct ApiDiscoveryShared {
     pub partner_candidates: Mutex<Vec<SocketAddr>>,
     /// Process-lifetime UDP socket used for STUN and hole punching.
     punch_socket: Mutex<Option<UdpSocket>>,
+    // Serialize signaling and socket ownership across cancelled/restarted attempts.
+    tunnel_session: Mutex<()>,
     /// Local candidates advertised to the API server (ip:port strings).
     pub punch_candidates: Mutex<Vec<String>>,
     /// Last time we refreshed `punch_candidates` via STUN. Used to age out
@@ -140,6 +143,7 @@ impl ApiDiscoveryShared {
             crypto: Mutex::new(None),
             partner_candidates: Mutex::new(Vec::new()),
             punch_socket: Mutex::new(None),
+            tunnel_session: Mutex::new(()),
             punch_candidates: Mutex::new(Vec::new()),
             last_stun: Mutex::new(None),
             portmap_external: Mutex::new(None),
@@ -148,6 +152,22 @@ impl ApiDiscoveryShared {
             relay_port: Mutex::new(None),
             punch_session_active: AtomicBool::new(false),
             connected: AtomicBool::new(false),
+        }
+    }
+
+    pub fn acquire_tunnel_session(
+        &self,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<MutexGuard<'_, ()>, String> {
+        loop {
+            if should_cancel() {
+                return Err(CANCELLED.into());
+            }
+            match self.tunnel_session.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+                Err(TryLockError::Poisoned(_)) => return Err("tunnel session lock poisoned".into()),
+            }
         }
     }
 
@@ -177,6 +197,16 @@ impl ApiDiscoveryShared {
 
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
+    }
+
+    pub fn is_punch_candidate(&self, addr: SocketAddr) -> bool {
+        self.host.lock().unwrap().as_ref().is_some_and(|host| {
+            host.last_seen.elapsed() < Duration::from_secs(30)
+                && host
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.parse::<SocketAddr>().ok() == Some(addr))
+        })
     }
 
     pub fn is_punch_session_active(&self) -> bool {
@@ -261,7 +291,10 @@ impl ApiDiscoveryShared {
     }
 
     fn ensure_punch_socket(&self) -> Result<Vec<String>, String> {
-        let has_socket = self.punch_socket.lock().unwrap().is_some();
+        // Serialize cache inspection and refresh: a simultaneous warm-up must
+        // not run a second STUN reader after an attempt has started punching.
+        let mut socket_guard = self.punch_socket.lock().unwrap();
+        let has_socket = socket_guard.is_some();
         let cached = self.punch_candidates.lock().unwrap().clone();
         let stun_fresh = match *self.last_stun.lock().unwrap() {
             Some(t) => t.elapsed() < STUN_REFRESH_TTL,
@@ -274,7 +307,6 @@ impl ApiDiscoveryShared {
             return Ok(self.augment_with_portmap(cached));
         }
 
-        let mut socket_guard = self.punch_socket.lock().unwrap();
         if socket_guard.is_none() {
             let socket =
                 UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind punch socket: {e}"))?;
@@ -288,11 +320,13 @@ impl ApiDiscoveryShared {
             .local_addr()
             .map_err(|e| format!("punch socket local_addr: {e}"))?
             .port();
+        socket
+            .set_nonblocking(false)
+            .map_err(|e| format!("configure STUN socket: {e}"))?;
         let candidates = st_protocol::tunnel::gather_candidates_with_stun(port, Some(socket));
-        drop(socket_guard);
-
         *self.punch_candidates.lock().unwrap() = candidates.clone();
         *self.last_stun.lock().unwrap() = Some(Instant::now());
+        drop(socket_guard);
         Ok(self.augment_with_portmap(candidates))
     }
 }
@@ -430,6 +464,20 @@ pub fn start_api_discovery(shared: Arc<ApiDiscoveryShared>, ctx: eframe::egui::C
                 }
                 std::thread::sleep(Duration::from_secs(5));
                 continue;
+            }
+
+            // A live tunnel must renew its lease: token-only discovery does not
+            // keep the client slot alive beyond the API's 120-second TTL.
+            // Heartbeats cannot reserve or resurrect a slot after disconnect.
+            if shared.tunnel_session.try_lock().is_err() {
+                let peer_id = shared.peer_id.lock().unwrap().clone();
+                let body = serde_json::json!({"token": token, "role": "client",
+                    "peer_id": peer_id, "lease_id": shared.lease_id})
+                .to_string();
+                let _ = http_agent()
+                    .post(&format!("{url}/api/heartbeat"))
+                    .set("Content-Type", "application/json")
+                    .send_string(&body);
             }
 
             // Idle discovery is deliberately token-only and read-only. It must
@@ -591,70 +639,31 @@ pub fn prepare_punch_attempt(
         "public_key": shared.public_key_b64(),
     })
     .to_string();
-    http_agent()
+    let response = http_agent()
         .post(&format!("{url}/api/register"))
         .set("Content-Type", "application/json")
         .send_string(&reg_body)
-        .map_err(|e| format!("register with API: {e}"))?;
+        .map_err(|e| format!("register with API: {e}"))?
+        .into_string()
+        .map_err(|e| format!("read registration response: {e}"))?;
     if should_cancel() {
         return Err(CANCELLED.into());
     }
-
-    let key_body = serde_json::json!({
-        "token": token,
-        "role": "client",
-        "peer_id": peer_id,
-        "lease_id": lease_id,
-        "expected_partner_peer_id": expected_host_peer_id,
-        "expected_partner_lease_id": expected_host_lease_id,
-        "public_key": shared.public_key_b64(),
-    })
-    .to_string();
-    let key_resp = http_agent()
-        .post(&format!("{url}/api/key"))
-        .set("Content-Type", "application/json")
-        .send_string(&key_body)
-        .map_err(|e| format!("exchange tunnel key: {e}"))?;
-    let key_text = key_resp
-        .into_string()
-        .map_err(|e| format!("read key response: {e}"))?;
-    let key_json: serde_json::Value =
-        serde_json::from_str(&key_text).map_err(|e| format!("parse key response: {e}"))?;
-    validate_partner_response(&key_json, &expected_host_peer_id, &expected_host_lease_id)?;
-    shared.update_shared_key_from_partner_b64(key_json["partner_key"].as_str());
-    if should_cancel() {
-        return Err(CANCELLED.into());
+    let response: serde_json::Value =
+        serde_json::from_str(&response).map_err(|e| format!("parse registration response: {e}"))?;
+    let host = &response["session"]["host"];
+    if host["peer_id"].as_str() != Some(expected_host_peer_id.as_str())
+        || host["lease_id"].as_str() != Some(expected_host_lease_id.as_str())
+    {
+        return Err("API host lease changed during signaling".into());
     }
-
-    let cand_body = serde_json::json!({
-        "token": token,
-        "role": "client",
-        "peer_id": peer_id,
-        "lease_id": lease_id,
-        "expected_partner_peer_id": expected_host_peer_id,
-        "expected_partner_lease_id": expected_host_lease_id,
-        "candidates": local_candidates,
-    })
-    .to_string();
-    let cand_resp = http_agent()
-        .post(&format!("{url}/api/candidates"))
-        .set("Content-Type", "application/json")
-        .send_string(&cand_body)
-        .map_err(|e| format!("refresh punch candidates: {e}"))?;
-    let cand_text = cand_resp
-        .into_string()
-        .map_err(|e| format!("read candidates response: {e}"))?;
-    let cand_json: serde_json::Value =
-        serde_json::from_str(&cand_text).map_err(|e| format!("parse candidates response: {e}"))?;
-    validate_partner_response(&cand_json, &expected_host_peer_id, &expected_host_lease_id)?;
-    let partner_candidates: Vec<SocketAddr> = cand_json["partner_candidates"]
+    shared.update_shared_key_from_partner_b64(host["public_key"].as_str());
+    let partner_candidates: Vec<SocketAddr> = host["candidates"]
         .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|value| value.as_str()?.parse().ok())
-                .collect()
-        })
-        .unwrap_or_default();
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str()?.parse().ok())
+        .collect();
     if partner_candidates.is_empty() {
         return Err("API session does not have any host punch candidates yet".into());
     }
@@ -903,5 +912,138 @@ fn clear_host(shared: &ApiDiscoveryShared) -> bool {
         true
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_punch_uses_registration_snapshot_without_extra_exchange_round_trips() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let shared = ApiDiscoveryShared::new(url, "token".into(), "client".into());
+        *shared.host.lock().unwrap() = Some(ApiDiscoveredHost {
+            candidates: vec!["127.0.0.1:5000".into()],
+            hostname: None,
+            peer_id: Some("host".into()),
+            lease_id: Some("host-lease".into()),
+            last_seen: Instant::now(),
+        });
+        *shared.punch_socket.lock().unwrap() = Some(UdpSocket::bind("127.0.0.1:0").unwrap());
+        *shared.punch_candidates.lock().unwrap() = vec!["127.0.0.1:6000".into()];
+        *shared.last_stun.lock().unwrap() = Some(Instant::now());
+        assert!(shared.is_punch_candidate("127.0.0.1:5000".parse().unwrap()));
+        assert!(!shared.is_punch_candidate("127.0.0.1:8080".parse().unwrap()));
+        let host_keys = TunnelKeys::generate();
+        let host_key = base64_encode(&host_keys.public_key_bytes());
+        let host_secret =
+            host_keys.derive_shared_key(&shared.tunnel_keys.lock().unwrap().public_key_bytes());
+        let lease_id = shared.lease_id.clone();
+        let server = std::thread::spawn(move || {
+            let mut generation = 0;
+            for path in ["/api/register", "/api/punch"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with(&format!("POST {path} ")), "{line}");
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let response = if path == "/api/register" {
+                    serde_json::json!({"session": {"host": {
+                        "peer_id": "host", "lease_id": "host-lease", "public_key": host_key,
+                        "candidates": ["127.0.0.1:5000"]
+                    }}})
+                } else {
+                    generation = body["generation"].as_u64().unwrap();
+                    serde_json::json!({"mode": "punch", "generation": generation,
+                        "owner_peer_id": "client", "owner_lease_id": lease_id,
+                        "partner_peer_id": "host", "partner_lease_id": "host-lease",
+                        "session_id": "session", "context": "context"})
+                }
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                )
+                .unwrap();
+            }
+            let key = derive_session_key(
+                &host_secret,
+                &SessionKeyContext {
+                    request_context: "context",
+                    session_id: "session",
+                    mode: TunnelMode::Punch,
+                    generation,
+                    host_peer_id: "host",
+                    host_lease_id: "host-lease",
+                    client_peer_id: "client",
+                    client_lease_id: &lease_id,
+                },
+            )
+            .unwrap();
+            CryptoContext::new(key, true)
+        });
+        let (candidates, crypto) = prepare_punch_attempt(&shared, &|| false).unwrap();
+        assert_eq!(
+            candidates,
+            vec!["127.0.0.1:5000".parse::<SocketAddr>().unwrap()]
+        );
+        let host_crypto = server.join().unwrap();
+        assert_eq!(
+            host_crypto
+                .decrypt(&crypto.encrypt(b"first attempt"))
+                .unwrap(),
+            b"first attempt"
+        );
+    }
+
+    #[test]
+    fn reconnect_waits_for_previous_socket_owner_and_can_cancel() {
+        let shared = Arc::new(ApiDiscoveryShared::new(
+            String::new(),
+            String::new(),
+            "client".into(),
+        ));
+        let first = shared.acquire_tunnel_session(&|| false).unwrap();
+        let next = Arc::clone(&shared);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancelled);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting = std::thread::spawn(move || {
+            let result = next.acquire_tunnel_session(&|| stop.load(Ordering::Acquire));
+            tx.send(result.err()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap().as_deref(),
+            Some(CANCELLED)
+        );
+        waiting.join().unwrap();
+        drop(first);
+        assert!(shared.acquire_tunnel_session(&|| false).is_ok());
     }
 }

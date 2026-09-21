@@ -4015,6 +4015,15 @@ fn run_fallback_chain(
             session_epoch,
         )
     };
+    // Cancellation alone does not join the previous reader. Keep signaling and
+    // the entire tunnel session exclusive so an old recv cannot steal the new
+    // attempt's encrypted probes, nor can its cleanup clear the new owner flag.
+    let session_owner = Arc::clone(&api_discovery);
+    let _tunnel_session = match session_owner.acquire_tunnel_session(&cancelled) {
+        Ok(guard) => guard,
+        Err(_) if cancelled() => return Ok(()),
+        Err(error) => return Err(error),
+    };
     // Two punch rounds before falling back to the relay. The server often
     // starts probing a few seconds into our 10s window (it only notices the
     // punch nonce on its next API poll), and the first round's probes warm
@@ -4169,14 +4178,22 @@ fn run_connection(
         return;
     }
 
-    // Try direct TCP first. If it fails and we have tunnel state, fall back to
+    // Try direct TCP first for actual server addresses. API candidates name
+    // the host's dedicated UDP socket, not its TCP listener; dialing TCP there
+    // adds an inevitable timeout before every remote connection.
+    // If direct TCP fails and we have tunnel state, fall back to
     // hole punch, then to the API server's TCP relay. A private/CGNAT direct
     // address must not suppress fallback: STUN may have failed, or that VPN
     // may be unreachable here. Signaling refreshes the full candidate list
     // and the relay can work even when no public UDP candidate exists.
     let force_tcp = force_tcp_media.lock().unwrap().contains(&addr) || force_tcp_env();
     let tcp_timeout = if punch_fallback_available { 3 } else { 5 };
-    let tcp_result = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(tcp_timeout));
+    let tcp_result = if punch_fallback_available && api_discovery.is_punch_candidate(socket_addr) {
+        Err("API candidate is a UDP punch endpoint".to_string())
+    } else {
+        TcpStream::connect_timeout(&socket_addr, Duration::from_secs(tcp_timeout))
+            .map_err(|error| error.to_string())
+    };
 
     let mut tcp = match tcp_result {
         Ok(s) => {
@@ -4220,9 +4237,7 @@ fn run_connection(
         }
         Err(tcp_err) => {
             if punch_fallback_available {
-                eprintln!(
-                    "[connect] Direct TCP to {socket_addr} failed ({tcp_err}); trying punch/relay fallback..."
-                );
+                eprintln!("[connect] Using punch/relay for {socket_addr}: {tcp_err}");
                 if let Err(failure) = run_fallback_chain(
                     token,
                     display_refresh_millihz,

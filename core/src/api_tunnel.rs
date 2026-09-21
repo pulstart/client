@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 use crate::client::ApiConnectionConfig;
 
 const PUNCH_TIMEOUT: Duration = Duration::from_secs(10);
-const HOST_SYNC_DELAY: Duration = Duration::from_millis(3_250);
 const MAX_TOKEN_LEN: usize = 256;
 
 struct ApiProcessState {
@@ -77,7 +76,44 @@ impl Drop for ApiSessionLease {
 
 pub(crate) struct ApiTunnelConnection {
     link: Arc<dyn TunnelLink>,
+    // Stop renewal before releasing the process lease to a reconnect attempt.
+    heartbeat: ApiLeaseHeartbeat,
     lease: ApiSessionLease,
+}
+
+struct ApiLeaseHeartbeat {
+    stop: std::sync::mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ApiLeaseHeartbeat {
+    fn start(config: &ApiConnectionConfig, token: &str, state: &ApiProcessState) -> Self {
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let url = config.api_url.clone();
+        let body = serde_json::json!({"token": token, "role": "client",
+            "peer_id": config.client_peer_id, "lease_id": state.lease_id});
+        let worker = std::thread::spawn(move || {
+            while matches!(
+                stopped.recv_timeout(Duration::from_secs(30)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                let _ = post_json(&url, "heartbeat", &body);
+            }
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for ApiLeaseHeartbeat {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl ApiTunnelConnection {
@@ -86,6 +122,7 @@ impl ApiTunnelConnection {
     }
 
     pub(crate) fn close(self, config: &ApiConnectionConfig, token: &str) {
+        drop(self.heartbeat);
         unregister(config, token, &self.lease.state);
         drop(self.lease);
     }
@@ -95,9 +132,10 @@ fn http_agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
         ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(5))
-            .timeout_read(Duration::from_secs(10))
-            .timeout_write(Duration::from_secs(10))
+            .timeout(Duration::from_secs(5))
+            .timeout_connect(Duration::from_secs(3))
+            .timeout_read(Duration::from_secs(5))
+            .timeout_write(Duration::from_secs(5))
             .build()
     })
 }
@@ -147,7 +185,11 @@ pub(crate) fn connect_punch(
     })();
 
     match result {
-        Ok(link) => Ok(ApiTunnelConnection { link, lease }),
+        Ok(link) => Ok(ApiTunnelConnection {
+            link,
+            heartbeat: ApiLeaseHeartbeat::start(config, token, &state),
+            lease,
+        }),
         Err(error) => {
             unregister(config, token, &state);
             Err(error)
@@ -170,7 +212,11 @@ pub(crate) fn connect_relay(
             dial_relay(config, crypto, &ticket, relay_port, stop)
         });
     match result {
-        Ok(link) => Ok(ApiTunnelConnection { link, lease }),
+        Ok(link) => Ok(ApiTunnelConnection {
+            link,
+            heartbeat: ApiLeaseHeartbeat::start(config, token, &state),
+            lease,
+        }),
         Err(error) => {
             unregister(config, token, &state);
             Err(error)
@@ -263,19 +309,10 @@ fn prepare_punch(
 ) -> Result<(Vec<SocketAddr>, [u8; 32], HostIdentity), String> {
     register(config, token, local_candidates, state)?;
     check_cancelled(stop)?;
-    let mut host = verify_host(config, token, state)?;
+    let host = verify_host(config, token, state)?;
     check_cancelled(stop)?;
-    exchange_key(config, token, state, &host)?;
-    check_cancelled(stop)?;
-    exchange_candidates(config, token, local_candidates, state, &host)?;
-    check_cancelled(stop)?;
-
-    // An idle host can sleep for three seconds. Let it observe this key before
-    // posting the nonce, then refresh both partner values once more so its
-    // punch task cannot capture stale signaling state.
-    interruptible_sleep(stop, HOST_SYNC_DELAY)?;
-    host = verify_host(config, token, state)?;
-    check_cancelled(stop)?;
+    // The host reads keys, candidates and the request from one API snapshot;
+    // it no longer needs a fixed sleep to synchronize independent polls.
     let shared_secret = exchange_key(config, token, state, &host)?;
     check_cancelled(stop)?;
     let partner_candidates = exchange_candidates(config, token, local_candidates, state, &host)?;
@@ -329,15 +366,6 @@ fn prepare_relay(
         &response,
     )?;
     Ok((crypto, ticket, relay_port))
-}
-
-fn interruptible_sleep(stop: &AtomicBool, duration: Duration) -> Result<(), String> {
-    let deadline = Instant::now() + duration;
-    while Instant::now() < deadline {
-        check_cancelled(stop)?;
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    Ok(())
 }
 
 fn register(
