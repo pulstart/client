@@ -190,6 +190,8 @@ struct StreamApp {
     audio_enabled: bool,
     debug_enabled: bool,
     yuv444_enabled: bool,
+    /// Multiplier on remote wheel deltas.
+    scroll_sensitivity: f32,
     display_refresh_millihz: Option<u32>,
     video_codec_support: decode::VideoCodecSupportReport,
     audio_enabled_flag: Arc<AtomicBool>,
@@ -509,6 +511,34 @@ fn save_yuv444_enabled(enabled: bool) {
     let _ = std::fs::write(dir.join("yuv444_enabled"), if enabled { "1" } else { "0" });
 }
 
+const SCROLL_SENSITIVITY_RANGE: std::ops::RangeInclusive<f32> = 0.1..=5.0;
+
+fn parse_scroll_sensitivity(raw: &str) -> Option<f32> {
+    raw.trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .map(|value| {
+            value.clamp(
+                *SCROLL_SENSITIVITY_RANGE.start(),
+                *SCROLL_SENSITIVITY_RANGE.end(),
+            )
+        })
+}
+
+fn load_scroll_sensitivity() -> f32 {
+    std::fs::read_to_string(state_dir().join("scroll_sensitivity"))
+        .ok()
+        .and_then(|raw| parse_scroll_sensitivity(&raw))
+        .unwrap_or(1.0)
+}
+
+fn save_scroll_sensitivity(value: f32) {
+    let dir = state_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("scroll_sensitivity"), format!("{value:.2}"));
+}
+
 fn load_token() -> String {
     std::fs::read_to_string(state_dir().join("token"))
         .ok()
@@ -784,6 +814,7 @@ impl StreamApp {
         let audio = load_audio_enabled();
         let debug_enabled = load_debug_enabled();
         let yuv444_enabled = load_yuv444_enabled();
+        let scroll_sensitivity = load_scroll_sensitivity();
         let menu_button_pos = load_menu_button_pos().unwrap_or_else(default_menu_button_pos);
         let display_refresh_millihz = display::detect_max_refresh_millihz();
         let video_codec_support = decode::VideoDecoder::detect_supported_codecs();
@@ -828,6 +859,7 @@ impl StreamApp {
             audio_enabled: audio,
             debug_enabled,
             yuv444_enabled,
+            scroll_sensitivity,
             display_refresh_millihz,
             video_codec_support,
             audio_enabled_flag: Arc::new(AtomicBool::new(audio)),
@@ -1239,7 +1271,7 @@ impl StreamApp {
         // already reflects the system "natural scrolling" setting, so that
         // toggle is the single source of truth for remote scroll direction —
         // no app-level inversion.
-        let scaled = delta * wheel_unit_scale(unit);
+        let scaled = delta * wheel_unit_scale(unit) * self.scroll_sensitivity;
         self.pending_wheel_units += scaled;
         let delta_x = take_wheel_units(&mut self.pending_wheel_units.x);
         let delta_y = take_wheel_units(&mut self.pending_wheel_units.y);
@@ -3122,6 +3154,17 @@ impl StreamApp {
             self.yuv444_enabled = !self.yuv444_enabled;
             save_yuv444_enabled(self.yuv444_enabled);
         }
+        ui.add_space(8.0);
+
+        if render_parsec_slider(
+            ui,
+            "Scroll Sensitivity",
+            "Multiplier for remote mouse-wheel and trackpad scrolling. Applies immediately.",
+            &mut self.scroll_sensitivity,
+            BG_ROW,
+        ) {
+            save_scroll_sensitivity(self.scroll_sensitivity);
+        }
 
         ui.add_space(16.0);
         ui.label(
@@ -3472,6 +3515,17 @@ impl StreamApp {
                                     .clicked()
                                 {
                                     debug_toggled = true;
+                                }
+
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new("Scroll").size(12.0).weak());
+                                let scroll = ui.add_sized(
+                                    [170.0, 22.0],
+                                    scroll_sensitivity_slider(&mut self.scroll_sensitivity),
+                                );
+                                if scroll.drag_stopped() || (scroll.changed() && !scroll.dragged())
+                                {
+                                    save_scroll_sensitivity(self.scroll_sensitivity);
                                 }
 
                                 // Monitor picker — only when the server reports
@@ -7179,6 +7233,54 @@ fn render_parsec_toggle(
     clicked
 }
 
+fn scroll_sensitivity_slider(value: &mut f32) -> egui::Slider<'_> {
+    egui::Slider::new(value, SCROLL_SENSITIVITY_RANGE)
+        .logarithmic(true)
+        .fixed_decimals(2)
+        .suffix("×")
+}
+
+fn render_parsec_slider(
+    ui: &mut egui::Ui,
+    title: &str,
+    description: &str,
+    value: &mut f32,
+    bg: egui::Color32,
+) -> bool {
+    let mut changed = false;
+    egui::Frame::NONE
+        .fill(bg)
+        .corner_radius(6)
+        .inner_margin(egui::Margin::same(14))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(title)
+                            .size(14.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(230, 233, 240)),
+                    );
+                    ui.label(
+                        egui::RichText::new(description)
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(138, 142, 150)),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Reset").clicked() {
+                        *value = 1.0;
+                        changed = true;
+                    }
+                    let response = ui.add(scroll_sensitivity_slider(value));
+                    changed |=
+                        response.drag_stopped() || (response.changed() && !response.dragged());
+                });
+            });
+        });
+    changed
+}
+
 fn about_platform_label() -> &'static str {
     if cfg!(target_os = "linux") {
         "Linux"
@@ -8546,6 +8648,28 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_sensitivity_parses_and_clamps() {
+        assert_eq!(parse_scroll_sensitivity(" 1.50\n"), Some(1.5));
+        assert_eq!(parse_scroll_sensitivity("0"), Some(0.1));
+        assert_eq!(parse_scroll_sensitivity("99"), Some(5.0));
+        assert_eq!(parse_scroll_sensitivity("NaN"), None);
+        assert_eq!(parse_scroll_sensitivity("fast"), None);
+    }
+
+    #[test]
+    fn low_scroll_sensitivity_accumulates_instead_of_dropping() {
+        let mut accum = 0.0f32;
+        let per_notch = wheel_unit_scale(egui::MouseWheelUnit::Line) * 0.1;
+        let sent: i32 = (0..10)
+            .map(|_| {
+                accum += per_notch;
+                i32::from(take_wheel_units(&mut accum))
+            })
+            .sum();
+        assert_eq!(sent, i32::from(MOUSE_WHEEL_STEP_UNITS));
+    }
 
     #[test]
     fn bounded_tunnel_media_handoff_keeps_latest_packets() {
