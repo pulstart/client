@@ -360,8 +360,7 @@ impl UdpReceiver {
         self.pending.pop_front()
     }
 
-    /// Block up to `timeout` waiting for socket data. Returns immediately once
-    /// data has arrived. On platforms without `poll`, degrades to a short sleep.
+    /// Block up to `timeout` waiting for socket data; returns once it arrives.
     pub fn wait_for_data(&mut self, timeout: Duration) {
         #[cfg(target_os = "linux")]
         {
@@ -383,9 +382,18 @@ impl UdpReceiver {
                 let _ = libc::poll(&mut pfd as *mut libc::pollfd, 1, poll_timeout_ms(timeout));
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            std::thread::sleep(timeout);
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::{WSAPoll, POLLRDNORM, WSAPOLLFD};
+            let mut pfd = WSAPOLLFD {
+                fd: self.socket.as_raw_socket() as usize,
+                events: POLLRDNORM,
+                revents: 0,
+            };
+            unsafe {
+                WSAPoll(&mut pfd, 1, poll_timeout_ms(timeout));
+            }
         }
     }
 
@@ -555,9 +563,9 @@ impl PacketReceiver {
     }
 
     pub fn wait_for_data(&mut self, timeout: Duration) {
-        // crossbeam try_recv has no wakeup we can latch to without consuming,
-        // so fall back to a short sleep. Most real deployments take the UDP path.
-        std::thread::sleep(timeout);
+        let mut select = crossbeam_channel::Select::new();
+        select.recv(&self.packet_rx);
+        let _ = select.ready_timeout(timeout);
     }
 
     pub fn take_stats(&mut self) -> Option<TransportWindowStats> {

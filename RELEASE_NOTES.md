@@ -1,3 +1,25 @@
+# 0.12.18
+
+Works with any 0.9.x host; update the host to 0.9.23 for the full effect.
+
+- Audio latency and glitches. The playback buffer held a fixed 60 ms; it now
+  sizes itself from the jitter it actually sees (20 ms floor, up to 60 ms)
+  and steers clock drift by dropping or repeating single samples, so a
+  quiet LAN plays with ~40 ms less delay. A lost 5 ms packet was concealed
+  with 120 ms of made-up sound and then clipped with a click; it is now
+  exactly 5 ms. The output device is opened with a small buffer, follows
+  the system default device, and is rebuilt if the stream errors (a
+  Bluetooth headset connecting used to silence audio for the session).
+- Input: a key tapped and released within one frame is no longer lost; a
+  lost key-up is repaired even while the mouse keeps moving (the repair
+  never ran during continuous motion); slow mouse movement keeps its
+  fractional part instead of vanishing; on Linux/Windows Ctrl chords no
+  longer arrive as Ctrl+Super.
+- Windows and NAT-traversed sessions wait for packets instead of sleeping in
+  20 ms steps, which added 10 ms on average to every frame.
+- Android: frames show as soon as they are decoded instead of one unit
+  later.
+
 # 0.12.17
 
 Works with any 0.9.x host.

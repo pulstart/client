@@ -306,6 +306,7 @@ struct StreamApp {
     /// is the "cross in from a window stacked on top" double-cursor case.
     prev_pointer_present: bool,
     pending_wheel_units: egui::Vec2,
+    pending_mouse_units: egui::Vec2,
     /// Number of upcoming frames whose `MouseMoved` deltas must be dropped.
     /// Set on every `CursorGrab` change because locking/warping the pointer
     /// makes the OS emit a spurious recentering delta that can land one or two
@@ -913,6 +914,7 @@ impl StreamApp {
             os_cursor_hide_settle_until: None,
             prev_pointer_present: false,
             pending_wheel_units: egui::Vec2::ZERO,
+            pending_mouse_units: egui::Vec2::ZERO,
             suppress_mouse_delta: 0,
             suppress_mouse_delta_until: None,
             suppress_pointer_pos_frames: 0,
@@ -1032,6 +1034,7 @@ impl StreamApp {
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
         self.pending_wheel_units = egui::Vec2::ZERO;
+        self.pending_mouse_units = egui::Vec2::ZERO;
         self.cursor_hidden_frames = 0;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
@@ -1122,6 +1125,7 @@ impl StreamApp {
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
         self.pending_wheel_units = egui::Vec2::ZERO;
+        self.pending_mouse_units = egui::Vec2::ZERO;
         self.cursor_hidden_frames = 0;
         self.remote_cursor_textures.clear();
         self.latest_remote_cursor_serial = None;
@@ -1142,6 +1146,7 @@ impl StreamApp {
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
         self.pending_wheel_units = egui::Vec2::ZERO;
+        self.pending_mouse_units = egui::Vec2::ZERO;
         self.cursor_hidden_frames = 0;
         self.resume_hover_after_relative_drag = false;
         self.hover_cursor_resync_pending = false;
@@ -1161,6 +1166,7 @@ impl StreamApp {
         self.last_sent_absolute_cursor = None;
         self.hover_cursor_pos = None;
         self.pending_wheel_units = egui::Vec2::ZERO;
+        self.pending_mouse_units = egui::Vec2::ZERO;
         self.cursor_hidden_frames = 0;
         self.menu_open = false;
         self.await_pointer_exit_after_auto_release = false;
@@ -1207,7 +1213,7 @@ impl StreamApp {
         self.last_local_cursor_prediction_at = None;
         self.await_pointer_exit_after_auto_release = false;
         self.clear_remote_keyboard();
-        if let Some(client_id) = self.shared_input.snapshot().client_id {
+        if let Some(client_id) = self.shared_input.client_id() {
             self.send_input_packet(InputPacket::MouseButtons(MouseButtonsInput {
                 client_id,
                 buttons: 0,
@@ -1260,7 +1266,7 @@ impl StreamApp {
 
     fn clear_remote_keyboard(&mut self) {
         if self.keyboard_state.clear() {
-            if let Some(client_id) = self.shared_input.snapshot().client_id {
+            if let Some(client_id) = self.shared_input.client_id() {
                 self.send_keyboard_snapshot(client_id);
             }
         }
@@ -5535,7 +5541,7 @@ fn run_tunnel_session(
                 }
             }
         }
-        if stream_config.is_some() && shared_input.snapshot().input_credential.is_some() {
+        if stream_config.is_some() && shared_input.input_credential().is_some() {
             break;
         }
     }
@@ -5754,7 +5760,7 @@ fn run_tunnel_session(
             did_work = true;
             mouse_heartbeat.observe(input_pkt, now);
             keyboard_heartbeat.observe(input_pkt, now);
-            if let Some(credential) = shared_input.snapshot().input_credential {
+            if let Some(credential) = shared_input.input_credential() {
                 let serialized = input_pkt.serialize(input_seq, credential);
                 input_seq = input_seq.wrapping_add(1);
                 let _ = punched.send_media(&serialized);
@@ -5765,7 +5771,7 @@ fn run_tunnel_session(
         // Heartbeat retransmission for button/key state repair over lossy UDP.
         if let Some(pkt) = mouse_heartbeat.due_packet(now) {
             did_work = true;
-            if let Some(credential) = shared_input.snapshot().input_credential {
+            if let Some(credential) = shared_input.input_credential() {
                 let serialized = pkt.serialize(input_seq, credential);
                 input_seq = input_seq.wrapping_add(1);
                 let _ = punched.send_media(&serialized);
@@ -5773,7 +5779,7 @@ fn run_tunnel_session(
         }
         if let Some(pkt) = keyboard_heartbeat.due_packet(now) {
             did_work = true;
-            if let Some(credential) = shared_input.snapshot().input_credential {
+            if let Some(credential) = shared_input.input_credential() {
                 let serialized = pkt.serialize(input_seq, credential);
                 input_seq = input_seq.wrapping_add(1);
                 let _ = punched.send_media(&serialized);
@@ -6555,24 +6561,25 @@ fn run_input_sender(
                 let now = Instant::now();
                 mouse_heartbeat.observe(packet, now);
                 keyboard_heartbeat.observe(packet, now);
-                if let Some(credential) = shared_input.snapshot().input_credential {
+                if let Some(credential) = shared_input.input_credential() {
                     send_input_packet_raw(&socket, target, packet, credential, &mut seq, cref);
                     mouse_heartbeat.mark_sent(packet, now);
                     keyboard_heartbeat.mark_sent(packet, now);
                 }
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                let now = Instant::now();
-                if let Some(credential) = shared_input.snapshot().input_credential {
-                    if let Some(packet) = mouse_heartbeat.due_packet(now) {
-                        send_input_packet_raw(&socket, target, packet, credential, &mut seq, cref);
-                    }
-                    if let Some(packet) = keyboard_heartbeat.due_packet(now) {
-                        send_input_packet_raw(&socket, target, packet, credential, &mut seq, cref);
-                    }
-                }
-            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+        // Repair heartbeats run after every wake: continuous mouse motion never
+        // lets the poll time out, and a lost key-up would stay stuck.
+        let now = Instant::now();
+        if let Some(credential) = shared_input.input_credential() {
+            if let Some(packet) = mouse_heartbeat.due_packet(now) {
+                send_input_packet_raw(&socket, target, packet, credential, &mut seq, cref);
+            }
+            if let Some(packet) = keyboard_heartbeat.due_packet(now) {
+                send_input_packet_raw(&socket, target, packet, credential, &mut seq, cref);
+            }
         }
     }
 }
@@ -6996,6 +7003,13 @@ fn wheel_unit_scale(unit: egui::MouseWheelUnit) -> f32 {
         egui::MouseWheelUnit::Line => f32::from(MOUSE_WHEEL_STEP_UNITS),
         egui::MouseWheelUnit::Page => f32::from(MOUSE_WHEEL_STEP_UNITS) * 6.0,
     }
+}
+
+fn take_pixel_units(delta: f32, remainder: &mut f32) -> i16 {
+    let total = delta + *remainder;
+    let whole = total.round().clamp(i16::MIN as f32, i16::MAX as f32);
+    *remainder = (total - whole).clamp(-0.5, 0.5);
+    whole as i16
 }
 
 fn take_wheel_units(accum: &mut f32) -> i16 {
@@ -8042,10 +8056,8 @@ impl eframe::App for StreamApp {
             } else {
                 None
             });
-        let mut keyboard_dirty = false;
-
-        if keyboard_forward_active {
-            keyboard_dirty |= self.keyboard_state.sync_modifiers(raw_input.modifiers);
+        if keyboard_forward_active && self.keyboard_state.sync_modifiers(raw_input.modifiers) {
+            self.send_keyboard_snapshot(client_id);
         }
 
         for event in &raw_input.events {
@@ -8061,7 +8073,9 @@ impl eframe::App for StreamApp {
                     }
                     let source_key = physical_key.unwrap_or(key);
                     if let Some(remote_key) = egui_key_to_remote_key(source_key) {
-                        keyboard_dirty |= self.keyboard_state.set_key(remote_key, pressed);
+                        if self.keyboard_state.set_key(remote_key, pressed) {
+                            self.send_keyboard_snapshot(client_id);
+                        }
                     }
                 }
                 egui::Event::PointerMoved(pos) => {
@@ -8138,16 +8152,8 @@ impl eframe::App for StreamApp {
                                 }
                             }
                         }
-                        let dx = input_delta
-                            .x
-                            .round()
-                            .clamp(i16::MIN as f32, i16::MAX as f32)
-                            as i16;
-                        let dy = input_delta
-                            .y
-                            .round()
-                            .clamp(i16::MIN as f32, i16::MAX as f32)
-                            as i16;
+                        let dx = take_pixel_units(input_delta.x, &mut self.pending_mouse_units.x);
+                        let dy = take_pixel_units(input_delta.y, &mut self.pending_mouse_units.y);
                         let mut predicted_cursor_pos = None;
                         if snapshot.capabilities.separate_cursor
                             && server_cursor_drawable(&snapshot)
@@ -8477,10 +8483,6 @@ impl eframe::App for StreamApp {
             }
         }
 
-        if keyboard_dirty {
-            self.send_keyboard_snapshot(client_id);
-        }
-
         if keyboard_forward_active {
             raw_input.events.retain(|event| {
                 !matches!(
@@ -8648,6 +8650,17 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_mouse_motion_keeps_its_fractions() {
+        let mut remainder = 0.0;
+        let sent: i32 = (0..100)
+            .map(|_| i32::from(take_pixel_units(0.3, &mut remainder)))
+            .sum();
+        assert_eq!(sent, 30);
+        assert_eq!(take_pixel_units(-2.6, &mut 0.0), -3);
+        assert_eq!(take_pixel_units(1e9, &mut 0.0), i16::MAX);
+    }
 
     #[test]
     fn scroll_sensitivity_parses_and_clamps() {

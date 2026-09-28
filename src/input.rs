@@ -3,7 +3,7 @@ use st_protocol::{
     control::OutputInfo, ControllerState, CursorShape, CursorState, InputCapabilities,
     InputCredential, InputSession, KeyboardKey, StreamConfig, KEYBOARD_STATE_BYTES,
 };
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// The client runs a Parsec-style two-mode cursor model. Only two modes
 /// actually forward input; the other two are transient "hands off" states.
@@ -54,7 +54,7 @@ pub struct SharedInputSnapshot {
     pub controller_state: ControllerState,
     pub capabilities: InputCapabilities,
     pub stream_config: Option<StreamConfig>,
-    pub cursor_shape: Option<CursorShape>,
+    pub cursor_shape: Option<Arc<CursorShape>>,
     pub cursor_state: CursorState,
     pub cursor_shape_version: u64,
     pub cursor_state_version: u64,
@@ -103,6 +103,14 @@ impl SharedInputState {
         self.inner.lock().unwrap().clone()
     }
 
+    pub fn input_credential(&self) -> Option<InputCredential> {
+        self.inner.lock().unwrap().input_credential
+    }
+
+    pub fn client_id(&self) -> Option<u32> {
+        self.inner.lock().unwrap().client_id
+    }
+
     pub fn set_input_session(&self, session: InputSession) {
         let mut inner = self.inner.lock().unwrap();
         inner.client_id = Some(session.client_id);
@@ -123,7 +131,7 @@ impl SharedInputState {
 
     pub fn set_cursor_shape(&self, cursor_shape: CursorShape) {
         let mut inner = self.inner.lock().unwrap();
-        inner.cursor_shape = Some(cursor_shape);
+        inner.cursor_shape = Some(Arc::new(cursor_shape));
         inner.cursor_shape_version = inner.cursor_shape_version.wrapping_add(1);
     }
 
@@ -192,7 +200,37 @@ impl LocalKeyboardState {
         changed |= self.set_key(KeyboardKey::LeftShift, modifiers.shift);
         changed |= self.set_key(KeyboardKey::LeftCtrl, modifiers.ctrl);
         changed |= self.set_key(KeyboardKey::LeftAlt, modifiers.alt);
-        changed |= self.set_key(KeyboardKey::LeftMeta, modifiers.command);
+        changed |= self.set_key(KeyboardKey::LeftMeta, modifiers.mac_cmd);
         changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_down(keys: &LocalKeyboardState, key: KeyboardKey) -> bool {
+        let (byte, bit) = key.bit();
+        keys.pressed()[byte] & bit != 0
+    }
+
+    #[test]
+    fn only_the_mac_command_key_becomes_meta() {
+        let mut keys = LocalKeyboardState::default();
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        assert!(keys.sync_modifiers(ctrl));
+        assert!(is_down(&keys, KeyboardKey::LeftCtrl));
+        assert!(!is_down(&keys, KeyboardKey::LeftMeta));
+        let cmd = egui::Modifiers {
+            command: true,
+            mac_cmd: true,
+            ..Default::default()
+        };
+        assert!(keys.sync_modifiers(cmd));
+        assert!(is_down(&keys, KeyboardKey::LeftMeta));
     }
 }

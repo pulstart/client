@@ -53,7 +53,7 @@ internal class AvcSurfaceDecoder(
                         pending
                         ?: NativeBridge.nativePollAccessUnit(nativeHandle, sessionEpoch, 20)
                         ?: run {
-                            if (codec?.let(::drainOutput) == true && !renderedFrame) {
+                            if (codec?.let { drainOutput(it) } == true && !renderedFrame) {
                                 renderedFrame = true
                                 onStatus("video active")
                             }
@@ -124,7 +124,7 @@ internal class AvcSurfaceDecoder(
                     lastPresentationUs = presentationUs
                     codec.queueInputBuffer(inputIndex, 0, payload.size, presentationUs, 0)
                     pending = null
-                    if (drainOutput(codec) && !renderedFrame) {
+                    if (drainOutput(codec, OUTPUT_WAIT_US) && !renderedFrame) {
                         renderedFrame = true
                         onStatus("video active")
                     }
@@ -161,6 +161,8 @@ internal class AvcSurfaceDecoder(
         format.setByteBuffer("csd-1", ByteBuffer.wrap(pps))
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+        } else {
+            format.setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
         }
 
         return createConfiguredCodec(
@@ -172,11 +174,15 @@ internal class AvcSurfaceDecoder(
         )
     }
 
-    private fun drainOutput(codec: MediaCodec): Boolean {
+    // Waiting for the unit just queued shows it now; a zero-timeout drain right
+    // after queueing only found the previous one, so every frame (and the last
+    // change on a static screen) appeared one unit late.
+    private fun drainOutput(codec: MediaCodec, waitUs: Long = 0): Boolean {
         val info = MediaCodec.BufferInfo()
         var newestPicture = -1
+        var timeoutUs = waitUs
         while (true) {
-            when (val index = codec.dequeueOutputBuffer(info, 0)) {
+            when (val index = codec.dequeueOutputBuffer(info, timeoutUs)) {
                 MediaCodec.INFO_TRY_AGAIN_LATER -> {
                     if (newestPicture >= 0) {
                         codec.releaseOutputBuffer(newestPicture, true)
@@ -185,6 +191,7 @@ internal class AvcSurfaceDecoder(
                 }
                 MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> Unit
                 else -> if (index >= 0) {
+                    timeoutUs = 0
                     val isPicture = info.size > 0 &&
                         info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0 &&
                         info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM == 0
@@ -212,6 +219,7 @@ internal class AvcSurfaceDecoder(
 
     private companion object {
         const val TAG = "st-decoder"
+        const val OUTPUT_WAIT_US = 8_000L
         const val NAL_IDR = 5
         const val NAL_SPS = 7
         const val NAL_PPS = 8
