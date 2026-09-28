@@ -100,119 +100,56 @@ struct DueVideoFrames {
 }
 
 struct VideoPlayoutBuffer {
-    /// Current effective scheduling delay. With adaptation enabled this floats
-    /// between `delay_floor` and `delay_ceiling` driven by measured interarrival
-    /// jitter; with a user-forced delay (`ST_CLIENT_VIDEO_JITTER_MS`) it is fixed
-    /// and `adaptive` is false.
-    min_delay: Duration,
-    /// Lower bound on the playout delay — the proven low-latency baseline
-    /// (~one frame). Adaptation never drops below this, so a clean network sees
-    /// exactly today's latency; it only adds headroom above it under jitter.
-    delay_floor: Duration,
-    /// Upper bound on how much headroom jitter can buy, so a bad path cannot
-    /// inflate latency without limit.
-    delay_ceiling: Duration,
-    adaptive: bool,
-    /// EWMA of |interarrival − frame_interval| in seconds (RFC 3550-style).
-    jitter_secs: f64,
-    last_arrival: Option<Instant>,
+    /// `ST_CLIENT_VIDEO_JITTER_MS` (debugging); otherwise zero: a uniform delay
+    /// shifts every frame alike and smooths nothing.
+    fixed_delay: Duration,
+    /// Most a frame is ever held past its arrival.
+    max_hold: Duration,
     frame_interval: Option<Duration>,
     max_queued_frames: usize,
     queued: VecDeque<QueuedVideoFrame>,
     last_scheduled_at: Option<Instant>,
     last_presented_frame_id: Option<u32>,
+    /// How long the latest frame is held: the buffer's current depth (HUD).
+    last_hold: Duration,
 }
 
 impl VideoPlayoutBuffer {
-    // Grow the delay immediately on a jitter spike (avoid underrun/stutter) but
-    // shrink it slowly when the path calms (avoid collapsing headroom and
-    // fast-forwarding). Classic adaptive de-jitter asymmetry.
-    //
-    // Latency-first tuning: 2.5× headroom (was 3×) buys a little less buffer per
-    // unit jitter, and a 1/12 shrink gain (was 1/16) returns to the floor a bit
-    // faster once the path calms — so dec→present settles lower after a transient
-    // (e.g. bufferbloat clearing). Still grow-fast/shrink-slow; the multiplier
-    // stays high enough to cover real jitter without underrunning into stutter.
-    const JITTER_GAIN: f64 = 1.0 / 16.0;
-    const DELAY_SHRINK_GAIN: f64 = 1.0 / 12.0;
-    const JITTER_MULTIPLIER: f64 = 2.5;
-    // Cap a single interarrival sample's contribution so one large legitimate
-    // gap (idle → motion, frame_id skip) can't blow up the estimate.
-    const MAX_SAMPLE_DEVIATION: Duration = Duration::from_millis(100);
+    /// Frames are spaced about one interval apart, so a frame arriving early
+    /// behind a late one waits for its slot: even cadence under jitter. Each
+    /// slot comes this share of an interval sooner, so a hold drains away (in
+    /// ~0.5 s) instead of adding latency to every later frame, as anchoring to
+    /// the latest-ever arrival did; recurring jitter builds it back up.
+    const DRAIN_DIV: u32 = 128;
 
     fn new(stream_fps: u16) -> Self {
-        let (floor, adaptive) = configured_video_jitter_delay(stream_fps);
-        let frame_interval = if stream_fps > 0 {
-            Some(Duration::from_secs_f64(1.0 / f64::from(stream_fps)))
-        } else {
-            None
-        };
-        let delay_ceiling = adaptive_delay_ceiling(floor, frame_interval);
-        let (configured_max, max_is_explicit) = configured_video_jitter_max_frames();
-        // The queue must be deep enough to actually hold the frames buffered at
-        // the ceiling delay, or adaptation would drop them before they are due.
-        // Respect an explicit user cap; otherwise bump the default to fit.
-        let max_queued_frames = if adaptive && !max_is_explicit {
-            let needed = frame_interval
+        let frame_interval =
+            (stream_fps > 0).then(|| Duration::from_secs_f64(1.0 / f64::from(stream_fps)));
+        let fixed_delay = configured_video_jitter_delay();
+        let max_hold = playout_max_hold(fixed_delay, frame_interval);
+        // Deep enough to hold every frame scheduled within the max hold.
+        let max_queued_frames = configured_video_jitter_max_frames().unwrap_or_else(|| {
+            frame_interval
                 .map(|interval| {
-                    (delay_ceiling.as_secs_f64() / interval.as_secs_f64()).ceil() as usize + 1
+                    (max_hold.as_secs_f64() / interval.as_secs_f64()).ceil() as usize + 1
                 })
-                .unwrap_or(configured_max);
-            configured_max.max(needed)
-        } else {
-            configured_max
-        };
+                .unwrap_or(3)
+                .max(3)
+        });
         Self {
-            min_delay: floor,
-            delay_floor: floor,
-            delay_ceiling,
-            adaptive,
-            jitter_secs: 0.0,
-            last_arrival: None,
+            fixed_delay,
+            max_hold,
             frame_interval,
             max_queued_frames,
             queued: VecDeque::new(),
             last_scheduled_at: None,
             last_presented_frame_id: None,
+            last_hold: Duration::ZERO,
         }
-    }
-
-    /// Update the jitter estimate from a frame's arrival time and retarget the
-    /// effective delay. No-op when adaptation is off or the frame interval is
-    /// unknown (e.g. fps=0 streams), leaving `min_delay` at its fixed value.
-    fn observe_arrival(&mut self, now: Instant) {
-        if !self.adaptive {
-            return;
-        }
-        let Some(interval) = self.frame_interval else {
-            return;
-        };
-        if let Some(last) = self.last_arrival {
-            let gap = now.saturating_duration_since(last).as_secs_f64();
-            let deviation = (gap - interval.as_secs_f64())
-                .abs()
-                .min(Self::MAX_SAMPLE_DEVIATION.as_secs_f64());
-            self.jitter_secs += (deviation - self.jitter_secs) * Self::JITTER_GAIN;
-            self.retarget_delay();
-        }
-        self.last_arrival = Some(now);
-    }
-
-    fn retarget_delay(&mut self) {
-        let floor = self.delay_floor.as_secs_f64();
-        let ceil = self.delay_ceiling.as_secs_f64();
-        let target = (floor + Self::JITTER_MULTIPLIER * self.jitter_secs).clamp(floor, ceil);
-        let current = self.min_delay.as_secs_f64();
-        let next = if target >= current {
-            target
-        } else {
-            current + (target - current) * Self::DELAY_SHRINK_GAIN
-        };
-        self.min_delay = Duration::from_secs_f64(next.clamp(floor, ceil));
     }
 
     fn current_delay_ms(&self) -> f32 {
-        self.min_delay.as_secs_f32() * 1000.0
+        self.last_hold.as_secs_f32() * 1000.0
     }
 
     /// Time until the earliest queued-but-not-yet-due frame becomes due, or
@@ -226,6 +163,10 @@ impl VideoPlayoutBuffer {
     }
 
     fn enqueue(&mut self, frame: VideoFrameBuffer) -> Option<VideoFrameBuffer> {
+        self.enqueue_at(frame, Instant::now())
+    }
+
+    fn enqueue_at(&mut self, frame: VideoFrameBuffer, now: Instant) -> Option<VideoFrameBuffer> {
         let frame_id = frame.debug_timing.as_ref().map(|timing| timing.frame_id);
         if let Some(frame_id) = frame_id {
             if self
@@ -248,24 +189,19 @@ impl VideoPlayoutBuffer {
             }
         }
 
-        let now = Instant::now();
-        self.observe_arrival(now);
-        let candidate = now + self.min_delay;
-        // Space frames at least one interval apart — but never schedule past the
-        // adaptive delay ceiling. Without that clamp `last_scheduled_at` is a
-        // ratchet: every enqueue pushes it forward by a full interval, so any
-        // sustained arrival rate above the advertised framerate (a burst drain,
-        // or an encoder emitting two units per captured frame) walks the
-        // schedule further into the future every frame and never recovers. That
-        // shows up as playout latency that only grows, and eventually as a
-        // permanently frozen picture. The ceiling is already the declared
-        // maximum acceptable playout delay, so it is the right bound here.
-        let ceiling = now + self.delay_ceiling.max(self.min_delay);
+        let candidate = now + self.fixed_delay;
+        // Beyond this a frame is late, not jittered: show it (newest wins)
+        // rather than replay a stale backlog at full cadence.
+        let ceiling = now + self.max_hold;
         let present_at = self
             .last_scheduled_at
             .zip(self.frame_interval)
-            .map(|(last, interval)| candidate.max(last + interval).min(ceiling))
+            .map(|(last, interval)| {
+                let slot = last + interval - interval / Self::DRAIN_DIV;
+                candidate.max(slot).min(ceiling)
+            })
             .unwrap_or(candidate);
+        self.last_hold = present_at.saturating_duration_since(now);
         self.last_scheduled_at = Some(present_at);
         self.queued.push_back(QueuedVideoFrame {
             present_at,
@@ -318,14 +254,10 @@ impl VideoPlayoutBuffer {
 
     fn update_framerate(&mut self, stream_fps: u16) {
         let updated = Self::new(stream_fps);
-        self.min_delay = updated.min_delay;
-        self.delay_floor = updated.delay_floor;
-        self.delay_ceiling = updated.delay_ceiling;
-        self.adaptive = updated.adaptive;
+        self.fixed_delay = updated.fixed_delay;
+        self.max_hold = updated.max_hold;
         self.frame_interval = updated.frame_interval;
         self.max_queued_frames = updated.max_queued_frames;
-        self.jitter_secs = 0.0;
-        self.last_arrival = None;
     }
 
     fn reset_for_discontinuity(&mut self, stream_fps: u16) -> Vec<VideoFrameBuffer> {
@@ -637,73 +569,26 @@ fn frame_id_is_newer(candidate: u32, previous: u32) -> bool {
     delta > 0 && delta < 0x8000_0000
 }
 
-/// Returns the playout delay floor and whether adaptation is enabled.
-///
-/// `ST_CLIENT_VIDEO_JITTER_MS` forces a fixed delay (adaptation off) as the
-/// escape hatch. Otherwise the returned value is the *floor* — the proven
-/// low-latency baseline (~one frame) below which the adaptive buffer never
-/// drops — and adaptation is on.
-fn configured_video_jitter_delay(stream_fps: u16) -> (Duration, bool) {
-    if let Ok(raw) = std::env::var("ST_CLIENT_VIDEO_JITTER_MS") {
-        if let Ok(parsed) = raw.parse::<u64>() {
-            return (Duration::from_millis(parsed.min(250)), false);
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        // Keep the Windows client biased toward low-delay
-        // presentation instead of buffering a full extra frame by default.
-        if stream_fps == 0 {
-            return (Duration::from_millis(6), true);
-        }
-
-        return (
-            Duration::from_secs_f64((0.5 / f64::from(stream_fps)).clamp(0.003, 0.008)),
-            true,
-        );
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        if stream_fps == 0 {
-            return (Duration::from_millis(10), true);
-        }
-
-        // Latency-first: hold roughly a half-frame baseline rather than a full
-        // frame, letting the adaptive buffer grow from here only when real jitter
-        // appears. Lever-1 (server adaptive fps) keeps the cadence regular so the
-        // buffer stays near this floor; the Stutter graph surfaces any playout
-        // drops if the floor is too tight on a given path.
-        (
-            Duration::from_secs_f64((0.6 / f64::from(stream_fps)).clamp(0.006, 0.020)),
-            true,
-        )
-    }
+/// `ST_CLIENT_VIDEO_JITTER_MS`: hold every frame this long (debugging).
+fn configured_video_jitter_delay() -> Duration {
+    std::env::var("ST_CLIENT_VIDEO_JITTER_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map_or(Duration::ZERO, |ms| Duration::from_millis(ms.min(250)))
 }
 
-/// Upper bound for the adaptive playout delay: ~3 frame intervals of headroom,
-/// hard-capped at 80ms so a pathological path cannot inflate latency without
-/// limit. Falls back to floor+45ms when the frame interval is unknown.
-fn adaptive_delay_ceiling(floor: Duration, frame_interval: Option<Duration>) -> Duration {
-    const ABS_MAX: Duration = Duration::from_millis(80);
-    let by_interval = frame_interval
-        .map(|interval| interval * 3)
-        .unwrap_or(floor + Duration::from_millis(45));
-    by_interval.clamp(floor, ABS_MAX)
+/// Longest a frame waits for its slot: half an interval of spacing on top of
+/// any fixed delay (8 ms when the rate is unknown).
+fn playout_max_hold(fixed_delay: Duration, frame_interval: Option<Duration>) -> Duration {
+    fixed_delay + frame_interval.map_or(Duration::from_millis(8), |interval| interval / 2)
 }
 
-/// Returns the configured max queued frames and whether the user set it
-/// explicitly (so adaptation can grow the default but never override an
-/// explicit user cap).
-fn configured_video_jitter_max_frames() -> (usize, bool) {
-    match std::env::var("ST_CLIENT_VIDEO_JITTER_MAX_FRAMES")
+/// `ST_CLIENT_VIDEO_JITTER_MAX_FRAMES`: explicit queue depth cap.
+fn configured_video_jitter_max_frames() -> Option<usize> {
+    std::env::var("ST_CLIENT_VIDEO_JITTER_MAX_FRAMES")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
-    {
-        Some(value) => (value.clamp(1, 8), true),
-        None => (3, false),
-    }
+        .map(|value| value.clamp(1, 8))
 }
 
 /// Escalating, in-session recovery for a video path that has gone dark while
@@ -1412,7 +1297,7 @@ fn request_recovery_keyframe(
 #[cfg(test)]
 mod tests {
     use super::{
-        adaptive_delay_ceiling, frame_id_is_newer, frame_matches_profile, queue_latest_audio,
+        frame_id_is_newer, frame_matches_profile, playout_max_hold, queue_latest_audio,
         StallAction, VideoPlayoutBuffer, VideoProfileState, VideoProfileUpdate, VideoStallRecovery,
         LIVE_DECODE_OUTPUT_TIMEOUT,
     };
@@ -1531,15 +1416,13 @@ mod tests {
 
         let mut playout = VideoPlayoutBuffer::new(60);
         assert!(playout.enqueue(frame_with_id(9)).is_none());
-        playout.jitter_secs = 0.012;
-        playout.last_arrival = Some(now);
+        playout.last_hold = Duration::from_millis(12);
         playout.last_presented_frame_id = Some(8);
         let dropped = playout.reset_for_discontinuity(60);
 
         assert_eq!(dropped.len(), 1);
         assert!(playout.queued.is_empty());
-        assert_eq!(playout.jitter_secs, 0.0);
-        assert!(playout.last_arrival.is_none());
+        assert_eq!(playout.last_hold, Duration::ZERO);
         assert!(playout.last_scheduled_at.is_none());
         assert!(playout.last_presented_frame_id.is_none());
     }
@@ -1610,7 +1493,7 @@ mod tests {
     #[test]
     fn enqueue_drops_frame_older_than_last_queued() {
         let mut playout = VideoPlayoutBuffer::new(60);
-        playout.min_delay = Duration::ZERO;
+        playout.fixed_delay = Duration::ZERO;
         playout.frame_interval = None;
         playout.max_queued_frames = 8;
 
@@ -1628,7 +1511,7 @@ mod tests {
     #[test]
     fn enqueue_drops_frame_older_than_last_presented() {
         let mut playout = VideoPlayoutBuffer::new(60);
-        playout.min_delay = Duration::ZERO;
+        playout.fixed_delay = Duration::ZERO;
         playout.frame_interval = None;
         playout.max_queued_frames = 8;
 
@@ -1647,118 +1530,92 @@ mod tests {
         assert!(playout.queued.is_empty());
     }
 
-    // --- Adaptive jitter buffer -------------------------------------------
+    // --- Playout scheduling -------------------------------------------------
 
-    /// Build a buffer with deterministic adaptive parameters, independent of
-    /// the host environment / platform defaults.
-    fn adaptive_playout(floor_ms: u64, ceiling_ms: u64, interval_ms: u64) -> VideoPlayoutBuffer {
-        let mut playout = VideoPlayoutBuffer::new(60);
-        playout.adaptive = true;
-        playout.delay_floor = Duration::from_millis(floor_ms);
-        playout.delay_ceiling = Duration::from_millis(ceiling_ms);
-        playout.min_delay = playout.delay_floor;
-        playout.frame_interval = Some(Duration::from_millis(interval_ms));
-        playout.jitter_secs = 0.0;
-        playout.last_arrival = None;
+    fn playout_at_120() -> VideoPlayoutBuffer {
+        let mut playout = VideoPlayoutBuffer::new(120);
+        playout.fixed_delay = Duration::ZERO;
         playout
     }
 
-    fn assert_close_ms(actual: Duration, expected_ms: f64, tol_ms: f64) {
-        let actual_ms = actual.as_secs_f64() * 1000.0;
+    /// Enqueue frames at the given arrival offsets (ms) and return each
+    /// frame's hold (ms) and scheduled present time.
+    fn schedule(playout: &mut VideoPlayoutBuffer, arrivals_ms: &[f64]) -> Vec<(f64, Instant)> {
+        let start = Instant::now();
+        arrivals_ms
+            .iter()
+            .enumerate()
+            .map(|(i, &at)| {
+                let now = start + Duration::from_secs_f64(at / 1000.0);
+                playout.enqueue_at(frame_with_id(i as u32 + 1), now);
+                let present_at = playout.last_scheduled_at.expect("scheduled");
+                (playout.last_hold.as_secs_f64() * 1000.0, present_at)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn steady_frames_are_shown_on_arrival() {
+        let interval = 1000.0 / 120.0;
+        let arrivals: Vec<f64> = (0..240).map(|i| i as f64 * interval).collect();
+        let holds = schedule(&mut playout_at_120(), &arrivals);
+        assert!(holds.iter().all(|(hold, _)| *hold < 0.01), "no fixed delay");
+    }
+
+    #[test]
+    fn a_late_burst_keeps_cadence_then_drains_instead_of_lingering() {
+        let interval = 1000.0 / 120.0;
+        // Frames 10..13 stall 20 ms on Wi-Fi and land together.
+        let arrivals: Vec<f64> = (0..400)
+            .map(|i| {
+                let on_time = i as f64 * interval;
+                if (10..13).contains(&i) {
+                    12.0 * interval + 0.1 * (i - 10) as f64
+                } else {
+                    on_time
+                }
+            })
+            .collect();
+        let holds = schedule(&mut playout_at_120(), &arrivals);
+        // A late burst is shown as it lands, never held past half a frame.
+        let max_hold = holds.iter().map(|(hold, _)| *hold).fold(0.0, f64::max);
+        assert!(max_hold <= interval / 2.0 + 1e-6, "held {max_hold} ms");
+        assert!(holds[14].0 > 3.0);
+        // The hold drains back to nothing within about half a second.
+        assert!(holds[80].0 < 0.5, "still holding {} ms", holds[80].0);
+    }
+
+    #[test]
+    fn jitter_is_smoothed_without_the_hold_growing() {
+        let interval = 1000.0 / 120.0;
+        let mut seed = 0x2545_f491_u32;
+        let arrivals: Vec<f64> = (0..1200)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                i as f64 * interval + (seed % 4000) as f64 / 1000.0 - 2.0
+            })
+            .collect();
+        let holds = schedule(&mut playout_at_120(), &arrivals);
+        let min_gap = holds
+            .windows(2)
+            .map(|w| (w[1].1 - w[0].1).as_secs_f64() * 1000.0)
+            .fold(f64::MAX, f64::min);
+        assert!(min_gap >= interval * (1.0 - 1.0 / 128.0) - 1e-6);
+        let max_hold = holds.iter().map(|(hold, _)| *hold).fold(0.0, f64::max);
         assert!(
-            (actual_ms - expected_ms).abs() <= tol_ms,
-            "expected ~{expected_ms}ms (±{tol_ms}), got {actual_ms}ms"
+            max_hold <= 4.5,
+            "hold grew to {max_hold} ms on ±2 ms jitter"
         );
     }
 
     #[test]
-    fn adaptive_delay_stays_at_floor_when_steady() {
-        let mut p = adaptive_playout(16, 50, 16);
-        let mut t = Instant::now();
-        for _ in 0..60 {
-            t += Duration::from_millis(16);
-            p.observe_arrival(t);
-        }
-        assert_close_ms(p.min_delay, 16.0, 0.5);
-    }
-
-    #[test]
-    fn adaptive_delay_grows_under_jitter_then_decays() {
-        let mut p = adaptive_playout(16, 50, 16);
-        let mut t = Instant::now();
-        // Alternating 6ms / 26ms gaps → ~10ms mean abs deviation.
-        for _ in 0..60 {
-            t += Duration::from_millis(6);
-            p.observe_arrival(t);
-            t += Duration::from_millis(26);
-            p.observe_arrival(t);
-        }
-        let jittered = p.min_delay;
-        assert!(
-            jittered > Duration::from_millis(16),
-            "delay should grow above floor under jitter, got {jittered:?}"
-        );
-        assert!(jittered <= p.delay_ceiling);
-
-        // Network calms: delay decays back toward the floor.
-        for _ in 0..400 {
-            t += Duration::from_millis(16);
-            p.observe_arrival(t);
-        }
-        assert!(
-            p.min_delay < jittered,
-            "delay should shrink once steady ({:?} !< {jittered:?})",
-            p.min_delay
-        );
-        assert_close_ms(p.min_delay, 16.0, 2.0);
-    }
-
-    #[test]
-    fn adaptive_delay_capped_at_ceiling() {
-        let mut p = adaptive_playout(16, 50, 16);
-        let mut t = Instant::now();
-        // Severe jitter (huge gaps) must never push past the ceiling.
-        for _ in 0..200 {
-            t += Duration::from_millis(1);
-            p.observe_arrival(t);
-            t += Duration::from_millis(220);
-            p.observe_arrival(t);
-        }
-        assert!(p.min_delay <= p.delay_ceiling);
-        assert_close_ms(p.min_delay, 50.0, 0.5);
-    }
-
-    #[test]
-    fn forced_delay_disables_adaptation() {
-        let mut p = adaptive_playout(16, 50, 16);
-        p.adaptive = false;
-        p.min_delay = Duration::ZERO; // simulate ST_CLIENT_VIDEO_JITTER_MS=0
-        let mut t = Instant::now();
-        for _ in 0..60 {
-            t += Duration::from_millis(6);
-            p.observe_arrival(t);
-            t += Duration::from_millis(40);
-            p.observe_arrival(t);
-        }
-        assert_eq!(p.min_delay, Duration::ZERO);
-    }
-
-    #[test]
-    fn ceiling_is_three_intervals_capped_at_80ms() {
-        assert_eq!(
-            adaptive_delay_ceiling(Duration::from_millis(16), Some(Duration::from_millis(16))),
-            Duration::from_millis(48)
-        );
-        // 3 * 30ms = 90ms → hard-capped at 80ms.
-        assert_eq!(
-            adaptive_delay_ceiling(Duration::from_millis(30), Some(Duration::from_millis(30))),
-            Duration::from_millis(80)
-        );
-        // Unknown interval → floor + 45ms.
-        assert_eq!(
-            adaptive_delay_ceiling(Duration::from_millis(18), None),
-            Duration::from_millis(63)
-        );
+    fn max_hold_is_half_an_interval_over_the_fixed_delay() {
+        let ms = Duration::from_millis;
+        assert_eq!(playout_max_hold(ms(0), Some(ms(16))), ms(8));
+        assert_eq!(playout_max_hold(ms(0), None), ms(8));
+        assert_eq!(playout_max_hold(ms(10), Some(ms(16))), ms(18));
     }
 
     #[test]
@@ -1815,7 +1672,7 @@ mod tests {
         // into the future every frame and never came back — growing latency that
         // ends in a frozen picture.
         let mut playout = VideoPlayoutBuffer::new(60);
-        let ceiling = playout.delay_ceiling.max(playout.min_delay);
+        let ceiling = playout.max_hold;
 
         let before = Instant::now();
         for frame_id in 0..600u32 {

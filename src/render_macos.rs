@@ -689,6 +689,7 @@ void main() {
 #[link(name = "OpenGL", kind = "framework")]
 unsafe extern "C" {
     fn CGLGetCurrentContext() -> CGLContextObj;
+    fn CGLSetParameter(ctx: CGLContextObj, pname: i32, params: *const i32) -> CGLError;
     fn CGLTexImageIOSurface2D(
         ctx: CGLContextObj,
         target: GLenum,
@@ -708,4 +709,13 @@ unsafe extern "C" {
     fn CVPixelBufferGetWidthOfPlane(pixel_buffer: CVPixelBufferRef, plane_index: usize) -> usize;
     fn CVPixelBufferGetHeightOfPlane(pixel_buffer: CVPixelBufferRef, plane_index: usize) -> usize;
     fn CVPixelBufferGetIOSurface(pixel_buffer: CVPixelBufferRef) -> IOSurfaceRef;
+}
+
+/// Swap interval of the current GL context: 1 waits for vsync, 0 doesn't.
+pub fn set_gl_swap_interval(interval: i32) -> bool {
+    const KCGLCP_SWAP_INTERVAL: i32 = 222;
+    unsafe {
+        let ctx = CGLGetCurrentContext();
+        !ctx.is_null() && CGLSetParameter(ctx, KCGLCP_SWAP_INTERVAL, &interval) == 0
+    }
 }

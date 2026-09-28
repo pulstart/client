@@ -58,6 +58,9 @@ pub struct NativeVideoTexture {
     rect_yuv_pipeline: Option<RectYuvPipeline>,
     #[cfg(target_os = "macos")]
     macos_metal_presenter: Option<MacosMetalVideoPresenter>,
+    /// Swap interval last applied to the GL context (`None`: startup default).
+    #[cfg(target_os = "macos")]
+    macos_gl_vsync: Option<bool>,
     #[cfg(target_os = "macos")]
     macos_direct_presenter: Option<MacosDirectVideoPresenter>,
     #[cfg(target_os = "macos")]
@@ -369,6 +372,8 @@ impl NativeVideoTexture {
             #[cfg(target_os = "macos")]
             macos_metal_presenter: direct_present.then(MacosMetalVideoPresenter::new),
             #[cfg(target_os = "macos")]
+            macos_gl_vsync: None,
+            #[cfg(target_os = "macos")]
             macos_direct_presenter: direct_present.then(MacosDirectVideoPresenter::new),
             #[cfg(target_os = "macos")]
             macos_recent_frames: VecDeque::with_capacity(MACOS_FRAME_KEEPALIVE_DEPTH),
@@ -529,6 +534,26 @@ impl NativeVideoTexture {
         }
     }
 
+    /// The GL swap waits for vsync only while GL itself draws the video. With
+    /// the Metal layer presenting it (display-synced on its own), a vsync'd GL
+    /// swap just parks the UI thread, and a frame decoded meanwhile waits for
+    /// that vsync and then the next one.
+    #[cfg(target_os = "macos")]
+    fn sync_macos_gl_vsync(&mut self, ui: &egui::Ui, rect: egui::Rect, vsync: bool) {
+        if crate::display::vsync_forced() || self.macos_gl_vsync == Some(vsync) {
+            return;
+        }
+        self.macos_gl_vsync = Some(vsync);
+        ui.painter().add(egui::PaintCallback {
+            rect,
+            callback: Arc::new(egui_glow::CallbackFn::new(move |_, _| {
+                if !crate::render_macos::set_gl_swap_interval(i32::from(vsync)) {
+                    eprintln!("[render] couldn't set the GL swap interval");
+                }
+            })),
+        });
+    }
+
     #[cfg(target_os = "macos")]
     fn retain_recent_macos_frame(&mut self, frame: &MacosVideoToolboxFrame) {
         self.macos_recent_frames.push_back(frame.clone());
@@ -637,12 +662,16 @@ impl NativeVideoTexture {
 
         #[cfg(target_os = "macos")]
         {
-            if let Some(presenter) = self.macos_metal_presenter.as_mut() {
-                if presenter.has_frame()
-                    && presenter.present(frame, rect, ui.ctx().pixels_per_point())
-                {
-                    return true;
-                }
+            let metal = self
+                .macos_metal_presenter
+                .as_mut()
+                .is_some_and(|presenter| {
+                    presenter.has_frame()
+                        && presenter.present(frame, rect, ui.ctx().pixels_per_point())
+                });
+            self.sync_macos_gl_vsync(ui, rect, !metal);
+            if metal {
+                return true;
             }
 
             let Some(presenter) = self.macos_direct_presenter.as_ref() else {

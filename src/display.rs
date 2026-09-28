@@ -23,6 +23,12 @@ pub fn vsync_enabled() -> bool {
     env_override_vsync().unwrap_or(cfg!(target_os = "macos"))
 }
 
+/// `ST_CLIENT_VSYNC` pins vsync; the renderer then leaves it alone.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn vsync_forced() -> bool {
+    env_override_vsync().is_some()
+}
+
 fn env_override_refresh_millihz() -> Option<u32> {
     if let Ok(value) = std::env::var("ST_CLIENT_REFRESH_MILLIHZ") {
         if let Ok(parsed) = value.parse::<u32>() {
