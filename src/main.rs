@@ -3745,6 +3745,9 @@ fn start_media_threads(
     let receiver = MediaReceiver::from_udp_socket(udp_socket, crypto)?;
     let (input_stop_tx, input_stop_rx) = crossbeam_channel::bounded::<()>(1);
     let input_thread = std::thread::spawn(move || {
+        st_protocol::thread_priority::promote_current_thread(
+            st_protocol::thread_priority::ThreadRole::Input,
+        );
         run_input_sender(
             input_socket,
             input_target,
@@ -3769,6 +3772,9 @@ fn start_media_threads(
     let pipeline_ctx = ctx.clone();
     let pipeline_audio_flag = Arc::clone(&audio_enabled);
     let video_thread = std::thread::spawn(move || {
+        st_protocol::thread_priority::promote_current_thread(
+            st_protocol::thread_priority::ThreadRole::Video,
+        );
         pipeline::run_receive_pipeline(
             pipeline_frame,
             pipeline_debug_state,
@@ -3795,6 +3801,9 @@ fn start_media_threads(
     let (audio_stop_tx, audio_stop_rx) = crossbeam_channel::bounded(1);
     let audio_packet_duration_ms = stream_config.packet_duration_ms as u32;
     let audio_thread = std::thread::spawn(move || {
+        st_protocol::thread_priority::promote_current_thread(
+            st_protocol::thread_priority::ThreadRole::Audio,
+        );
         if let Err(e) = audio::run_audio_pipeline(
             audio_data_rx,
             audio_stop_rx,
@@ -3849,6 +3858,9 @@ fn start_punched_media_threads(
     let pipeline_ctx = ctx.clone();
     let pipeline_audio_flag = Arc::clone(&audio_enabled);
     let video_thread = std::thread::spawn(move || {
+        st_protocol::thread_priority::promote_current_thread(
+            st_protocol::thread_priority::ThreadRole::Video,
+        );
         pipeline::run_receive_pipeline(
             pipeline_frame,
             pipeline_debug_state,
@@ -3875,6 +3887,9 @@ fn start_punched_media_threads(
     let (audio_stop_tx, audio_stop_rx) = crossbeam_channel::bounded(1);
     let audio_packet_duration_ms = stream_config.packet_duration_ms as u32;
     let audio_thread = std::thread::spawn(move || {
+        st_protocol::thread_priority::promote_current_thread(
+            st_protocol::thread_priority::ThreadRole::Audio,
+        );
         if let Err(e) = audio::run_audio_pipeline(
             audio_data_rx,
             audio_stop_rx,
@@ -8442,6 +8457,7 @@ fn main() {
         }
     }
     updater::cleanup_old_update_files();
+    st_protocol::thread_priority::init_process(false);
 
     #[cfg(target_os = "macos")]
     let viewport = egui::ViewportBuilder::default()
