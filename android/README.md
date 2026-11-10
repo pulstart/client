@@ -102,10 +102,19 @@ For an optimized, manually installable APK:
 adb install -r app/build/outputs/apk/release/app-release.apk
 ```
 
-Release builds use the local Android debug key by default, so they are signed
-and installable without Google Play. To keep the same signature across build
-machines, set `ST_ANDROID_KEYSTORE`, `ST_ANDROID_STORE_PASSWORD`,
-`ST_ANDROID_KEY_ALIAS`, and `ST_ANDROID_KEY_PASSWORD` before building.
+Every build — debug or release, local or CI — is signed with the key in
+`app/st-release.p12` (alias `st`, password `st-android`), so any APK installs
+over any other without uninstalling first. The key is committed and its
+password public on purpose: it marks "a build of this repository", not a
+publisher, and anyone can sign with it. An app installed before 0.13.1 carries
+a different signature and has to be uninstalled once. To sign with a private
+key instead, set `ST_ANDROID_KEYSTORE`, `ST_ANDROID_STORE_PASSWORD`,
+`ST_ANDROID_KEY_ALIAS`, and `ST_ANDROID_KEY_PASSWORD` (all four) before
+building.
+
+A local build takes its version from the newest `v*` git tag (CI stamps the
+tag it builds): Android refuses an APK with a lower `versionCode` than the one
+installed.
 
 Use `10.0.2.2:28480` to reach a server on the host from the Android emulator.
 The signaling URL defaults to production and can be overridden at build time
