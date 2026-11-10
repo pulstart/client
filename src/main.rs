@@ -13,6 +13,7 @@ mod file_transfer;
 mod graph_overlay;
 mod input;
 mod keep_awake;
+mod layout;
 #[cfg(target_os = "linux")]
 mod linux_uring;
 mod pipeline;
@@ -29,6 +30,8 @@ mod render_wgpu_linux_dmabuf;
 mod render_windows;
 #[cfg(target_os = "windows")]
 mod render_windows_native;
+mod repaint;
+mod secondary;
 mod transport;
 mod updater;
 mod video_frame;
@@ -37,6 +40,8 @@ use eframe::egui;
 use input::{LocalCaptureMode, LocalKeyboardState, RemoteCursorTexture, SharedInputState};
 use keep_awake::KeepAwakeController;
 use render::VideoTexture;
+use repaint::Repaint;
+use secondary::{AuxEnv, AuxPointer, AuxStream};
 use serde::{Deserialize, Serialize};
 use st_client_core::drain_control_messages;
 use st_protocol::{
@@ -44,7 +49,7 @@ use st_protocol::{
     InputPacket, KeyboardKey, KeyboardStateInput, MouseAbsoluteInput, MouseButtonsInput,
     MouseRelativeInput, MouseWheelInput, StreamConfig, TransportFeedback, VideoChromaSampling,
     VideoCodec, VideoCodecSupport, MOUSE_BUTTON_EXTRA1, MOUSE_BUTTON_EXTRA2, MOUSE_BUTTON_MIDDLE,
-    MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY, MOUSE_WHEEL_STEP_UNITS,
+    MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY, MOUSE_WHEEL_STEP_UNITS, OUTPUT_DEFAULT,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -72,6 +77,8 @@ const DISCOVERY_EXPIRY: Duration = Duration::from_secs(10);
 /// long enough that a single stray beacon can't thrash a healthy session.
 const LAN_UPGRADE_HYSTERESIS: Duration = Duration::from_secs(2);
 const MAX_REMOTE_CURSOR_TEXTURES: usize = 8;
+/// How long a monitor listing stays good enough to plan windows from.
+const MONITORS_FRESH: Duration = Duration::from_secs(5);
 const INPUT_SENDER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const INPUT_STATE_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
 const INPUT_STATE_REPAIR_WINDOW: Duration = Duration::from_millis(200);
@@ -193,6 +200,40 @@ struct StreamApp {
     /// Multiplier on remote wheel deltas.
     scroll_sensitivity: f32,
     display_refresh_millihz: Option<u32>,
+    /// Monitors of the local desktop, left to right. Refreshed on connect.
+    local_monitors: Vec<display::LocalMonitor>,
+    local_monitors_at: Instant,
+    /// A monitor listing running on a worker (the tools it calls take tens of
+    /// milliseconds, which the UI thread must not spend).
+    monitor_probe: Option<crossbeam_channel::Receiver<Vec<display::LocalMonitor>>>,
+    /// Since when auto layout has been waiting for the main window's position.
+    layout_wait_since: Option<Instant>,
+    /// Open one window per extra local monitor on connect.
+    auto_layout: bool,
+    /// Aux windows of the live main session.
+    aux: Vec<Arc<AuxStream>>,
+    /// Textures of closed aux windows, freed on the next root pass.
+    retired_video: Vec<VideoTexture>,
+    glow_slots: render_gl::GlowSlotPool,
+    aux_seq: u64,
+    aux_env: Option<Arc<AuxEnv>>,
+    aux_pointer: Option<AuxPointer>,
+    /// Server the aux windows belong to.
+    aux_server_key: Option<String>,
+    /// Auto layout already ran for this session.
+    layout_applied: bool,
+    /// Wayland places windows itself: tell the user once, for a while.
+    placement_note_until: Option<Instant>,
+    placement_note_shown: bool,
+    render_state: Option<eframe::egui_wgpu::RenderState>,
+    /// The live main session runs over a direct connection (aux windows need
+    /// one). Replaced by every `connect`.
+    direct_path: Arc<AtomicBool>,
+    /// Output the next connect asks for, with the server it was chosen on.
+    requested_output: Option<(String, u32)>,
+    /// Picker choice awaiting the server's next `StreamConfig`: the output
+    /// asked for and the `StreamConfig` count when it was asked.
+    pending_output: Option<(u32, u64)>,
     video_codec_support: decode::VideoCodecSupportReport,
     audio_enabled_flag: Arc<AtomicBool>,
     debug_enabled_flag: Arc<AtomicBool>,
@@ -512,6 +553,29 @@ fn save_yuv444_enabled(enabled: bool) {
     let _ = std::fs::write(dir.join("yuv444_enabled"), if enabled { "1" } else { "0" });
 }
 
+fn load_auto_layout() -> bool {
+    std::fs::read_to_string(state_dir().join("auto_layout"))
+        .ok()
+        .map(|s| s.trim() != "0")
+        .unwrap_or(true)
+}
+
+fn save_auto_layout(enabled: bool) {
+    let dir = state_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("auto_layout"), if enabled { "1" } else { "0" });
+}
+
+fn load_placement_note_shown() -> bool {
+    state_dir().join("placement_note_shown").exists()
+}
+
+fn save_placement_note_shown() {
+    let dir = state_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("placement_note_shown"), "1");
+}
+
 const SCROLL_SENSITIVITY_RANGE: std::ops::RangeInclusive<f32> = 0.1..=5.0;
 
 fn parse_scroll_sensitivity(raw: &str) -> Option<f32> {
@@ -631,6 +695,17 @@ struct ServerEntry {
     /// True only for entries the user explicitly added.
     #[serde(default)]
     manually_added: bool,
+    /// Server output (`OutputInfo::id`) the user last picked for the primary
+    /// window; requested again on the next connect.
+    #[serde(default)]
+    preferred_output: Option<u32>,
+}
+
+/// Matches a saved server by stable peer id when known, else by address.
+fn server_entry_index(list: &[ServerEntry], peer_id: Option<&str>, addr: &str) -> Option<usize> {
+    peer_id
+        .and_then(|pid| list.iter().position(|e| e.peer_id.as_deref() == Some(pid)))
+        .or_else(|| list.iter().position(|e| e.address == addr))
 }
 
 fn load_server_list() -> Vec<ServerEntry> {
@@ -676,6 +751,7 @@ fn ensure_server_in_list(list: &mut Vec<ServerEntry>, addr: &str) -> bool {
         peer_id: None,
         last_connected: 0,
         manually_added: true,
+        preferred_output: None,
     });
     true
 }
@@ -817,7 +893,8 @@ impl StreamApp {
         let yuv444_enabled = load_yuv444_enabled();
         let scroll_sensitivity = load_scroll_sensitivity();
         let menu_button_pos = load_menu_button_pos().unwrap_or_else(default_menu_button_pos);
-        let display_refresh_millihz = display::detect_max_refresh_millihz();
+        let local_monitors = display::list_local_monitors();
+        let display_refresh_millihz = display::refresh_for_monitor(None, &local_monitors);
         let video_codec_support = decode::VideoDecoder::detect_supported_codecs();
         let (update_tx, update_rx) = crossbeam_channel::unbounded();
         let update_ui_state = match updater::supported_target_label() {
@@ -862,6 +939,25 @@ impl StreamApp {
             yuv444_enabled,
             scroll_sensitivity,
             display_refresh_millihz,
+            local_monitors,
+            local_monitors_at: Instant::now(),
+            monitor_probe: None,
+            layout_wait_since: None,
+            auto_layout: load_auto_layout(),
+            aux: Vec::new(),
+            retired_video: Vec::new(),
+            glow_slots: Arc::new(Mutex::new(Vec::new())),
+            aux_seq: 0,
+            aux_env: None,
+            aux_pointer: None,
+            aux_server_key: None,
+            layout_applied: false,
+            placement_note_until: None,
+            placement_note_shown: load_placement_note_shown(),
+            render_state: cc.wgpu_render_state.clone(),
+            direct_path: Arc::new(AtomicBool::new(false)),
+            requested_output: None,
+            pending_output: None,
             video_codec_support,
             audio_enabled_flag: Arc::new(AtomicBool::new(audio)),
             debug_enabled_flag: Arc::new(AtomicBool::new(debug_enabled)),
@@ -1056,6 +1152,35 @@ impl StreamApp {
         self.input_tx = Some(input_tx);
 
         let addr = normalize_server_addr(&self.server_addr);
+        let server_key = self.server_key(&addr);
+        if self.aux_server_key.as_deref() != Some(server_key.as_str()) {
+            self.close_all_aux();
+            self.layout_applied = false;
+            self.aux_server_key = Some(server_key);
+        }
+        if let Some(env) = &self.aux_env {
+            *env.addr.lock().unwrap() = addr.clone();
+            *env.token.lock().unwrap() = self.token.clone();
+        }
+        if !self.monitors_fresh() {
+            self.request_monitor_probe(&ctx);
+        }
+        self.layout_wait_since = None;
+        let monitor = self
+            .window_monitor(&ctx)
+            .map(|i| self.local_monitors[i].clone());
+        self.display_refresh_millihz =
+            display::refresh_for_monitor(monitor.as_ref(), &self.local_monitors);
+        let display = SessionDisplay {
+            refresh_millihz: self.display_refresh_millihz,
+            width: monitor.as_ref().map_or(0, |m| m.width),
+            height: monitor.as_ref().map_or(0, |m| m.height),
+            output_id: self.output_for_connect(&addr),
+            aux: false,
+        };
+        self.pending_output = None;
+        let direct_path = Arc::new(AtomicBool::new(false));
+        self.direct_path = Arc::clone(&direct_path);
         let state = Arc::clone(&self.state);
         let frame_buf = Arc::clone(&self.frame);
         let disconnect = disconnect_flag;
@@ -1064,7 +1189,6 @@ impl StreamApp {
         let debug_enabled_flag = Arc::clone(&self.debug_enabled_flag);
         let debug_state = Arc::clone(&self.debug_state);
         let native_surfaces = Arc::clone(&self.native_surfaces);
-        let display_refresh_millihz = self.display_refresh_millihz;
         let video_codec_support =
             advertised_video_codec_support(self.video_codec_support, self.yuv444_enabled);
         let excluded_video_codecs = Arc::clone(&self.excluded_video_codecs);
@@ -1074,13 +1198,14 @@ impl StreamApp {
         let api_disc = Arc::clone(&self.api_discovery);
         let ft_state = file_transfer::new_shared_state();
         self.file_transfer_state = Arc::clone(&ft_state);
-        debug_state.reset_for_connect(&addr, display_refresh_millihz);
+        debug_state.reset_for_connect(&addr, display.refresh_millihz);
+        let repaint = Repaint::root(ctx);
 
         std::thread::spawn(move || {
             run_connection(
                 addr,
                 token,
-                display_refresh_millihz,
+                display,
                 video_codec_support,
                 excluded_video_codecs,
                 force_tcp_media,
@@ -1096,14 +1221,116 @@ impl StreamApp {
                 shared_input,
                 control_rx,
                 input_rx,
-                ctx,
+                repaint,
                 api_disc,
                 ft_state,
+                direct_path,
             );
         });
     }
 
+    fn resolve_pending_output(&mut self) {
+        let Some((requested, version)) = self.pending_output else {
+            return;
+        };
+        let snapshot = self.shared_input.snapshot();
+        if snapshot.stream_config_version == version {
+            return;
+        }
+        self.pending_output = None;
+        if snapshot
+            .stream_config
+            .is_some_and(|cfg| cfg.output_id == requested)
+        {
+            self.remember_output(requested);
+        }
+    }
+
+    fn monitors_fresh(&self) -> bool {
+        self.local_monitors_at.elapsed() < MONITORS_FRESH
+    }
+
+    /// Lists the monitors on a worker; `poll_monitor_probe` takes the result.
+    fn request_monitor_probe(&mut self, ctx: &egui::Context) {
+        if self.monitor_probe.is_some() {
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let repaint = Repaint::root(ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(display::list_local_monitors());
+            repaint.request_repaint();
+        });
+        self.monitor_probe = Some(rx);
+    }
+
+    fn poll_monitor_probe(&mut self) {
+        let Some(rx) = &self.monitor_probe else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(monitors) => {
+                self.local_monitors = monitors;
+                self.local_monitors_at = Instant::now();
+                self.monitor_probe = None;
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => self.monitor_probe = None,
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Monitor the main window is on, when the window system reports where the
+    /// window is (Wayland never does).
+    fn window_monitor(&self, ctx: &egui::Context) -> Option<usize> {
+        let center = ctx.input(|i| i.viewport().outer_rect)?.center();
+        display::monitor_at(&self.local_monitors, center.x, center.y)
+    }
+
+    /// The main window's monitor, assuming the primary when unknown.
+    fn root_monitor(&self, ctx: &egui::Context) -> Option<usize> {
+        self.window_monitor(ctx)
+            .or_else(|| display::primary_monitor(&self.local_monitors))
+    }
+
+    fn server_key(&self, addr: &str) -> String {
+        self.connect_peer_id
+            .clone()
+            .unwrap_or_else(|| addr.to_string())
+    }
+
+    /// The output this connect asks for: the session's pick, else the one
+    /// saved for this server, else whatever the server calls primary.
+    fn output_for_connect(&mut self, addr: &str) -> u32 {
+        let key = self.server_key(addr);
+        if let Some((requested_key, id)) = &self.requested_output {
+            if *requested_key == key {
+                return *id;
+            }
+        }
+        let saved = server_entry_index(&self.server_list, self.connect_peer_id.as_deref(), addr)
+            .and_then(|i| self.server_list[i].preferred_output)
+            .unwrap_or(OUTPUT_DEFAULT);
+        self.requested_output = Some((key, saved));
+        saved
+    }
+
+    /// Remember an output the server confirmed for the main window.
+    fn remember_output(&mut self, output_id: u32) {
+        let addr = normalize_server_addr(&self.server_addr);
+        self.requested_output = Some((self.server_key(&addr), output_id));
+        if let Some(i) =
+            server_entry_index(&self.server_list, self.connect_peer_id.as_deref(), &addr)
+        {
+            if self.server_list[i].preferred_output != Some(output_id) {
+                self.server_list[i].preferred_output = Some(output_id);
+                save_server_list(&self.server_list);
+            }
+        }
+    }
+
     fn disconnect(&mut self) {
+        self.close_all_aux();
+        self.layout_applied = false;
         // User-initiated teardown cancels any pending auto-reconnect.
         self.auto_reconnect_attempts = 0;
         self.next_reconnect_at = None;
@@ -1222,6 +1449,16 @@ impl StreamApp {
     }
 
     fn auto_release_capture(&mut self, await_pointer_exit_before_recapture: bool) {
+        self.auto_release_capture_with(await_pointer_exit_before_recapture, true);
+    }
+
+    /// `clear_keys` false leaves held keys down, for a pointer handing over to
+    /// an aux window that takes no part in the main window's keyboard.
+    fn auto_release_capture_with(
+        &mut self,
+        await_pointer_exit_before_recapture: bool,
+        clear_keys: bool,
+    ) {
         let snapshot = self.shared_input.snapshot();
         let preserved_cursor_pos = if self.capture_mode == LocalCaptureMode::CapturedRelative
             && snapshot.capabilities.separate_cursor
@@ -1239,7 +1476,9 @@ impl StreamApp {
             self.hover_cursor_pos = Some(pos);
         }
         self.await_pointer_exit_after_auto_release = await_pointer_exit_before_recapture;
-        self.clear_remote_keyboard();
+        if clear_keys {
+            self.clear_remote_keyboard();
+        }
         if let Some(client_id) = snapshot.client_id {
             self.send_input_packet(InputPacket::MouseButtons(MouseButtonsInput {
                 client_id,
@@ -1307,13 +1546,13 @@ impl StreamApp {
         self.pending_overlay_hit_rects.push(rect);
     }
 
+    /// Upright picture size: the coordinate space of server cursor positions
+    /// and of normalized absolute mouse input.
     fn cursor_space_size(&self) -> Option<egui::Vec2> {
         if let Some(stream_config) = self.shared_input.snapshot().stream_config {
-            if stream_config.width > 0 && stream_config.height > 0 {
-                return Some(egui::vec2(
-                    stream_config.width as f32,
-                    stream_config.height as f32,
-                ));
+            let (width, height) = stream_config.display_size();
+            if width > 0 && height > 0 {
+                return Some(egui::vec2(width as f32, height as f32));
             }
         }
 
@@ -1326,40 +1565,11 @@ impl StreamApp {
     }
 
     fn video_space_size(&self) -> Option<egui::Vec2> {
-        if let Some(stream_config) = self.shared_input.snapshot().stream_config {
-            if stream_config.width > 0 && stream_config.height > 0 {
-                return Some(egui::vec2(
-                    stream_config.width as f32,
-                    stream_config.height as f32,
-                ));
-            }
-        }
-
-        let size = self.video_texture.size_vec2();
-        if size.x >= 1.0 && size.y >= 1.0 {
-            Some(size)
-        } else {
-            None
-        }
+        self.cursor_space_size()
     }
 
     fn video_rect_for_container(&self, content_rect: egui::Rect) -> Option<egui::Rect> {
-        let video_size = self.video_space_size()?;
-        if video_size.x <= 0.0
-            || video_size.y <= 0.0
-            || content_rect.width() <= 0.0
-            || content_rect.height() <= 0.0
-        {
-            return None;
-        }
-
-        let scale = (content_rect.width() / video_size.x).min(content_rect.height() / video_size.y);
-        if !scale.is_finite() || scale <= 0.0 {
-            return None;
-        }
-
-        let sized = egui::vec2(video_size.x * scale, video_size.y * scale);
-        Some(egui::Rect::from_center_size(content_rect.center(), sized))
+        fit_picture(content_rect, self.video_space_size()?)
     }
 
     fn current_video_rect(&self, ctx: &egui::Context) -> Option<egui::Rect> {
@@ -1710,6 +1920,7 @@ impl StreamApp {
                 x: absolute_x,
                 y: absolute_y,
                 buttons: self.pointer_buttons,
+                output_id: 0,
             }));
             true
         } else {
@@ -3162,6 +3373,20 @@ impl StreamApp {
         }
         ui.add_space(8.0);
 
+        let layout_clicked = render_parsec_toggle(
+            ui,
+            "Auto Layout",
+            "On a direct connection, open a window on every extra monitor and show a server display on it. Where the system places windows itself (Wayland), you move each one.",
+            self.auto_layout,
+            BG_ROW,
+        );
+        if layout_clicked {
+            self.auto_layout = !self.auto_layout;
+            save_auto_layout(self.auto_layout);
+            self.layout_applied = false;
+        }
+        ui.add_space(8.0);
+
         if render_parsec_slider(
             ui,
             "Scroll Sensitivity",
@@ -3478,7 +3703,25 @@ impl StreamApp {
             let mut selected_output_request: Option<u32> = None;
             let menu_snapshot = self.shared_input.snapshot();
             let available_outputs = menu_snapshot.available_outputs.clone();
-            let selected_output = menu_snapshot.selected_output;
+            let streamed_output = menu_snapshot.stream_config.map(|cfg| cfg.output_id);
+            let selected_output = self.pending_output.map(|(id, _)| id).or(streamed_output);
+            let direct_path = self.direct_path.load(Ordering::SeqCst);
+            let open_outputs: Vec<u32> = available_outputs
+                .iter()
+                .filter(|o| self.aux_shows_output(o.id))
+                .map(|o| o.id)
+                .collect();
+            let can_add_virtual = direct_path
+                && layout::can_add_virtual_display(
+                    &self.local_monitors,
+                    &available_outputs,
+                    menu_snapshot.virtual_supported,
+                )
+                && self.free_monitor(ctx).is_some();
+            let multi_monitor = self.local_monitors.len() > 1;
+            let mut toggle_display: Option<(u32, bool)> = None;
+            let mut add_virtual = false;
+            let mut relayout = false;
             let menu_left = button_rect.left().clamp(
                 content_rect.left(),
                 (content_rect.right() - 190.0).max(content_rect.left()),
@@ -3536,12 +3779,22 @@ impl StreamApp {
 
                                 // Monitor picker — only when the server reports
                                 // more than one capturable output (KMS path).
-                                if available_outputs.len() > 1 {
+                                // An output an aux window shows is not offered here:
+                                // the main window cannot share it (a virtual one
+                                // would vanish with its window).
+                                let picker_outputs: Vec<_> = available_outputs
+                                    .iter()
+                                    .filter(|o| {
+                                        streamed_output == Some(o.id)
+                                            || !open_outputs.contains(&o.id)
+                                    })
+                                    .collect();
+                                if picker_outputs.len() > 1 {
                                     ui.add_space(8.0);
                                     ui.separator();
                                     ui.add_space(4.0);
                                     ui.label(egui::RichText::new("Monitor").size(12.0).weak());
-                                    for out in &available_outputs {
+                                    for out in picker_outputs {
                                         let is_selected = selected_output == Some(out.id);
                                         let label = format!(
                                             "{}{} ({}×{})",
@@ -3559,6 +3812,67 @@ impl StreamApp {
                                             && !is_selected
                                         {
                                             selected_output_request = Some(out.id);
+                                        }
+                                    }
+                                }
+
+                                if available_outputs.len() > 1 || can_add_virtual {
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                    ui.add_space(4.0);
+                                    ui.label(egui::RichText::new("Displays").size(12.0).weak());
+                                    if !direct_path {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Extra windows need a direct connection.",
+                                            )
+                                            .size(11.0)
+                                            .weak(),
+                                        );
+                                    } else {
+                                        for out in available_outputs
+                                            .iter()
+                                            .filter(|o| Some(o.id) != streamed_output)
+                                        {
+                                            let open = open_outputs.contains(&out.id);
+                                            let label = format!(
+                                                "{} {} ({}×{})",
+                                                if open { "●" } else { "○" },
+                                                out.name,
+                                                out.width,
+                                                out.height
+                                            );
+                                            if ui
+                                                .add_sized([170.0, 26.0], egui::Button::new(label))
+                                                .on_hover_text(if open {
+                                                    "Close this display's window"
+                                                } else {
+                                                    "Open this display in its own window"
+                                                })
+                                                .clicked()
+                                            {
+                                                toggle_display = Some((out.id, open));
+                                            }
+                                        }
+                                        if can_add_virtual
+                                            && ui
+                                                .add_sized(
+                                                    [170.0, 26.0],
+                                                    egui::Button::new("＋ Virtual display"),
+                                                )
+                                                .clicked()
+                                        {
+                                            add_virtual = true;
+                                        }
+                                        if multi_monitor
+                                            && ui
+                                                .add_sized(
+                                                    [170.0, 26.0],
+                                                    egui::Button::new("Re-apply layout"),
+                                                )
+                                                .clicked()
+                                        {
+                                            relayout = true;
                                         }
                                     }
                                 }
@@ -3590,9 +3904,24 @@ impl StreamApp {
                 if let Some(tx) = &self.control_tx {
                     let _ = tx.send(ControlMessage::SelectOutput(id));
                 }
-                // Optimistically reflect the choice so the picker highlights it
-                // immediately; the server confirms with a SelectOutput echo.
-                self.shared_input.set_selected_output(id);
+                // Highlight the choice at once; the server answers with a
+                // StreamConfig naming the output it actually switched to.
+                self.pending_output = Some((id, menu_snapshot.stream_config_version));
+            }
+            if let Some((id, open)) = toggle_display {
+                if open {
+                    self.close_aux_for_output(id);
+                } else {
+                    self.open_aux(ctx, layout::AuxTarget::Output(id), None);
+                }
+            }
+            if add_virtual {
+                let monitor = self.free_monitor(ctx);
+                self.open_aux(ctx, layout::AuxTarget::Virtual, monitor);
+            }
+            if relayout {
+                self.close_all_aux();
+                self.layout_applied = false;
             }
             if request_disconnect {
                 self.disconnect();
@@ -3611,6 +3940,41 @@ impl StreamApp {
         }
 
         overlay_top
+    }
+
+    /// One-time hint: this system places new windows itself.
+    fn render_placement_note(&mut self, ctx: &egui::Context) {
+        let Some(until) = self.placement_note_until else {
+            return;
+        };
+        if Instant::now() >= until {
+            self.placement_note_until = None;
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_secs(1));
+        let mut dismissed = false;
+        let area = egui::Area::new(egui::Id::new("placement_note"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 12.0])
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(egui::Color32::from_rgba_unmultiplied(20, 24, 28, 232))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                "Display windows opened. This system places windows itself: \
+                                 move each one onto its monitor.",
+                            );
+                            if ui.button("OK").clicked() {
+                                dismissed = true;
+                            }
+                        });
+                    });
+            });
+        self.register_overlay_rect(area.response.rect);
+        if dismissed {
+            self.placement_note_until = None;
+        }
     }
 
     fn render_file_transfer_overlay(&mut self, ctx: &egui::Context, menu_bottom: f32) {
@@ -3771,7 +4135,7 @@ struct MediaThreads {
     video_stop_tx: crossbeam_channel::Sender<()>,
     video_thread: std::thread::JoinHandle<()>,
     audio_stop_tx: crossbeam_channel::Sender<()>,
-    audio_thread: std::thread::JoinHandle<()>,
+    audio_thread: Option<std::thread::JoinHandle<()>>,
     feedback_rx: crossbeam_channel::Receiver<TransportFeedback>,
     decode_started_rx: crossbeam_channel::Receiver<pipeline::VideoDecodeProgress>,
     stream_config_tx: crossbeam_channel::Sender<StreamConfig>,
@@ -3786,8 +4150,8 @@ fn start_media_threads(
     debug_enabled: Arc<AtomicBool>,
     video_arrival: Arc<AtomicU64>,
     video_stalled: Arc<AtomicBool>,
-    ctx: egui::Context,
-    display_refresh_millihz: Option<u32>,
+    ctx: Repaint,
+    display: SessionDisplay,
     audio_enabled: Arc<AtomicBool>,
     native_surfaces: Arc<NativeSurfaceControl>,
     control_tx: crossbeam_channel::Sender<ControlMessage>,
@@ -3797,6 +4161,9 @@ fn start_media_threads(
     udp_socket: UdpSocket,
     crypto: Option<Arc<st_protocol::tunnel::CryptoContext>>,
 ) -> Result<MediaThreads, String> {
+    // Video-only (aux) sessions run no audio thread; their input thread only
+    // carries the neutral bootstrap snapshots.
+    let video_only = display.aux;
     let input_socket = udp_socket
         .try_clone()
         .map_err(|err| format!("Failed to clone UDP socket: {err}"))?;
@@ -3852,7 +4219,7 @@ fn start_media_threads(
             control_tx,
             stream_config_rx,
             profile_error_tx,
-            display_refresh_millihz,
+            display.refresh_millihz,
             stream_config,
             receiver,
         );
@@ -3860,18 +4227,20 @@ fn start_media_threads(
 
     let (audio_stop_tx, audio_stop_rx) = crossbeam_channel::bounded(1);
     let audio_packet_duration_ms = stream_config.packet_duration_ms as u32;
-    let audio_thread = std::thread::spawn(move || {
-        st_protocol::thread_priority::promote_current_thread(
-            st_protocol::thread_priority::ThreadRole::Audio,
-        );
-        if let Err(e) = audio::run_audio_pipeline(
-            audio_data_rx,
-            audio_stop_rx,
-            audio_packet_duration_ms,
-            audio_enabled,
-        ) {
-            eprintln!("[audio] {e}");
-        }
+    let audio_thread = (!video_only).then(|| {
+        std::thread::spawn(move || {
+            st_protocol::thread_priority::promote_current_thread(
+                st_protocol::thread_priority::ThreadRole::Audio,
+            );
+            if let Err(e) = audio::run_audio_pipeline(
+                audio_data_rx,
+                audio_stop_rx,
+                audio_packet_duration_ms,
+                audio_enabled,
+            ) {
+                eprintln!("[audio] {e}");
+            }
+        })
     });
 
     Ok(MediaThreads {
@@ -3895,8 +4264,8 @@ fn start_punched_media_threads(
     debug_enabled: Arc<AtomicBool>,
     video_arrival: Arc<AtomicU64>,
     video_stalled: Arc<AtomicBool>,
-    ctx: egui::Context,
-    display_refresh_millihz: Option<u32>,
+    ctx: Repaint,
+    display: SessionDisplay,
     audio_enabled: Arc<AtomicBool>,
     native_surfaces: Arc<NativeSurfaceControl>,
     control_tx: crossbeam_channel::Sender<ControlMessage>,
@@ -3938,7 +4307,7 @@ fn start_punched_media_threads(
             control_tx,
             stream_config_rx,
             profile_error_tx,
-            display_refresh_millihz,
+            display.refresh_millihz,
             stream_config,
             receiver,
         );
@@ -3966,7 +4335,7 @@ fn start_punched_media_threads(
         video_stop_tx,
         video_thread,
         audio_stop_tx,
-        audio_thread,
+        audio_thread: Some(audio_thread),
         feedback_rx,
         decode_started_rx,
         stream_config_tx,
@@ -3981,7 +4350,9 @@ fn stop_media_threads(media_threads: MediaThreads) {
         let _ = input_stop_tx.send(());
     }
     let _ = media_threads.video_thread.join();
-    let _ = media_threads.audio_thread.join();
+    if let Some(audio_thread) = media_threads.audio_thread {
+        let _ = audio_thread.join();
+    }
     if let Some(input_thread) = media_threads.input_thread {
         let _ = input_thread.join();
     }
@@ -4064,7 +4435,7 @@ fn force_tcp_env() -> bool {
 #[allow(clippy::too_many_arguments)]
 fn run_fallback_chain(
     token: String,
-    display_refresh_millihz: Option<u32>,
+    display: SessionDisplay,
     video_codec_support: decode::VideoCodecSupportReport,
     excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
     state: Arc<Mutex<ConnectionState>>,
@@ -4079,7 +4450,7 @@ fn run_fallback_chain(
     shared_input: Arc<SharedInputState>,
     control_rx: crossbeam_channel::Receiver<ControlMessage>,
     input_rx: crossbeam_channel::Receiver<InputPacket>,
-    ctx: egui::Context,
+    ctx: Repaint,
     api_discovery: Arc<api_client::ApiDiscoveryShared>,
     ft_shared_state: file_transfer::SharedTransferState,
 ) -> Result<(), String> {
@@ -4118,7 +4489,7 @@ fn run_fallback_chain(
                     partner_cands,
                     punched_crypto,
                     token.clone(),
-                    display_refresh_millihz,
+                    display,
                     video_codec_support,
                     Arc::clone(&excluded_video_codecs),
                     Arc::clone(&state),
@@ -4156,9 +4527,14 @@ fn run_fallback_chain(
                     return Ok(());
                 }
                 punch_failure = format!("Hole punch setup failed: {punch_err}");
-                // Signaling problems (API unreachable, host not registered)
-                // won't heal within a retry round — go straight to the relay.
-                break;
+                eprintln!("[connect] {punch_failure} (round {round}/{PUNCH_ROUNDS})");
+                // A signaling hiccup (one failed API call, discovery briefly
+                // losing the host) used to send the session straight to the
+                // relay; it costs a round instead.
+                let retry_at = Instant::now() + Duration::from_millis(1500);
+                while round < PUNCH_ROUNDS && Instant::now() < retry_at && !cancelled() {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
         }
     }
@@ -4170,7 +4546,7 @@ fn run_fallback_chain(
     eprintln!("[connect] {punch_failure}; attempting TCP relay fallback...");
     if run_relay_tunnel_session(
         token,
-        display_refresh_millihz,
+        display,
         video_codec_support,
         excluded_video_codecs,
         state,
@@ -4199,7 +4575,7 @@ fn run_fallback_chain(
 fn run_connection(
     addr: String,
     token: String,
-    display_refresh_millihz: Option<u32>,
+    display: SessionDisplay,
     video_codec_support: decode::VideoCodecSupportReport,
     excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
     force_tcp_media: Arc<Mutex<std::collections::HashSet<String>>>,
@@ -4215,11 +4591,15 @@ fn run_connection(
     shared_input: Arc<SharedInputState>,
     control_rx: crossbeam_channel::Receiver<ControlMessage>,
     input_rx: crossbeam_channel::Receiver<InputPacket>,
-    ctx: egui::Context,
+    ctx: Repaint,
     api_discovery: Arc<api_client::ApiDiscoveryShared>,
     ft_shared_state: file_transfer::SharedTransferState,
+    // Set once this session is Connected over a direct connection, the only
+    // kind aux sessions can be opened beside.
+    direct_path: Arc<AtomicBool>,
 ) {
-    let punch_fallback_available = api_discovery.is_connected();
+    // Aux sessions are direct-only: they never use punch, relay or TCP media.
+    let punch_fallback_available = !display.aux && api_discovery.is_connected();
 
     if session_cancelled(
         disconnect.as_ref(),
@@ -4261,7 +4641,8 @@ fn run_connection(
     // address must not suppress fallback: STUN may have failed, or that VPN
     // may be unreachable here. Signaling refreshes the full candidate list
     // and the relay can work even when no public UDP candidate exists.
-    let force_tcp = force_tcp_media.lock().unwrap().contains(&addr) || force_tcp_env();
+    let force_tcp =
+        !display.aux && (force_tcp_media.lock().unwrap().contains(&addr) || force_tcp_env());
     let tcp_timeout = if punch_fallback_available { 3 } else { 5 };
     let tcp_result = if punch_fallback_available && api_discovery.is_punch_candidate(socket_addr) {
         Err("API candidate is a UDP punch endpoint".to_string())
@@ -4282,7 +4663,7 @@ fn run_connection(
                 let established = run_direct_tcp_tunnel_session(
                     s,
                     token,
-                    display_refresh_millihz,
+                    display,
                     video_codec_support,
                     excluded_video_codecs,
                     state,
@@ -4315,7 +4696,7 @@ fn run_connection(
                 eprintln!("[connect] Using punch/relay for {socket_addr}: {tcp_err}");
                 if let Err(failure) = run_fallback_chain(
                     token,
-                    display_refresh_millihz,
+                    display,
                     video_codec_support,
                     excluded_video_codecs,
                     Arc::clone(&state),
@@ -4452,7 +4833,7 @@ fn run_connection(
             drop(tcp);
             if let Err(failure) = run_fallback_chain(
                 token,
-                display_refresh_millihz,
+                display,
                 video_codec_support,
                 excluded_video_codecs,
                 Arc::clone(&state),
@@ -4526,50 +4907,13 @@ fn run_connection(
         .ok()
         .map(|addr| addr.port())
         .unwrap_or(0);
-    if trace_enabled() {
-        eprintln!(
-            "[trace][client] sending ClientDisplayInfo: refresh_millihz={} udp_port={local_udp_port} codecs={} hw_codecs={} yuv444={} yuv444_hw={}",
-            display_refresh_millihz.unwrap_or(0),
-            codec_support_summary(video_codec_support.supported),
-            codec_support_summary(video_codec_support.hardware),
-            codec_support_summary(video_codec_support.yuv444),
-            codec_support_summary(video_codec_support.hardware_yuv444),
-        );
-    }
-    let mut excluded = *excluded_video_codecs.lock().unwrap();
-    let mut effective_supported = video_codec_support.supported.subtract(excluded);
-    // If all supported codecs are excluded, reset the blacklist so we can retry.
-    if effective_supported.is_empty() && !excluded.is_empty() {
-        eprintln!("[codec] all codecs excluded — resetting blacklist to retry");
-        *excluded_video_codecs.lock().unwrap() = st_protocol::VideoCodecSupport::empty();
-        excluded = st_protocol::VideoCodecSupport::empty();
-        effective_supported = video_codec_support.supported;
-    }
-    let effective_hardware = video_codec_support.hardware.subtract(excluded);
-    let effective_yuv444 = video_codec_support.yuv444.subtract(excluded);
-    let effective_hardware_yuv444 = video_codec_support.hardware_yuv444.subtract(excluded);
-    if !excluded.is_empty() {
-        eprintln!(
-            "[codec] excluding previously failed codecs: {} (effective: supported={} hw={} yuv444={} yuv444_hw={})",
-            codec_support_summary(excluded),
-            codec_support_summary(effective_supported),
-            codec_support_summary(effective_hardware),
-            codec_support_summary(effective_yuv444),
-            codec_support_summary(effective_hardware_yuv444),
-        );
-    }
-    let _ = tcp.write_all(
-        &ControlMessage::ClientDisplayInfo(ClientDisplayInfo {
-            max_refresh_millihz: display_refresh_millihz.unwrap_or(0),
-            udp_port: local_udp_port,
-            supported_video_codecs: effective_supported,
-            hardware_video_codecs: effective_hardware,
-            supported_yuv444_video_codecs: effective_yuv444,
-            hardware_yuv444_video_codecs: effective_hardware_yuv444,
-            hdr_display: client_hdr_display_supported(),
-        })
-        .serialize(),
+    let display_info = client_display_info(
+        display,
+        local_udp_port,
+        &video_codec_support,
+        &excluded_video_codecs,
     );
+    let _ = tcp.write_all(&ControlMessage::ClientDisplayInfo(display_info).serialize());
     if let Some(max_kbps) = client_bitrate_preference_kbps() {
         let _ = tcp.write_all(&ControlMessage::ClientBitratePreference(max_kbps).serialize());
     }
@@ -4581,7 +4925,13 @@ fn run_connection(
     let mut stream_started = false;
     let mut media_threads: Option<MediaThreads> = None;
     let mut udp_socket = Some(udp_socket);
-    let mut input_rx = Some(input_rx);
+    // An aux session sends no input of its own, but its input thread (same UDP
+    // socket as the media receiver) carries neutral snapshots that tell the
+    // server where to send media and keep the NAT mapping open.
+    let (bootstrap_tx, bootstrap_rx) = crossbeam_channel::bounded::<InputPacket>(8);
+    let mut input_rx = Some(if display.aux { bootstrap_rx } else { input_rx });
+    let mut media_ready_pending = false;
+    let mut media_ready_deadline = Instant::now();
     let (pipeline_control_tx, pipeline_control_rx) =
         crossbeam_channel::bounded::<ControlMessage>(8);
     loop {
@@ -4594,6 +4944,31 @@ fn run_connection(
                 stop_media_threads(media_threads);
             }
             return;
+        }
+        // An aux session announces its media socket (neutral input snapshots)
+        // before it says it is ready, which needs the server's InputSession.
+        if media_ready_pending {
+            let announced = !display.aux || send_media_bootstrap(&bootstrap_tx, &shared_input);
+            if announced || Instant::now() >= media_ready_deadline {
+                media_ready_pending = false;
+                if let Err(err) = tcp.write_all(&ControlMessage::ClientReadyForMedia.serialize()) {
+                    if let Some(media_threads) = media_threads.take() {
+                        stop_media_threads(media_threads);
+                    }
+                    set_error(
+                        &state,
+                        &ctx,
+                        &disconnect,
+                        &connection_epoch,
+                        session_epoch,
+                        format!("Failed to acknowledge media readiness: {err}"),
+                    );
+                    return;
+                }
+                if trace_enabled() {
+                    eprintln!("[trace][client] sent ClientReadyForMedia");
+                }
+            }
         }
         match tcp.read(&mut buf) {
             Ok(0) => {
@@ -4613,6 +4988,10 @@ fn run_connection(
             Ok(n) => {
                 control_buf.extend_from_slice(&buf[..n]);
                 for msg in drain_control_messages(&mut control_buf) {
+                    let Some(msg) = apply_session_state(msg, &shared_input, &debug_state, &ctx)
+                    else {
+                        continue;
+                    };
                     match msg {
                         ControlMessage::StreamConfig(cfg) => {
                             if trace_enabled() {
@@ -4639,7 +5018,7 @@ fn run_connection(
                                     Arc::clone(&video_arrival),
                                     Arc::clone(&video_stalled),
                                     ctx.clone(),
-                                    display_refresh_millihz,
+                                    display,
                                     Arc::clone(&audio_enabled),
                                     Arc::clone(&native_surfaces),
                                     pipeline_control_tx.clone(),
@@ -4668,31 +5047,11 @@ fn run_connection(
                                         "[trace][client] media threads started on udp_port={local_udp_port}"
                                     );
                                 }
-                                if let Err(err) =
-                                    tcp.write_all(&ControlMessage::ClientReadyForMedia.serialize())
-                                {
-                                    if let Some(media_threads) = media_threads.take() {
-                                        stop_media_threads(media_threads);
-                                    }
-                                    set_error(
-                                        &state,
-                                        &ctx,
-                                        &disconnect,
-                                        &connection_epoch,
-                                        session_epoch,
-                                        format!("Failed to acknowledge media readiness: {err}"),
-                                    );
-                                    return;
-                                }
-                                if trace_enabled() {
-                                    eprintln!("[trace][client] sent ClientReadyForMedia");
-                                }
+                                media_ready_pending = true;
+                                media_ready_deadline = Instant::now() + MEDIA_BOOTSTRAP_WAIT;
                             } else if let Some(media) = media_threads.as_ref() {
                                 let _ = media.stream_config_tx.send(cfg);
                             }
-                        }
-                        ControlMessage::SessionDebugInfo(info) => {
-                            debug_state.set_session_info(info);
                         }
                         ControlMessage::ClockSyncPong(pong)
                             if debug_enabled.load(Ordering::Relaxed) =>
@@ -4700,50 +5059,6 @@ fn run_connection(
                             debug_state.update_clock_sync(pong, unix_time_micros());
                         }
                         ControlMessage::ClockSyncPong(_) => {}
-                        ControlMessage::InputSession(session) => {
-                            shared_input.set_input_session(session);
-                        }
-                        ControlMessage::ControllerState(controller_state) => {
-                            shared_input.set_controller_state(controller_state);
-                        }
-                        ControlMessage::InputCapabilities(capabilities) => {
-                            eprintln!(
-                                "[cursor] capabilities: abs={} rel={} kbd={} separate_cursor={} hover_capture={}",
-                                capabilities.mouse_absolute,
-                                capabilities.mouse_relative,
-                                capabilities.keyboard,
-                                capabilities.separate_cursor,
-                                capabilities.hover_capture
-                            );
-                            shared_input.set_capabilities(capabilities);
-                        }
-                        ControlMessage::CursorShape(shape) => {
-                            if trace_enabled() {
-                                eprintln!(
-                                    "[cursor] shape: serial={} {}x{} hotspot=({},{}) rgba_len={}",
-                                    shape.serial,
-                                    shape.width,
-                                    shape.height,
-                                    shape.hotspot_x,
-                                    shape.hotspot_y,
-                                    shape.rgba.len()
-                                );
-                            }
-                            shared_input.set_cursor_shape(shape);
-                            ctx.request_repaint();
-                        }
-                        ControlMessage::CursorState(cursor_state) => {
-                            shared_input.set_cursor_state(cursor_state);
-                            ctx.request_repaint();
-                        }
-                        ControlMessage::AvailableOutputs(outputs) => {
-                            shared_input.set_available_outputs(outputs);
-                            ctx.request_repaint();
-                        }
-                        ControlMessage::SelectOutput(id) => {
-                            shared_input.set_selected_output(id);
-                            ctx.request_repaint();
-                        }
                         ControlMessage::StreamStarted => {
                             if trace_enabled() {
                                 eprintln!("[trace][client] received StreamStarted");
@@ -4829,21 +5144,13 @@ fn run_connection(
     let feedback_rx = media_threads.feedback_rx.clone();
     let decode_started_rx = media_threads.decode_started_rx.clone();
     let profile_error_rx = media_threads.profile_error_rx.clone();
-    let (clipboard_control_tx, clipboard_control_rx) =
-        crossbeam_channel::bounded::<ControlMessage>(8);
-    let (file_detect_tx, file_detect_rx) = crossbeam_channel::bounded::<std::path::PathBuf>(8);
-    let suppressed_paths = clipboard::new_suppressed_paths();
-    let mut clipboard_sync = clipboard::ClipboardSync::start_with_file_detection(
-        "client",
-        clipboard_control_tx,
-        file_detect_tx,
-        Arc::clone(&suppressed_paths),
-    );
-    let mut ft_manager = file_transfer::FileTransferManager::start_full(
-        st_protocol::file_transfer::TransportMode::Direct,
-        Arc::clone(&ft_shared_state),
-        suppressed_paths,
-    );
+    let mut services = (!display.aux).then(|| {
+        SessionServices::start(
+            "client",
+            st_protocol::file_transfer::TransportMode::Direct,
+            Arc::clone(&ft_shared_state),
+        )
+    });
 
     // Connected!
     {
@@ -4857,17 +5164,21 @@ fn run_connection(
             return;
         }
         *s = ConnectionState::Connected;
+        direct_path.store(true, Ordering::SeqCst);
     }
     if trace_enabled() {
         eprintln!("[trace][client] connection state -> Connected");
     }
     ctx.request_repaint();
 
-    // Tell server our audio preference
-    let initial_audio =
-        audio_enabled.load(Ordering::SeqCst) && stream_supports_client_audio(&stream_config);
+    // Tell server our audio preference; aux sessions carry no audio.
+    let initial_audio = !display.aux
+        && audio_enabled.load(Ordering::SeqCst)
+        && stream_supports_client_audio(&stream_config);
     audio_enabled.store(initial_audio, Ordering::SeqCst);
-    let _ = tcp.write_all(&ControlMessage::SetAudio(initial_audio).serialize());
+    if !display.aux {
+        let _ = tcp.write_all(&ControlMessage::SetAudio(initial_audio).serialize());
+    }
 
     // TCP control loop — check for server messages, disconnect flag, and audio toggle
     control_buf.clear();
@@ -4928,16 +5239,10 @@ fn run_connection(
         while let Ok(msg) = control_rx.try_recv() {
             let _ = tcp.write_all(&msg.serialize());
         }
-        while let Ok(msg) = clipboard_control_rx.try_recv() {
-            let _ = tcp.write_all(&msg.serialize());
-        }
-        while let Ok(path) = file_detect_rx.try_recv() {
-            let _ = ft_manager
-                .inbound_tx
-                .try_send(file_transfer::FtInbound::SendFile { path });
-        }
-        while let Ok(msg) = ft_manager.outbound_rx.try_recv() {
-            let _ = tcp.write_all(&msg.serialize());
+        if let Some(services) = services.as_ref() {
+            services.drain_outgoing(|msg| {
+                let _ = tcp.write_all(&msg.serialize());
+            });
         }
         while let Ok(msg) = pipeline_control_rx.try_recv() {
             let _ = tcp.write_all(&msg.serialize());
@@ -4955,8 +5260,9 @@ fn run_connection(
             excluded_video_codecs.lock().unwrap().insert(failure.codec);
             *state.lock().unwrap() = ConnectionState::Disconnected;
             ctx.request_repaint();
-            clipboard_sync.stop();
-            ft_manager.stop();
+            if let Some(services) = services.as_mut() {
+                services.stop();
+            }
             stop_media_threads(media_threads);
             return;
         }
@@ -4983,9 +5289,12 @@ fn run_connection(
                      switching to TCP media transport and reconnecting",
                     STARTUP_DECODE_TIMEOUT.as_secs(),
                 );
-                force_tcp_media.lock().unwrap().insert(addr.clone());
-                clipboard_sync.stop();
-                ft_manager.stop();
+                if !display.aux {
+                    force_tcp_media.lock().unwrap().insert(addr.clone());
+                }
+                if let Some(services) = services.as_mut() {
+                    services.stop();
+                }
                 stop_media_threads(media_threads);
                 set_error(
                     &state,
@@ -5007,8 +5316,9 @@ fn run_connection(
             // Trigger reconnect by disconnecting cleanly
             *state.lock().unwrap() = ConnectionState::Disconnected;
             ctx.request_repaint();
-            clipboard_sync.stop();
-            ft_manager.stop();
+            if let Some(services) = services.as_mut() {
+                services.stop();
+            }
             stop_media_threads(media_threads);
             return;
         }
@@ -5020,6 +5330,11 @@ fn run_connection(
             });
             let _ = tcp.write_all(&ping.serialize());
             next_clock_ping = Instant::now() + Duration::from_secs(2);
+            // An aux session otherwise sends nothing, and nothing would keep the
+            // return path to its media port open through a NAT or firewall.
+            if display.aux {
+                send_media_bootstrap(&bootstrap_tx, &shared_input);
+            }
         }
 
         match tcp.read(&mut buf) {
@@ -5028,6 +5343,16 @@ fn run_connection(
                 let mut should_break = false;
                 control_buf.extend_from_slice(&buf[..n]);
                 for msg in drain_control_messages(&mut control_buf) {
+                    let Some(msg) = apply_session_state(msg, &shared_input, &debug_state, &ctx)
+                    else {
+                        continue;
+                    };
+                    let Some(msg) = (match services.as_mut() {
+                        Some(services) => services.handle_incoming(msg),
+                        None => Some(msg),
+                    }) else {
+                        continue;
+                    };
                     match msg {
                         ControlMessage::StreamConfig(cfg) => {
                             shared_input.set_stream_config(cfg);
@@ -5037,9 +5362,6 @@ fn run_connection(
                             }
                             stream_config = cfg;
                             let _ = media_threads.stream_config_tx.send(cfg);
-                        }
-                        ControlMessage::SessionDebugInfo(info) => {
-                            debug_state.set_session_info(info);
                         }
                         ControlMessage::ClockSyncPong(pong) => {
                             // B1: always derive RTT for the feedback field; the
@@ -5056,119 +5378,6 @@ fn run_connection(
                             if current_debug_enabled {
                                 debug_state.update_clock_sync(pong, now);
                             }
-                        }
-                        ControlMessage::InputSession(session) => {
-                            shared_input.set_input_session(session);
-                        }
-                        ControlMessage::ControllerState(controller_state) => {
-                            shared_input.set_controller_state(controller_state);
-                        }
-                        ControlMessage::InputCapabilities(capabilities) => {
-                            eprintln!(
-                                "[cursor] capabilities: abs={} rel={} kbd={} separate_cursor={} hover_capture={}",
-                                capabilities.mouse_absolute,
-                                capabilities.mouse_relative,
-                                capabilities.keyboard,
-                                capabilities.separate_cursor,
-                                capabilities.hover_capture
-                            );
-                            shared_input.set_capabilities(capabilities);
-                        }
-                        ControlMessage::CursorShape(shape) => {
-                            if trace_enabled() {
-                                eprintln!(
-                                    "[cursor] shape: serial={} {}x{} hotspot=({},{}) rgba_len={}",
-                                    shape.serial,
-                                    shape.width,
-                                    shape.height,
-                                    shape.hotspot_x,
-                                    shape.hotspot_y,
-                                    shape.rgba.len()
-                                );
-                            }
-                            shared_input.set_cursor_shape(shape);
-                            ctx.request_repaint();
-                        }
-                        ControlMessage::CursorState(cursor_state) => {
-                            shared_input.set_cursor_state(cursor_state);
-                            ctx.request_repaint();
-                        }
-                        ControlMessage::AvailableOutputs(outputs) => {
-                            shared_input.set_available_outputs(outputs);
-                            ctx.request_repaint();
-                        }
-                        ControlMessage::SelectOutput(id) => {
-                            shared_input.set_selected_output(id);
-                            ctx.request_repaint();
-                        }
-                        ControlMessage::ClipboardText(text) => {
-                            clipboard_sync.set_remote_text(text);
-                        }
-                        ControlMessage::FileOffer {
-                            transfer_id,
-                            file_size,
-                            file_name,
-                        } => {
-                            let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::OfferReceived {
-                                    transfer_id,
-                                    file_size,
-                                    file_name,
-                                },
-                            );
-                        }
-                        ControlMessage::FileAccept {
-                            transfer_id,
-                            accepted,
-                        } => {
-                            let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::AcceptReceived {
-                                    transfer_id,
-                                    accepted,
-                                },
-                            );
-                        }
-                        ControlMessage::FileChunk {
-                            transfer_id,
-                            chunk_index,
-                            data,
-                        } => {
-                            let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::ChunkReceived {
-                                    transfer_id,
-                                    chunk_index,
-                                    data,
-                                },
-                            );
-                        }
-                        ControlMessage::FileComplete {
-                            transfer_id,
-                            total_chunks,
-                            sha256,
-                        } => {
-                            let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::CompleteReceived {
-                                    transfer_id,
-                                    total_chunks,
-                                    sha256,
-                                },
-                            );
-                        }
-                        ControlMessage::FileCancel { transfer_id } => {
-                            let _ = ft_manager
-                                .inbound_tx
-                                .try_send(file_transfer::FtInbound::CancelReceived { transfer_id });
-                        }
-                        ControlMessage::FileProgress {
-                            transfer_id,
-                            chunks_received,
-                        } => {
-                            let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::ProgressReceived {
-                                    transfer_id,
-                                    chunks_received,
-                                },
-                            );
                         }
                         ControlMessage::Error(err) => {
                             set_error(
@@ -5205,8 +5414,9 @@ fn run_connection(
     }
 
     // Cleanup
-    clipboard_sync.stop();
-    ft_manager.stop();
+    if let Some(services) = services.as_mut() {
+        services.stop();
+    }
     stop_media_threads(media_threads);
 
     if !session_is_current(connection_epoch.as_ref(), session_epoch) {
@@ -5247,7 +5457,7 @@ fn run_punched_session(
     partner_candidates: Vec<std::net::SocketAddr>,
     crypto: Arc<st_protocol::tunnel::CryptoContext>,
     token: String,
-    display_refresh_millihz: Option<u32>,
+    display: SessionDisplay,
     video_codec_support: decode::VideoCodecSupportReport,
     excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
     state: Arc<Mutex<ConnectionState>>,
@@ -5262,7 +5472,7 @@ fn run_punched_session(
     shared_input: Arc<SharedInputState>,
     control_rx: crossbeam_channel::Receiver<ControlMessage>,
     input_rx: crossbeam_channel::Receiver<InputPacket>,
-    ctx: egui::Context,
+    ctx: Repaint,
     api_discovery: Arc<api_client::ApiDiscoveryShared>,
     ft_shared_state: file_transfer::SharedTransferState,
 ) -> bool {
@@ -5337,7 +5547,7 @@ fn run_punched_session(
         punched,
         "punch",
         token,
-        display_refresh_millihz,
+        display,
         video_codec_support,
         excluded_video_codecs,
         state,
@@ -5368,7 +5578,7 @@ fn run_tunnel_session(
     punched: Arc<dyn st_protocol::tcp_tunnel::TunnelLink>,
     via: &'static str,
     token: String,
-    display_refresh_millihz: Option<u32>,
+    display: SessionDisplay,
     video_codec_support: decode::VideoCodecSupportReport,
     excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
     state: Arc<Mutex<ConnectionState>>,
@@ -5383,7 +5593,7 @@ fn run_tunnel_session(
     shared_input: Arc<SharedInputState>,
     control_rx: crossbeam_channel::Receiver<ControlMessage>,
     input_rx: crossbeam_channel::Receiver<InputPacket>,
-    ctx: egui::Context,
+    ctx: Repaint,
     ft_shared_state: file_transfer::SharedTransferState,
 ) -> bool {
     use st_protocol::reliable_udp::PunchedMessage;
@@ -5457,26 +5667,9 @@ fn run_tunnel_session(
     eprintln!("[{via}] Authenticated");
 
     // --- Send ClientDisplayInfo ---
-    let mut excluded = *excluded_video_codecs.lock().unwrap();
-    let mut effective_supported = video_codec_support.supported.subtract(excluded);
-    if effective_supported.is_empty() && !excluded.is_empty() {
-        eprintln!("[codec] all codecs excluded — resetting blacklist to retry");
-        *excluded_video_codecs.lock().unwrap() = st_protocol::VideoCodecSupport::empty();
-        excluded = st_protocol::VideoCodecSupport::empty();
-        effective_supported = video_codec_support.supported;
-    }
-    let effective_hardware = video_codec_support.hardware.subtract(excluded);
-    let effective_yuv444 = video_codec_support.yuv444.subtract(excluded);
-    let effective_hardware_yuv444 = video_codec_support.hardware_yuv444.subtract(excluded);
-    let display_info = st_protocol::ClientDisplayInfo {
-        max_refresh_millihz: display_refresh_millihz.unwrap_or(0),
-        udp_port: 0, // Not used for punched connections.
-        supported_video_codecs: effective_supported,
-        hardware_video_codecs: effective_hardware,
-        supported_yuv444_video_codecs: effective_yuv444,
-        hardware_yuv444_video_codecs: effective_hardware_yuv444,
-        hdr_display: client_hdr_display_supported(),
-    };
+    // Not used for punched connections: no UDP port.
+    let display_info =
+        client_display_info(display, 0, &video_codec_support, &excluded_video_codecs);
     let _ = punched.send_control(&ControlMessage::ClientDisplayInfo(display_info).serialize());
     if let Some(max_kbps) = client_bitrate_preference_kbps() {
         let _ =
@@ -5492,28 +5685,13 @@ fn run_tunnel_session(
             let mut offset = 0;
             while let Some((msg, used)) = ControlMessage::deserialize(&data[offset..]) {
                 offset += used;
+                let Some(msg) = apply_session_state(msg, &shared_input, &debug_state, &ctx) else {
+                    continue;
+                };
                 match msg {
                     ControlMessage::StreamConfig(cfg) => {
                         shared_input.set_stream_config(cfg);
                         stream_config = Some(cfg);
-                    }
-                    ControlMessage::SessionDebugInfo(info) => {
-                        debug_state.set_session_info(info);
-                    }
-                    ControlMessage::InputSession(session) => {
-                        shared_input.set_input_session(session);
-                    }
-                    ControlMessage::InputCapabilities(caps) => {
-                        shared_input.set_capabilities(caps);
-                    }
-                    ControlMessage::ControllerState(cs) => {
-                        shared_input.set_controller_state(cs);
-                    }
-                    ControlMessage::AvailableOutputs(outputs) => {
-                        shared_input.set_available_outputs(outputs);
-                    }
-                    ControlMessage::SelectOutput(id) => {
-                        shared_input.set_selected_output(id);
                     }
                     ControlMessage::Error(error) => {
                         set_error(
@@ -5652,7 +5830,7 @@ fn run_tunnel_session(
         video_arrival,
         Arc::clone(&video_stalled),
         ctx.clone(),
-        display_refresh_millihz,
+        display,
         Arc::clone(&audio_enabled),
         Arc::clone(&native_surfaces),
         pipeline_control_tx,
@@ -5677,20 +5855,10 @@ fn run_tunnel_session(
     let mut input_seq: u16 = 0;
     let mut mouse_heartbeat = MouseInputHeartbeat::default();
     let mut keyboard_heartbeat = KeyboardInputHeartbeat::default();
-    let (clipboard_control_tx, clipboard_control_rx) =
-        crossbeam_channel::bounded::<ControlMessage>(8);
-    let (file_detect_tx, file_detect_rx) = crossbeam_channel::bounded::<std::path::PathBuf>(8);
-    let suppressed_paths = clipboard::new_suppressed_paths();
-    let mut clipboard_sync = clipboard::ClipboardSync::start_with_file_detection(
+    let mut services = SessionServices::start(
         "client-punched",
-        clipboard_control_tx,
-        file_detect_tx,
-        Arc::clone(&suppressed_paths),
-    );
-    let mut ft_manager = file_transfer::FileTransferManager::start_full(
         st_protocol::file_transfer::TransportMode::Punched,
         Arc::clone(&ft_shared_state),
-        suppressed_paths,
     );
 
     // UDP gives no FIN; if the server vanishes (crash, network loss) nothing tells
@@ -5791,20 +5959,9 @@ fn run_tunnel_session(
             did_work = true;
             let _ = punched.send_control(&ctrl.serialize());
         }
-        while let Ok(ctrl) = clipboard_control_rx.try_recv() {
-            did_work = true;
+        did_work |= services.drain_outgoing(|ctrl| {
             let _ = punched.send_control(&ctrl.serialize());
-        }
-        while let Ok(path) = file_detect_rx.try_recv() {
-            did_work = true;
-            let _ = ft_manager
-                .inbound_tx
-                .try_send(file_transfer::FtInbound::SendFile { path });
-        }
-        while let Ok(ctrl) = ft_manager.outbound_rx.try_recv() {
-            did_work = true;
-            let _ = punched.send_control(&ctrl.serialize());
-        }
+        });
 
         // Forward transport feedback.
         while let Ok(mut fb) = media.feedback_rx.try_recv() {
@@ -5863,6 +6020,14 @@ fn run_tunnel_session(
                         let mut offset = 0;
                         while let Some((msg, used)) = ControlMessage::deserialize(&data[offset..]) {
                             offset += used;
+                            let Some(msg) =
+                                apply_session_state(msg, &shared_input, &debug_state, &ctx)
+                            else {
+                                continue;
+                            };
+                            let Some(msg) = services.handle_incoming(msg) else {
+                                continue;
+                            };
                             match msg {
                                 ControlMessage::StreamConfig(cfg) => {
                                     shared_input.set_stream_config(cfg);
@@ -5872,9 +6037,6 @@ fn run_tunnel_session(
                                     }
                                     stream_config = cfg;
                                     let _ = media.stream_config_tx.send(cfg);
-                                }
-                                ControlMessage::SessionDebugInfo(info) => {
-                                    debug_state.set_session_info(info);
                                 }
                                 ControlMessage::ClockSyncPong(pong) => {
                                     // B1: always derive RTT for the feedback
@@ -5891,101 +6053,6 @@ fn run_tunnel_session(
                                     if current_debug_enabled {
                                         debug_state.update_clock_sync(pong, now);
                                     }
-                                }
-                                ControlMessage::InputSession(session) => {
-                                    shared_input.set_input_session(session);
-                                }
-                                ControlMessage::ControllerState(cs) => {
-                                    shared_input.set_controller_state(cs);
-                                    ctx.request_repaint();
-                                }
-                                ControlMessage::InputCapabilities(caps) => {
-                                    shared_input.set_capabilities(caps);
-                                }
-                                ControlMessage::CursorShape(shape) => {
-                                    shared_input.set_cursor_shape(shape);
-                                    ctx.request_repaint();
-                                }
-                                ControlMessage::CursorState(cs) => {
-                                    shared_input.set_cursor_state(cs);
-                                    ctx.request_repaint();
-                                }
-                                ControlMessage::AvailableOutputs(outputs) => {
-                                    shared_input.set_available_outputs(outputs);
-                                    ctx.request_repaint();
-                                }
-                                ControlMessage::SelectOutput(id) => {
-                                    shared_input.set_selected_output(id);
-                                    ctx.request_repaint();
-                                }
-                                ControlMessage::ClipboardText(text) => {
-                                    clipboard_sync.set_remote_text(text);
-                                }
-                                ControlMessage::FileOffer {
-                                    transfer_id,
-                                    file_size,
-                                    file_name,
-                                } => {
-                                    let _ = ft_manager.inbound_tx.try_send(
-                                        file_transfer::FtInbound::OfferReceived {
-                                            transfer_id,
-                                            file_size,
-                                            file_name,
-                                        },
-                                    );
-                                }
-                                ControlMessage::FileAccept {
-                                    transfer_id,
-                                    accepted,
-                                } => {
-                                    let _ = ft_manager.inbound_tx.try_send(
-                                        file_transfer::FtInbound::AcceptReceived {
-                                            transfer_id,
-                                            accepted,
-                                        },
-                                    );
-                                }
-                                ControlMessage::FileChunk {
-                                    transfer_id,
-                                    chunk_index,
-                                    data,
-                                } => {
-                                    let _ = ft_manager.inbound_tx.try_send(
-                                        file_transfer::FtInbound::ChunkReceived {
-                                            transfer_id,
-                                            chunk_index,
-                                            data,
-                                        },
-                                    );
-                                }
-                                ControlMessage::FileComplete {
-                                    transfer_id,
-                                    total_chunks,
-                                    sha256,
-                                } => {
-                                    let _ = ft_manager.inbound_tx.try_send(
-                                        file_transfer::FtInbound::CompleteReceived {
-                                            transfer_id,
-                                            total_chunks,
-                                            sha256,
-                                        },
-                                    );
-                                }
-                                ControlMessage::FileCancel { transfer_id } => {
-                                    let _ = ft_manager.inbound_tx.try_send(
-                                        file_transfer::FtInbound::CancelReceived { transfer_id },
-                                    );
-                                }
-                                ControlMessage::FileProgress {
-                                    transfer_id,
-                                    chunks_received,
-                                } => {
-                                    let _ = ft_manager.inbound_tx.try_send(
-                                        file_transfer::FtInbound::ProgressReceived {
-                                            transfer_id,
-                                            chunks_received,
-                                        },
-                                    );
                                 }
                                 ControlMessage::Error(err) => {
                                     set_error(
@@ -6052,9 +6119,12 @@ fn run_tunnel_session(
     }
 
     // Cleanup.
-    clipboard_sync.stop();
-    ft_manager.stop();
+    services.stop();
     stop_media_threads(media);
+    // A tunnel has no connection close for the server to see: without the
+    // goodbye it holds the session until its silence timeout.
+    let _ = punched.send_control(&ControlMessage::Shutdown.serialize());
+    let _ = punched.flush_control(Duration::from_millis(250));
 
     {
         let mut s = state.lock().unwrap();
@@ -6088,7 +6158,7 @@ fn run_tunnel_session(
 fn run_direct_tcp_tunnel_session(
     mut stream: TcpStream,
     token: String,
-    display_refresh_millihz: Option<u32>,
+    display: SessionDisplay,
     video_codec_support: decode::VideoCodecSupportReport,
     excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
     state: Arc<Mutex<ConnectionState>>,
@@ -6103,7 +6173,7 @@ fn run_direct_tcp_tunnel_session(
     shared_input: Arc<SharedInputState>,
     control_rx: crossbeam_channel::Receiver<ControlMessage>,
     input_rx: crossbeam_channel::Receiver<InputPacket>,
-    ctx: egui::Context,
+    ctx: Repaint,
     ft_shared_state: file_transfer::SharedTransferState,
 ) -> bool {
     let _ = stream.set_nodelay(true);
@@ -6137,7 +6207,7 @@ fn run_direct_tcp_tunnel_session(
         Arc::new(tunnel),
         "tcp",
         token,
-        display_refresh_millihz,
+        display,
         video_codec_support,
         excluded_video_codecs,
         state,
@@ -6168,7 +6238,7 @@ fn run_direct_tcp_tunnel_session(
 #[allow(clippy::too_many_arguments)]
 fn run_relay_tunnel_session(
     token: String,
-    display_refresh_millihz: Option<u32>,
+    display: SessionDisplay,
     video_codec_support: decode::VideoCodecSupportReport,
     excluded_video_codecs: Arc<Mutex<st_protocol::VideoCodecSupport>>,
     state: Arc<Mutex<ConnectionState>>,
@@ -6183,7 +6253,7 @@ fn run_relay_tunnel_session(
     shared_input: Arc<SharedInputState>,
     control_rx: crossbeam_channel::Receiver<ControlMessage>,
     input_rx: crossbeam_channel::Receiver<InputPacket>,
-    ctx: egui::Context,
+    ctx: Repaint,
     api_discovery: Arc<api_client::ApiDiscoveryShared>,
     ft_shared_state: file_transfer::SharedTransferState,
 ) -> bool {
@@ -6227,7 +6297,7 @@ fn run_relay_tunnel_session(
         Arc::new(tunnel),
         "relay",
         token,
-        display_refresh_millihz,
+        display,
         video_codec_support,
         excluded_video_codecs,
         state,
@@ -6248,9 +6318,289 @@ fn run_relay_tunnel_session(
     true
 }
 
+/// How long an aux session waits for its `InputSession` before saying it is
+/// ready for media anyway.
+const MEDIA_BOOTSTRAP_WAIT: Duration = Duration::from_secs(3);
+
+/// Packets that change no input state: nothing held, nothing pressed. Sent
+/// under the session's own id and credential, they let the server learn the
+/// address of the media socket without taking control.
+fn neutral_input_snapshots(client_id: u32) -> [InputPacket; 2] {
+    [
+        InputPacket::MouseButtons(MouseButtonsInput {
+            client_id,
+            buttons: 0,
+        }),
+        InputPacket::KeyboardState(KeyboardStateInput {
+            client_id,
+            pressed: [0; st_protocol::KEYBOARD_STATE_BYTES],
+        }),
+    ]
+}
+
+/// Queues the neutral snapshots for the input thread; false while the session
+/// has no id and credential yet.
+fn send_media_bootstrap(
+    tx: &crossbeam_channel::Sender<InputPacket>,
+    shared_input: &SharedInputState,
+) -> bool {
+    let (Some(client_id), Some(_)) = (shared_input.client_id(), shared_input.input_credential())
+    else {
+        return false;
+    };
+    for packet in neutral_input_snapshots(client_id) {
+        let _ = tx.try_send(packet);
+    }
+    true
+}
+
+/// Session-state messages every control loop applies the same way. Returns the
+/// message back when it is not one of them.
+fn apply_session_state(
+    msg: ControlMessage,
+    shared_input: &SharedInputState,
+    debug_state: &ConnectionDebugState,
+    ctx: &Repaint,
+) -> Option<ControlMessage> {
+    match msg {
+        ControlMessage::SessionDebugInfo(info) => debug_state.set_session_info(info),
+        ControlMessage::InputSession(session) => shared_input.set_input_session(session),
+        ControlMessage::ControllerState(controller_state) => {
+            shared_input.set_controller_state(controller_state);
+            ctx.request_repaint();
+        }
+        ControlMessage::InputCapabilities(capabilities) => {
+            eprintln!(
+                "[cursor] capabilities: abs={} rel={} kbd={} separate_cursor={} hover_capture={}",
+                capabilities.mouse_absolute,
+                capabilities.mouse_relative,
+                capabilities.keyboard,
+                capabilities.separate_cursor,
+                capabilities.hover_capture
+            );
+            shared_input.set_capabilities(capabilities);
+        }
+        ControlMessage::CursorShape(shape) => {
+            if trace_enabled() {
+                eprintln!(
+                    "[cursor] shape: serial={} {}x{} hotspot=({},{}) rgba_len={}",
+                    shape.serial,
+                    shape.width,
+                    shape.height,
+                    shape.hotspot_x,
+                    shape.hotspot_y,
+                    shape.rgba.len()
+                );
+            }
+            shared_input.set_cursor_shape(shape);
+            ctx.request_repaint();
+        }
+        ControlMessage::CursorState(cursor_state) => {
+            shared_input.set_cursor_state(cursor_state);
+            ctx.request_repaint();
+        }
+        ControlMessage::AvailableOutputs {
+            outputs,
+            virtual_supported,
+        } => {
+            shared_input.set_available_outputs(outputs, virtual_supported);
+            ctx.request_repaint();
+        }
+        other => return Some(other),
+    }
+    None
+}
+
+/// Clipboard sync and file transfer of a primary session. Secondary (aux)
+/// sessions carry video only and run without them.
+struct SessionServices {
+    clipboard_sync: clipboard::ClipboardSync,
+    ft_manager: file_transfer::FileTransferManager,
+    clipboard_control_rx: crossbeam_channel::Receiver<ControlMessage>,
+    file_detect_rx: crossbeam_channel::Receiver<PathBuf>,
+}
+
+impl SessionServices {
+    fn start(
+        label: &'static str,
+        mode: st_protocol::file_transfer::TransportMode,
+        ft_state: file_transfer::SharedTransferState,
+    ) -> Self {
+        let (clipboard_control_tx, clipboard_control_rx) =
+            crossbeam_channel::bounded::<ControlMessage>(8);
+        let (file_detect_tx, file_detect_rx) = crossbeam_channel::bounded::<PathBuf>(8);
+        let suppressed_paths = clipboard::new_suppressed_paths();
+        let clipboard_sync = clipboard::ClipboardSync::start_with_file_detection(
+            label,
+            clipboard_control_tx,
+            file_detect_tx,
+            Arc::clone(&suppressed_paths),
+        );
+        let ft_manager =
+            file_transfer::FileTransferManager::start_full(mode, ft_state, suppressed_paths);
+        Self {
+            clipboard_sync,
+            ft_manager,
+            clipboard_control_rx,
+            file_detect_rx,
+        }
+    }
+
+    /// Hands everything the services want sent to `send`; true if any.
+    fn drain_outgoing(&self, mut send: impl FnMut(ControlMessage)) -> bool {
+        let mut any = false;
+        while let Ok(msg) = self.clipboard_control_rx.try_recv() {
+            any = true;
+            send(msg);
+        }
+        while let Ok(path) = self.file_detect_rx.try_recv() {
+            any = true;
+            let _ = self
+                .ft_manager
+                .inbound_tx
+                .try_send(file_transfer::FtInbound::SendFile { path });
+        }
+        while let Ok(msg) = self.ft_manager.outbound_rx.try_recv() {
+            any = true;
+            send(msg);
+        }
+        any
+    }
+
+    /// Consumes clipboard and file messages; returns any other message.
+    fn handle_incoming(&mut self, msg: ControlMessage) -> Option<ControlMessage> {
+        use file_transfer::FtInbound;
+        let inbound = match msg {
+            ControlMessage::ClipboardText(text) => {
+                self.clipboard_sync.set_remote_text(text);
+                return None;
+            }
+            ControlMessage::FileOffer {
+                transfer_id,
+                file_size,
+                file_name,
+            } => FtInbound::OfferReceived {
+                transfer_id,
+                file_size,
+                file_name,
+            },
+            ControlMessage::FileAccept {
+                transfer_id,
+                accepted,
+            } => FtInbound::AcceptReceived {
+                transfer_id,
+                accepted,
+            },
+            ControlMessage::FileChunk {
+                transfer_id,
+                chunk_index,
+                data,
+            } => FtInbound::ChunkReceived {
+                transfer_id,
+                chunk_index,
+                data,
+            },
+            ControlMessage::FileComplete {
+                transfer_id,
+                total_chunks,
+                sha256,
+            } => FtInbound::CompleteReceived {
+                transfer_id,
+                total_chunks,
+                sha256,
+            },
+            ControlMessage::FileCancel { transfer_id } => FtInbound::CancelReceived { transfer_id },
+            ControlMessage::FileProgress {
+                transfer_id,
+                chunks_received,
+            } => FtInbound::ProgressReceived {
+                transfer_id,
+                chunks_received,
+            },
+            other => return Some(other),
+        };
+        let _ = self.ft_manager.inbound_tx.try_send(inbound);
+        None
+    }
+
+    fn stop(&mut self) {
+        self.clipboard_sync.stop();
+        self.ft_manager.stop();
+    }
+}
+
+/// What the local display showing one connection's stream looks like, and
+/// which server output that connection streams.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionDisplay {
+    refresh_millihz: Option<u32>,
+    /// Pixel size of the local monitor; 0 when unknown.
+    width: u32,
+    height: u32,
+    output_id: u32,
+    /// Video-only companion of the primary connection.
+    aux: bool,
+}
+
+fn client_display_info(
+    display: SessionDisplay,
+    udp_port: u16,
+    video_codec_support: &decode::VideoCodecSupportReport,
+    excluded_video_codecs: &Mutex<VideoCodecSupport>,
+) -> ClientDisplayInfo {
+    let mut excluded = *excluded_video_codecs.lock().unwrap();
+    let mut supported = video_codec_support.supported.subtract(excluded);
+    // If all supported codecs are excluded, reset the blacklist so we can retry.
+    if supported.is_empty() && !excluded.is_empty() {
+        eprintln!("[codec] all codecs excluded — resetting blacklist to retry");
+        *excluded_video_codecs.lock().unwrap() = VideoCodecSupport::empty();
+        excluded = VideoCodecSupport::empty();
+        supported = video_codec_support.supported;
+    }
+    let info = ClientDisplayInfo {
+        max_refresh_millihz: display.refresh_millihz.unwrap_or(0),
+        udp_port,
+        supported_video_codecs: supported,
+        hardware_video_codecs: video_codec_support.hardware.subtract(excluded),
+        supported_yuv444_video_codecs: video_codec_support.yuv444.subtract(excluded),
+        hardware_yuv444_video_codecs: video_codec_support.hardware_yuv444.subtract(excluded),
+        hdr_display: client_hdr_display_supported(),
+        aux: display.aux,
+        output_id: display.output_id,
+        width: display.width,
+        height: display.height,
+    };
+    if trace_enabled() {
+        eprintln!(
+            "[trace][client] sending ClientDisplayInfo: refresh_millihz={} udp_port={udp_port} \
+             output={} aux={} {}x{} codecs={} hw_codecs={} yuv444={} yuv444_hw={}",
+            info.max_refresh_millihz,
+            info.output_id,
+            info.aux,
+            info.width,
+            info.height,
+            codec_support_summary(info.supported_video_codecs),
+            codec_support_summary(info.hardware_video_codecs),
+            codec_support_summary(info.supported_yuv444_video_codecs),
+            codec_support_summary(info.hardware_yuv444_video_codecs),
+        );
+    }
+    if !excluded.is_empty() {
+        eprintln!(
+            "[codec] excluding previously failed codecs: {} (effective: supported={} hw={} yuv444={} yuv444_hw={})",
+            codec_support_summary(excluded),
+            codec_support_summary(info.supported_video_codecs),
+            codec_support_summary(info.hardware_video_codecs),
+            codec_support_summary(info.supported_yuv444_video_codecs),
+            codec_support_summary(info.hardware_yuv444_video_codecs),
+        );
+    }
+    info
+}
+
 fn set_error(
     state: &Arc<Mutex<ConnectionState>>,
-    ctx: &egui::Context,
+    ctx: &Repaint,
     disconnect: &Arc<AtomicBool>,
     connection_epoch: &Arc<AtomicU64>,
     session_epoch: u64,
@@ -6803,6 +7153,21 @@ fn codec_name(codec: VideoCodec) -> &'static str {
         VideoCodec::Hevc => "hevc",
         VideoCodec::Av1 => "av1",
     }
+}
+
+/// The largest rect of a picture's aspect that fits `content`, centered.
+fn fit_picture(content: egui::Rect, picture: egui::Vec2) -> Option<egui::Rect> {
+    if picture.x <= 0.0 || picture.y <= 0.0 || content.width() <= 0.0 || content.height() <= 0.0 {
+        return None;
+    }
+    let scale = (content.width() / picture.x).min(content.height() / picture.y);
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    Some(egui::Rect::from_center_size(
+        content.center(),
+        picture * scale,
+    ))
 }
 
 fn normalized_coord(value: f32, min: f32, max: f32) -> u16 {
@@ -7371,20 +7736,13 @@ fn fmt_ms(v: Option<f32>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn build_debug_general_lines(
-    snapshot: &ConnectionDebugSnapshot,
-    input_snapshot: &input::SharedInputSnapshot,
-    capture_mode: LocalCaptureMode,
-    audio_enabled: bool,
-    pointer_buttons: u8,
-    pressed_keys: usize,
-) -> Vec<String> {
-    let stream_line = input_snapshot
+fn debug_stream_line(input_snapshot: &input::SharedInputSnapshot) -> String {
+    input_snapshot
         .stream_config
         .as_ref()
         .map(|cfg| {
             format!(
-                "{} {} {}x{} {} fps hdr={} audio={}ch/{}Hz",
+                "{} {} {}x{} {} fps hdr={} audio={}ch/{}Hz out={} rot={}",
                 codec_label(cfg),
                 stream_chroma_label(cfg.chroma),
                 cfg.width,
@@ -7392,79 +7750,17 @@ fn build_debug_general_lines(
                 cfg.framerate,
                 cfg.hdr,
                 cfg.audio_channels,
-                cfg.audio_sample_rate
+                cfg.audio_sample_rate,
+                cfg.output_id,
+                u32::from(cfg.rotation) * 90
             )
         })
-        .unwrap_or_else(|| "-".to_string());
+        .unwrap_or_else(|| "-".to_string())
+}
 
+/// Frame, network, fps, loss, latency and clock lines every stream reports.
+fn debug_link_lines(snapshot: &ConnectionDebugSnapshot) -> Vec<String> {
     vec![
-        format!("server: {}", snapshot.server_addr),
-        format!("stream: {stream_line}"),
-        format!(
-            "display: {}  audio={}  decoder={}  encoder={}  capture={}  input={}  quality={}",
-            format_refresh(snapshot.display_refresh_millihz),
-            if audio_enabled { "on" } else { "off" },
-            if snapshot.decoder_name.is_empty() {
-                "-"
-            } else {
-                snapshot.decoder_name.as_str()
-            },
-            if snapshot.encoder_name.is_empty() {
-                "-"
-            } else {
-                snapshot.encoder_name.as_str()
-            },
-            if snapshot.capture_backend.is_empty() {
-                "-"
-            } else {
-                snapshot.capture_backend.as_str()
-            },
-            if snapshot.input_backend.is_empty() {
-                "-"
-            } else {
-                snapshot.input_backend.as_str()
-            },
-            if snapshot.quality_preset.is_empty() {
-                "-"
-            } else {
-                snapshot.quality_preset.as_str()
-            }
-        ),
-        format!(
-            "input: controller={:?} mode={} client_id={} keys={} buttons=0x{pointer_buttons:02x} caps=abs:{} rel:{} kb:{} cursor:{} hover:{}",
-            input_snapshot.controller_state,
-            capture_mode.label(),
-            input_snapshot
-                .client_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "-".to_string()),
-            pressed_keys,
-            if input_snapshot.capabilities.mouse_absolute {
-                "y"
-            } else {
-                "n"
-            },
-            if input_snapshot.capabilities.mouse_relative {
-                "y"
-            } else {
-                "n"
-            },
-            if input_snapshot.capabilities.keyboard {
-                "y"
-            } else {
-                "n"
-            },
-            if input_snapshot.capabilities.separate_cursor {
-                "y"
-            } else {
-                "n"
-            },
-            if input_snapshot.capabilities.hover_capture {
-                "y"
-            } else {
-                "n"
-            }
-        ),
         format!(
             "frame: id={} format={} present_path={}",
             snapshot
@@ -7535,6 +7831,90 @@ fn build_debug_general_lines(
     ]
 }
 
+fn build_debug_general_lines(
+    snapshot: &ConnectionDebugSnapshot,
+    input_snapshot: &input::SharedInputSnapshot,
+    capture_mode: LocalCaptureMode,
+    audio_enabled: bool,
+    pointer_buttons: u8,
+    pressed_keys: usize,
+) -> Vec<String> {
+    let stream_line = debug_stream_line(input_snapshot);
+
+    vec![
+        format!("server: {}", snapshot.server_addr),
+        format!("stream: {stream_line}"),
+        format!(
+            "display: {}  audio={}  decoder={}  encoder={}  capture={}  input={}  quality={}",
+            format_refresh(snapshot.display_refresh_millihz),
+            if audio_enabled { "on" } else { "off" },
+            if snapshot.decoder_name.is_empty() {
+                "-"
+            } else {
+                snapshot.decoder_name.as_str()
+            },
+            if snapshot.encoder_name.is_empty() {
+                "-"
+            } else {
+                snapshot.encoder_name.as_str()
+            },
+            if snapshot.capture_backend.is_empty() {
+                "-"
+            } else {
+                snapshot.capture_backend.as_str()
+            },
+            if snapshot.input_backend.is_empty() {
+                "-"
+            } else {
+                snapshot.input_backend.as_str()
+            },
+            if snapshot.quality_preset.is_empty() {
+                "-"
+            } else {
+                snapshot.quality_preset.as_str()
+            }
+        ),
+        format!(
+            "input: controller={:?} mode={} client_id={} keys={} buttons=0x{pointer_buttons:02x} caps=abs:{} rel:{} kb:{} cursor:{} hover:{}",
+            input_snapshot.controller_state,
+            capture_mode.label(),
+            input_snapshot
+                .client_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            pressed_keys,
+            if input_snapshot.capabilities.mouse_absolute {
+                "y"
+            } else {
+                "n"
+            },
+            if input_snapshot.capabilities.mouse_relative {
+                "y"
+            } else {
+                "n"
+            },
+            if input_snapshot.capabilities.keyboard {
+                "y"
+            } else {
+                "n"
+            },
+            if input_snapshot.capabilities.separate_cursor {
+                "y"
+            } else {
+                "n"
+            },
+            if input_snapshot.capabilities.hover_capture {
+                "y"
+            } else {
+                "n"
+            }
+        ),
+    ]
+    .into_iter()
+    .chain(debug_link_lines(snapshot))
+    .collect()
+}
+
 fn render_debug_overlay(
     ctx: &egui::Context,
     general_lines: &[String],
@@ -7582,7 +7962,10 @@ impl eframe::App for StreamApp {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.process_update_events();
+        self.poll_monitor_probe();
+        self.resolve_pending_output();
         let state = self.state.lock().unwrap().clone();
+        self.service_aux(ctx, frame, &state);
         if matches!(
             state,
             ConnectionState::Disconnected | ConnectionState::Error(_)
@@ -7754,6 +8137,10 @@ impl eframe::App for StreamApp {
                 self.local_overlay_hit_rects.clear();
                 0.0
             };
+
+        if state == ConnectionState::Connected {
+            self.render_placement_note(ctx);
+        }
 
         let central_panel = if state == ConnectionState::Connected {
             #[cfg(target_os = "macos")]
@@ -7992,6 +8379,14 @@ impl eframe::App for StreamApp {
         if *self.state.lock().unwrap() != ConnectionState::Connected {
             return;
         }
+        // Called for every window; an aux window forwards through the main
+        // session with its own geometry.
+        if raw_input.viewport_id != egui::ViewportId::ROOT {
+            if let Some(aux) = self.aux_window(raw_input.viewport_id) {
+                self.aux_raw_input(ctx, &aux, raw_input);
+            }
+            return;
+        }
 
         let force_release = raw_input.events.iter().any(|event| match event {
             egui::Event::Key {
@@ -8023,7 +8418,7 @@ impl eframe::App for StreamApp {
             return;
         };
         let keyboard_forward_active = self.keyboard_forward_active(&snapshot);
-        if !keyboard_forward_active {
+        if !keyboard_forward_active && self.aux_pointer.is_none() {
             self.clear_remote_keyboard();
         }
 
@@ -8650,6 +9045,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use st_protocol::OUTPUT_VIRTUAL;
+    use std::net::TcpListener;
 
     #[test]
     fn slow_mouse_motion_keeps_its_fractions() {
@@ -8737,6 +9134,7 @@ mod tests {
             x: 100,
             y: 200,
             buttons: MOUSE_BUTTON_PRIMARY,
+            output_id: 0,
         });
         assert_eq!(
             mouse_heartbeat_packet(absolute),
@@ -8958,5 +9356,445 @@ mod tests {
             ),
             Some((predicted, true))
         );
+    }
+
+    fn report() -> decode::VideoCodecSupportReport {
+        let mut supported = VideoCodecSupport::h264_only();
+        supported.insert(VideoCodec::Hevc);
+        decode::VideoCodecSupportReport {
+            supported,
+            hardware: supported,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn display_info_names_the_output_the_monitor_and_the_aux_role() {
+        let display = SessionDisplay {
+            refresh_millihz: Some(143_856),
+            width: 2560,
+            height: 1440,
+            output_id: OUTPUT_VIRTUAL,
+            aux: true,
+        };
+        let info = client_display_info(
+            display,
+            4242,
+            &report(),
+            &Mutex::new(VideoCodecSupport::empty()),
+        );
+        assert!(info.aux);
+        assert_eq!(info.output_id, OUTPUT_VIRTUAL);
+        assert_eq!((info.width, info.height), (2560, 1440));
+        assert_eq!(info.max_refresh_millihz, 143_856);
+        assert_eq!(info.udp_port, 4242);
+
+        let primary = SessionDisplay {
+            output_id: OUTPUT_DEFAULT,
+            aux: false,
+            ..display
+        };
+        let info = client_display_info(
+            primary,
+            0,
+            &report(),
+            &Mutex::new(VideoCodecSupport::empty()),
+        );
+        assert!(!info.aux);
+        assert_eq!(info.output_id, OUTPUT_DEFAULT);
+    }
+
+    #[test]
+    fn display_info_drops_failed_codecs_but_never_all_of_them() {
+        let display = SessionDisplay {
+            refresh_millihz: None,
+            width: 0,
+            height: 0,
+            output_id: OUTPUT_DEFAULT,
+            aux: false,
+        };
+        let mut hevc = VideoCodecSupport::empty();
+        hevc.insert(VideoCodec::Hevc);
+        let excluded = Mutex::new(hevc);
+        let info = client_display_info(display, 0, &report(), &excluded);
+        assert!(info.supported_video_codecs.supports(VideoCodec::H264));
+        assert!(!info.supported_video_codecs.supports(VideoCodec::Hevc));
+        assert_eq!(info.max_refresh_millihz, 0);
+
+        let mut both = hevc;
+        both.insert(VideoCodec::H264);
+        let excluded = Mutex::new(both);
+        let info = client_display_info(display, 0, &report(), &excluded);
+        assert!(
+            info.supported_video_codecs.supports(VideoCodec::H264),
+            "blacklist reset"
+        );
+        assert!(excluded.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn saved_output_preference_follows_the_peer_then_the_address() {
+        let entry = |address: &str, peer: Option<&str>| ServerEntry {
+            address: address.into(),
+            nickname: String::new(),
+            peer_id: peer.map(Into::into),
+            last_connected: 0,
+            manually_added: true,
+            preferred_output: None,
+        };
+        let list = vec![
+            entry("10.0.0.2:28480", Some("peer-a")),
+            entry("10.0.0.3:28480", None),
+        ];
+        assert_eq!(
+            server_entry_index(&list, Some("peer-a"), "192.168.1.9:28480"),
+            Some(0)
+        );
+        assert_eq!(server_entry_index(&list, None, "10.0.0.3:28480"), Some(1));
+        assert_eq!(
+            server_entry_index(&list, Some("peer-z"), "10.0.0.3:28480"),
+            Some(1)
+        );
+        assert_eq!(server_entry_index(&list, None, "10.0.0.9:28480"), None);
+    }
+
+    #[test]
+    fn server_entries_without_a_saved_output_still_load() {
+        let old = r#"[{"address": "10.0.0.2:28480", "manually_added": true}]"#;
+        let list: Vec<ServerEntry> = serde_json::from_str(old).unwrap();
+        assert_eq!(list[0].preferred_output, None);
+    }
+
+    #[test]
+    fn rotated_streams_fit_and_map_in_the_upright_space() {
+        let mut cfg = StreamConfig {
+            video_epoch: 1,
+            codec: VideoCodec::H264,
+            width: 2560,
+            height: 1440,
+            framerate: 60,
+            audio_sample_rate: 48_000,
+            audio_channels: 2,
+            hdr: false,
+            chroma: VideoChromaSampling::Yuv420,
+            packet_duration_ms: 5,
+            output_id: 2,
+            rotation: 1,
+        };
+        let content = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1080.0));
+        let (w, h) = cfg.display_size();
+        let rect = fit_picture(content, egui::vec2(w as f32, h as f32)).expect("fits");
+        assert_eq!(rect.height(), 1080.0, "portrait picture fills the height");
+        assert!((rect.width() - 607.5).abs() < 0.01);
+        assert_eq!(rect.center(), content.center());
+
+        // The window centre of the upright picture is the middle of the
+        // normalized range, and its corners the extremes.
+        let mid = normalized_coord(rect.center().x, rect.left(), rect.right());
+        assert!((i32::from(mid) - 32768).abs() <= 1);
+        assert_eq!(normalized_coord(rect.left(), rect.left(), rect.right()), 0);
+        assert_eq!(
+            normalized_coord(rect.bottom(), rect.top(), rect.bottom()),
+            65535
+        );
+
+        cfg.rotation = 2;
+        assert_eq!(cfg.display_size(), (2560, 1440));
+        assert!(fit_picture(content, egui::vec2(0.0, 1440.0)).is_none());
+    }
+
+    #[test]
+    fn neutral_snapshots_change_no_input_state() {
+        let [mouse, keyboard] = neutral_input_snapshots(7);
+        assert_eq!(
+            mouse,
+            InputPacket::MouseButtons(MouseButtonsInput {
+                client_id: 7,
+                buttons: 0
+            })
+        );
+        assert_eq!(
+            keyboard,
+            InputPacket::KeyboardState(KeyboardStateInput {
+                client_id: 7,
+                pressed: [0; st_protocol::KEYBOARD_STATE_BYTES]
+            })
+        );
+    }
+
+    #[test]
+    fn aux_bootstrap_reaches_the_server_from_the_media_socket() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let media = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let media_addr = media.local_addr().unwrap();
+        let credential = InputCredential::from_bytes([9; st_protocol::INPUT_CREDENTIAL_BYTES]);
+        let shared = Arc::new(SharedInputState::new());
+        let (tx, rx) = crossbeam_channel::bounded::<InputPacket>(8);
+
+        assert!(
+            !send_media_bootstrap(&tx, &shared),
+            "nothing is sent before the server issued an input session"
+        );
+        assert!(rx.try_recv().is_err());
+
+        shared.set_input_session(st_protocol::InputSession {
+            client_id: 7,
+            credential,
+        });
+        let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let sender = std::thread::spawn({
+            let shared = Arc::clone(&shared);
+            let server_addr = server.local_addr().unwrap();
+            move || run_input_sender(media, server_addr, rx, stop_rx, None, shared)
+        });
+        assert!(send_media_bootstrap(&tx, &shared));
+
+        let mut mouse = false;
+        let mut keyboard = false;
+        let mut buf = [0u8; 256];
+        while !(mouse && keyboard) {
+            let (n, from) = server.recv_from(&mut buf).expect("bootstrap datagram");
+            assert_eq!(from, media_addr, "sent from the media socket");
+            let (_, got, packet) = InputPacket::deserialize(&buf[..n]).expect("input packet");
+            assert_eq!(got, credential);
+            match packet {
+                InputPacket::MouseButtons(p) => {
+                    assert_eq!((p.client_id, p.buttons), (7, 0));
+                    mouse = true;
+                }
+                InputPacket::KeyboardState(p) => {
+                    assert_eq!(p.pressed, [0; st_protocol::KEYBOARD_STATE_BYTES]);
+                    keyboard = true;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let _ = stop_tx.send(());
+        drop(tx);
+        sender.join().unwrap();
+    }
+
+    /// Reads whatever the client sent over `tcp` into `seen` until `wanted`
+    /// matches one of the messages or `timeout` passes.
+    fn await_control(
+        tcp: &mut TcpStream,
+        pending: &mut Vec<u8>,
+        seen: &mut Vec<ControlMessage>,
+        timeout: Duration,
+        wanted: impl Fn(&ControlMessage) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut chunk = [0u8; 512];
+        loop {
+            if seen.iter().any(&wanted) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            match tcp.read(&mut chunk) {
+                Ok(0) => return false,
+                Ok(n) => {
+                    pending.extend_from_slice(&chunk[..n]);
+                    seen.extend(drain_control_messages(pending));
+                }
+                Err(e) if is_timeout(&e) => {}
+                Err(_) => return false,
+            }
+        }
+    }
+
+    /// An aux session against a scripted server: it asks for its output as an
+    /// aux session, waits for its input session before saying it is ready for
+    /// media, announces its media socket with neutral snapshots (again every
+    /// couple of seconds), and sends nothing a video-only session must not.
+    #[test]
+    fn aux_session_announces_its_media_socket_and_stays_video_only() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let udp = UdpSocket::bind(server_addr).unwrap();
+        let credential = InputCredential::from_bytes([3; st_protocol::INPUT_CREDENTIAL_BYTES]);
+        let disconnect = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(Mutex::new(ConnectionState::Connecting));
+
+        let client = std::thread::spawn({
+            let disconnect = Arc::clone(&disconnect);
+            let state = Arc::clone(&state);
+            move || {
+                let display = SessionDisplay {
+                    refresh_millihz: Some(60_000),
+                    width: 1920,
+                    height: 1080,
+                    output_id: 3,
+                    aux: true,
+                };
+                let (_control_tx, control_rx) = crossbeam_channel::bounded(1);
+                let (_input_tx, input_rx) = crossbeam_channel::bounded(1);
+                run_connection(
+                    server_addr.to_string(),
+                    "tok".into(),
+                    display,
+                    decode::VideoCodecSupportReport {
+                        supported: VideoCodecSupport::h264_only(),
+                        ..Default::default()
+                    },
+                    Arc::new(Mutex::new(VideoCodecSupport::empty())),
+                    Arc::new(Mutex::new(std::collections::HashSet::new())),
+                    state,
+                    Arc::new(Mutex::new(VideoFrameBuffer::default())),
+                    Arc::new(ConnectionDebugState::new()),
+                    disconnect,
+                    Arc::new(AtomicU64::new(1)),
+                    1,
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(NativeSurfaceControl::new(Default::default())),
+                    Arc::new(SharedInputState::new()),
+                    control_rx,
+                    input_rx,
+                    Repaint::root(egui::Context::default()),
+                    Arc::new(api_client::ApiDiscoveryShared::new(
+                        "http://127.0.0.1:9".into(),
+                        "tok".into(),
+                        "peer".into(),
+                    )),
+                    file_transfer::new_shared_state(),
+                    Arc::new(AtomicBool::new(false)),
+                );
+            }
+        });
+
+        let (mut tcp, _) = listener.accept().unwrap();
+        tcp.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let (mut pending, mut seen) = (Vec::new(), Vec::new());
+        let step = Duration::from_secs(5);
+        assert!(await_control(
+            &mut tcp,
+            &mut pending,
+            &mut seen,
+            step,
+            |m| { matches!(m, ControlMessage::Authenticate(t) if t == "tok") }
+        ));
+        tcp.write_all(&ControlMessage::AuthResult(true).serialize())
+            .unwrap();
+        assert!(await_control(
+            &mut tcp,
+            &mut pending,
+            &mut seen,
+            step,
+            |m| { matches!(m, ControlMessage::ClientDisplayInfo(_)) }
+        ));
+        let info = seen
+            .iter()
+            .find_map(|m| match m {
+                ControlMessage::ClientDisplayInfo(info) => Some(*info),
+                _ => None,
+            })
+            .unwrap();
+        assert!(info.aux);
+        assert_eq!((info.output_id, info.width, info.height), (3, 1920, 1080));
+
+        let config = StreamConfig {
+            video_epoch: 1,
+            codec: VideoCodec::H264,
+            width: 640,
+            height: 360,
+            framerate: 60,
+            audio_sample_rate: 48_000,
+            audio_channels: 2,
+            hdr: false,
+            chroma: VideoChromaSampling::Yuv420,
+            packet_duration_ms: 5,
+            output_id: 3,
+            rotation: 0,
+        };
+        tcp.write_all(&ControlMessage::StreamConfig(config).serialize())
+            .unwrap();
+        assert!(
+            !await_control(
+                &mut tcp,
+                &mut pending,
+                &mut seen,
+                Duration::from_millis(400),
+                |m| matches!(m, ControlMessage::ClientReadyForMedia)
+            ),
+            "not ready for media before the input session is known"
+        );
+
+        tcp.write_all(
+            &ControlMessage::InputSession(st_protocol::InputSession {
+                client_id: 5,
+                credential,
+            })
+            .serialize(),
+        )
+        .unwrap();
+        assert!(await_control(
+            &mut tcp,
+            &mut pending,
+            &mut seen,
+            step,
+            |m| { matches!(m, ControlMessage::ClientReadyForMedia) }
+        ));
+
+        // Both neutral snapshots arrive from one address, signed by the session.
+        udp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (mut mouse, mut keyboard) = (false, false);
+        let mut buf = [0u8; 256];
+        let mut media_addr = None;
+        while !(mouse && keyboard) {
+            let (n, from) = udp.recv_from(&mut buf).expect("bootstrap datagram");
+            assert_eq!(*media_addr.get_or_insert(from), from);
+            let (_, got, packet) = InputPacket::deserialize(&buf[..n]).expect("input packet");
+            assert_eq!(got, credential);
+            match packet {
+                InputPacket::MouseButtons(p) => {
+                    assert_eq!((p.client_id, p.buttons), (5, 0));
+                    mouse = true;
+                }
+                InputPacket::KeyboardState(p) => {
+                    assert_eq!(p.pressed, [0; st_protocol::KEYBOARD_STATE_BYTES]);
+                    keyboard = true;
+                }
+                other => panic!("an aux session sent {other:?}"),
+            }
+        }
+
+        tcp.write_all(&ControlMessage::StreamStarted.serialize())
+            .unwrap();
+        // Let the repair repeats of the first round die down, then expect the
+        // periodic one.
+        udp.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        while udp.recv_from(&mut buf).is_ok() {}
+        udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let (n, from) = udp.recv_from(&mut buf).expect("periodic bootstrap");
+        assert_eq!(Some(from), media_addr);
+        assert!(InputPacket::deserialize(&buf[..n]).is_some());
+
+        assert!(await_control(
+            &mut tcp,
+            &mut pending,
+            &mut seen,
+            step,
+            |m| { matches!(m, ControlMessage::ClockSyncPing(_)) }
+        ));
+        assert!(
+            !seen.iter().any(|m| matches!(
+                m,
+                ControlMessage::SetAudio(_)
+                    | ControlMessage::ClipboardText(_)
+                    | ControlMessage::AcquireControl
+                    | ControlMessage::FileOffer { .. }
+            )),
+            "an aux session carries video only: {seen:?}"
+        );
+
+        disconnect.store(true, Ordering::SeqCst);
+        client.join().unwrap();
     }
 }

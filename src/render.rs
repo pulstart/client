@@ -3,7 +3,7 @@
 //! `VideoFrameBuffer` upload/paint surface of both implementations so
 //! `main.rs` only deals with one type.
 
-use crate::render_gl::NativeVideoTexture;
+use crate::render_gl::{GlowSlotPool, NativeVideoTexture};
 use crate::render_wgpu::WgpuVideoTexture;
 use crate::video_frame::{NativeSurfaceCapabilities, NativeSurfaceControl, VideoFrameBuffer};
 use eframe::egui;
@@ -22,6 +22,47 @@ impl VideoTexture {
             Self::Wgpu(WgpuVideoTexture::new())
         } else {
             Self::Glow(NativeVideoTexture::new(cc.gl.as_ref()))
+        }
+    }
+
+    /// A texture for a secondary window. It only ever shows the output texture
+    /// (no platform presenters, no native surfaces), so it also works from a
+    /// window other than the root.
+    pub fn new_secondary(wgpu: bool, glow_slots: GlowSlotPool) -> Self {
+        if wgpu {
+            Self::Wgpu(WgpuVideoTexture::new_secondary())
+        } else {
+            Self::Glow(NativeVideoTexture::new_secondary(glow_slots))
+        }
+    }
+
+    /// Gives back what a secondary window's texture holds: its egui
+    /// registration (wgpu) or its GL objects and egui slot (glow).
+    pub fn release(&mut self, frame: &eframe::Frame) {
+        match self {
+            Self::Wgpu(t) => t.release(),
+            Self::Glow(t) => {
+                if let Some(gl) = frame.gl() {
+                    t.release(gl);
+                }
+            }
+        }
+    }
+
+    /// Glow uploads need the root window's `eframe::Frame`; wgpu uploads only
+    /// need the render state.
+    pub fn needs_root_frame(&self) -> bool {
+        matches!(self, Self::Glow(_))
+    }
+
+    pub fn upload_with_render_state(
+        &mut self,
+        render_state: &eframe::egui_wgpu::RenderState,
+        video: &VideoFrameBuffer,
+    ) -> Result<(), String> {
+        match self {
+            Self::Wgpu(t) => t.upload_with(render_state, video),
+            Self::Glow(_) => Err("glow uploads need the root frame".to_string()),
         }
     }
 

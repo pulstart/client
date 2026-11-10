@@ -1,9 +1,9 @@
 use crate::debug_state::{mono_micros, ConnectionDebugState};
 use crate::decode::VideoDecoder;
+use crate::repaint::Repaint;
 use crate::transport::{AudioPacket, MediaReceiver, ReceivedData, TransportWindowStats};
 use crate::video_frame::{FrameDebugTiming, NativeSurfaceControl, VideoFrameBuffer};
 use crossbeam_channel::{Receiver, Sender};
-use eframe::egui;
 use st_protocol::{ControlMessage, StreamConfig, TransportFeedback};
 use std::collections::VecDeque;
 use std::sync::{
@@ -39,7 +39,7 @@ impl RepaintPacer {
         }
     }
 
-    fn request_video(&mut self, ctx: &egui::Context, immediate: bool, repaint_pending: bool) {
+    fn request_video(&mut self, ctx: &Repaint, immediate: bool, repaint_pending: bool) {
         if !repaint_pending {
             self.immediate_pending = false;
         } else if !immediate || self.immediate_pending {
@@ -55,7 +55,7 @@ impl RepaintPacer {
         }
     }
 
-    fn request(&mut self, ctx: &egui::Context) {
+    fn request(&mut self, ctx: &Repaint) {
         let Some(min_interval) = self.min_interval else {
             self.last_request = Some(Instant::now());
             ctx.request_repaint();
@@ -714,7 +714,7 @@ fn present_due_video_frames(
     playout: &mut VideoPlayoutBuffer,
     recycled_frames: &mut Vec<VideoFrameBuffer>,
     frame_buf: &Arc<Mutex<VideoFrameBuffer>>,
-    ctx: &egui::Context,
+    ctx: &Repaint,
     repaint_pacer: &mut RepaintPacer,
     // When this present follows a fresh decode this iteration, repaint
     // immediately: the frame is brand-new content and the playout buffer +
@@ -755,7 +755,7 @@ pub fn run_receive_pipeline(
     frame_buf: Arc<Mutex<VideoFrameBuffer>>,
     debug_state: Arc<ConnectionDebugState>,
     debug_enabled: Arc<AtomicBool>,
-    ctx: egui::Context,
+    ctx: Repaint,
     shutdown_rx: Receiver<()>,
     audio_tx: Sender<AudioPacket>,
     audio_drop_rx: Receiver<AudioPacket>,
@@ -1108,6 +1108,9 @@ pub fn run_receive_pipeline(
                 let mut latest_timing = None;
                 let mut produced_frame = false;
                 let mut fatal_decode_error = None;
+                // Decoded surfaces and the frame's stamped rotation come from
+                // the same config, so they cannot disagree.
+                let rotation = profile.config.rotation;
                 for (completed, assembled_micros, assembled_mono) in pending_video {
                     let decode_start_mono = mono_micros();
                     let active_decoder = decoder.as_mut().expect("decoder checked before drain");
@@ -1115,6 +1118,7 @@ pub fn run_receive_pipeline(
                         &completed.data,
                         completed.frame_id,
                         completed.frame_type,
+                        rotation,
                         &mut decoded_frame,
                     ) {
                         Ok(frame) => frame,
@@ -1203,6 +1207,7 @@ pub fn run_receive_pipeline(
                         let _ = decode_started_tx.send(profile.progress());
                     }
                     decoded_frame.debug_timing = latest_timing;
+                    decoded_frame.rotation = rotation;
                     if debug_enabled.load(Ordering::Relaxed) {
                         if let Some(timing) = decoded_frame.debug_timing.as_ref() {
                             debug_state.record_decoded(timing);
@@ -1318,6 +1323,8 @@ mod tests {
             hdr: false,
             chroma: VideoChromaSampling::Yuv420,
             packet_duration_ms: 5,
+            output_id: 0,
+            rotation: 0,
         }
     }
 

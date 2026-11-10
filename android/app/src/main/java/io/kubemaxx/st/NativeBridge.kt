@@ -26,6 +26,10 @@ internal object NativeBridge {
         clientPeerId: String,
         hostPeerId: String,
         requestNonce: Long,
+        outputId: Long,
+        aux: Boolean,
+        displayWidth: Int,
+        displayHeight: Int,
     ): String?
 
     @JvmStatic external fun nativeGetSessionEpoch(handle: Long): Long
@@ -79,6 +83,7 @@ internal object NativeBridge {
     @JvmStatic external fun nativeSendTextInput(handle: Long, epoch: Long, text: String): Boolean
 
     @JvmStatic external fun nativeRequestKeyframe(handle: Long, epoch: Long)
+    @JvmStatic external fun nativeSelectOutput(handle: Long, epoch: Long, outputId: Long): Boolean
     @JvmStatic external fun nativeAcceptStreamGeneration(
         handle: Long,
         epoch: Long,
@@ -111,27 +116,41 @@ internal data class StreamDescription(
     val transportGeneration: Int,
     val generation: Int,
     val videoEpoch: Long,
+    /** Encoded picture size; the decoder is configured with it. */
     val width: Int,
     val height: Int,
+    /** Upright picture size: the space cursor positions live in. */
     val cursorWidth: Int,
     val cursorHeight: Int,
     val framerate: Int,
     val audioSampleRate: Int,
     val audioChannels: Int,
     val packetDurationMs: Int,
+    /** `OutputInfo::id` being streamed, 0 when the server cannot enumerate outputs. */
+    val outputId: Long = OUTPUT_DEFAULT,
+    /** Clockwise quarter turns that make the decoded picture upright. */
+    val rotation: Int = 0,
+    val directTransport: Boolean = true,
 ) {
+    val uprightWidth: Int get() = uprightSize(width, height, rotation).first
+    val uprightHeight: Int get() = uprightSize(width, height, rotation).second
+
     fun decoderCompatibleWith(other: StreamDescription): Boolean =
-        width == other.width && height == other.height
+        width == other.width && height == other.height && rotation == other.rotation
 
     fun audioCompatibleWith(other: StreamDescription): Boolean =
         audioSampleRate == other.audioSampleRate &&
             audioChannels == other.audioChannels &&
             packetDurationMs == other.packetDurationMs
 
-        companion object {
-            fun from(values: IntArray): StreamDescription? {
-            if (values.size != 12 || values[0] <= 0 || values[1] <= 0 ||
-                values[4] <= 0 || values[5] <= 0 || values[6] <= 0 || values[7] <= 0
+    companion object {
+        const val FIELD_COUNT = 15
+        private const val TRANSPORT_DIRECT = 1
+
+        fun from(values: IntArray): StreamDescription? {
+            if (values.size != FIELD_COUNT || values[0] <= 0 || values[1] <= 0 ||
+                values[4] <= 0 || values[5] <= 0 || values[6] <= 0 || values[7] <= 0 ||
+                values[13] !in 0..3
             ) {
                 return null
             }
@@ -150,6 +169,9 @@ internal data class StreamDescription(
                 audioSampleRate = values[9],
                 audioChannels = values[10],
                 packetDurationMs = values[11],
+                outputId = values[12].toLong() and 0xffffffffL,
+                rotation = values[13],
+                directTransport = values[14] == TRANSPORT_DIRECT,
             )
         }
     }
@@ -218,10 +240,11 @@ internal data class CursorSnapshotUpdate(
     val controllerState: RevisedValue<ControllerOwnership>?,
     val shape: RevisedValue<CursorShapeData>?,
     val state: RevisedValue<CursorStateData>?,
+    val outputs: RevisedValue<ServerOutputs>? = null,
 ) {
     companion object {
         /*
-         * JNI snapshot v2, all integers little-endian:
+         * JNI snapshot v3, all integers little-endian:
          * [version:u8][present:u8][transport_generation:u32], followed in flag-bit order by
          * bit 0 capabilities: [revision:u64][flags:u8], where flag bit 6 is
          *                     reliable committed Unicode text input
@@ -229,8 +252,11 @@ internal data class CursorSnapshotUpdate(
          * bit 2 shape:        [revision:u64][serial:u64][width:u16][height:u16]
          *                     [hotspot_x:u16][hotspot_y:u16][rgba_len:u32][RGBA8...]
          * bit 3 state:        [revision:u64][serial:u64][x:i32][y:i32][flags:u8]
-         * State flag bit 0 is visible and bit 1 is app_grab. RGBA8 is already
-         * premultiplied by the producer.
+         * bit 4 outputs:     [revision:u64][virtual_supported:u8][count:u16], then per output
+         *                     [id:u32][width:u32][height:u32][x:i32][y:i32][refresh_millihz:u32]
+         *                     [rotation:u8][flags:u8][name_len:u16][name utf-8]
+         * State flag bit 0 is visible and bit 1 is app_grab. Output flag bit 0 is
+         * primary and bit 1 is virtual. RGBA8 is already premultiplied by the producer.
          */
         fun from(bytes: ByteArray): CursorSnapshotUpdate? = runCatching {
             val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
@@ -309,20 +335,59 @@ internal data class CursorSnapshotUpdate(
             } else {
                 null
             }
+            val outputs = if (present and OUTPUTS_PRESENT != 0) {
+                buffer.requireRemaining(11)
+                val revision = buffer.long
+                val virtualSupported = buffer.get().toInt() and 0xff != 0
+                val count = buffer.short.toInt() and 0xffff
+                val list = List(count) { readOutput(buffer) }
+                RevisedValue(revision, ServerOutputs(list, virtualSupported))
+            } else {
+                null
+            }
             require(!buffer.hasRemaining())
-            CursorSnapshotUpdate(transportGeneration, capabilities, controller, shape, state)
+            CursorSnapshotUpdate(transportGeneration, capabilities, controller, shape, state, outputs)
         }.getOrNull()
+
+        private fun readOutput(buffer: ByteBuffer): ServerOutput {
+            buffer.requireRemaining(OUTPUT_FIXED_BYTES)
+            val id = buffer.int.toLong() and 0xffffffffL
+            val width = buffer.int
+            val height = buffer.int
+            val x = buffer.int
+            val y = buffer.int
+            val refreshMilliHz = buffer.int
+            val rotation = buffer.get().toInt() and 3
+            val flags = buffer.get().toInt() and 0xff
+            val nameLength = buffer.short.toInt() and 0xffff
+            buffer.requireRemaining(nameLength)
+            val name = ByteArray(nameLength).also(buffer::get).toString(Charsets.UTF_8)
+            return ServerOutput(
+                id = id,
+                name = name,
+                width = width,
+                height = height,
+                x = x,
+                y = y,
+                refreshMilliHz = refreshMilliHz,
+                rotation = rotation,
+                primary = flags and (1 shl 0) != 0,
+                virtual = flags and (1 shl 1) != 0,
+            )
+        }
 
         private fun ByteBuffer.requireRemaining(count: Int) {
             require(count >= 0 && remaining() >= count)
         }
 
-        private const val SNAPSHOT_VERSION = 2
+        private const val SNAPSHOT_VERSION = 3
         private const val CAPABILITIES_PRESENT = 1 shl 0
         private const val CONTROLLER_PRESENT = 1 shl 1
         private const val SHAPE_PRESENT = 1 shl 2
         private const val STATE_PRESENT = 1 shl 3
+        private const val OUTPUTS_PRESENT = 1 shl 4
+        private const val OUTPUT_FIXED_BYTES = 4 * 6 + 1 + 1 + 2
         private const val KNOWN_PRESENT_FLAGS = CAPABILITIES_PRESENT or CONTROLLER_PRESENT or
-            SHAPE_PRESENT or STATE_PRESENT
+            SHAPE_PRESENT or STATE_PRESENT or OUTPUTS_PRESENT
     }
 }

@@ -23,6 +23,9 @@ pub struct NativeSurfaceCapabilities {
     pub linux_dmabuf: bool,
     pub macos_videotoolbox: bool,
     pub windows_d3d11: bool,
+    /// The renderer rotates DMA-BUF frames itself (wgpu); Glow's direct
+    /// presenters do not.
+    pub linux_dmabuf_rotates: bool,
 }
 
 pub struct NativeSurfaceControl {
@@ -33,6 +36,7 @@ impl NativeSurfaceControl {
     const LINUX_DMABUF_BIT: u8 = 1 << 0;
     const MACOS_VIDEOTOOLBOX_BIT: u8 = 1 << 1;
     const WINDOWS_D3D11_BIT: u8 = 1 << 2;
+    const LINUX_DMABUF_ROTATES_BIT: u8 = 1 << 3;
 
     pub fn new(caps: NativeSurfaceCapabilities) -> Self {
         Self {
@@ -47,6 +51,20 @@ impl NativeSurfaceControl {
 
     pub fn snapshot(&self) -> NativeSurfaceCapabilities {
         Self::caps_from_mask(self.mask.load(Ordering::Relaxed))
+    }
+
+    /// What may be decoded into native surfaces for frames shown at
+    /// `rotation`: presenters that cannot rotate take CPU planes instead. The
+    /// decoder asks with the rotation of the config it is decoding, so a
+    /// frame's surfaces and its own `rotation` always agree.
+    pub fn snapshot_for(&self, rotation: u8) -> NativeSurfaceCapabilities {
+        let mut caps = self.snapshot();
+        if rotation & 3 != 0 {
+            caps.linux_dmabuf &= caps.linux_dmabuf_rotates;
+            caps.macos_videotoolbox = false;
+            caps.windows_d3d11 = false;
+        }
+        caps
     }
 
     #[cfg(target_os = "linux")]
@@ -80,6 +98,9 @@ impl NativeSurfaceControl {
         if caps.windows_d3d11 {
             mask |= Self::WINDOWS_D3D11_BIT;
         }
+        if caps.linux_dmabuf_rotates {
+            mask |= Self::LINUX_DMABUF_ROTATES_BIT;
+        }
         mask
     }
 
@@ -88,6 +109,7 @@ impl NativeSurfaceControl {
             linux_dmabuf: mask & Self::LINUX_DMABUF_BIT != 0,
             macos_videotoolbox: mask & Self::MACOS_VIDEOTOOLBOX_BIT != 0,
             windows_d3d11: mask & Self::WINDOWS_D3D11_BIT != 0,
+            linux_dmabuf_rotates: mask & Self::LINUX_DMABUF_ROTATES_BIT != 0,
         }
     }
 }
@@ -369,6 +391,8 @@ pub struct VideoFrameBuffer {
     pub d3d11: Option<WindowsD3d11Frame>,
     pub decoder_frame_ref: Option<FfmpegVideoFrameHold>,
     pub debug_timing: Option<FrameDebugTiming>,
+    /// Clockwise quarter turns that show the picture upright.
+    pub rotation: u8,
     pub dirty: bool,
 }
 
@@ -389,12 +413,39 @@ impl Default for VideoFrameBuffer {
             d3d11: None,
             decoder_frame_ref: None,
             debug_timing: None,
+            rotation: 0,
             dirty: false,
         }
     }
 }
 
+/// Source texture coordinates `(u_s, v_s)` for output coordinates `(u, v)` when
+/// the picture is shown rotated `rotation` clockwise quarter turns, as
+/// `[a, b, c, d, e, f]` with `u_s = a*u + b*v + c`, `v_s = d*u + e*v + f`.
+pub fn uv_rotation(rotation: u8) -> [f32; 6] {
+    match rotation & 3 {
+        0 => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        1 => [0.0, 1.0, 0.0, -1.0, 0.0, 1.0],
+        2 => [-1.0, 0.0, 1.0, 0.0, -1.0, 1.0],
+        _ => [0.0, -1.0, 1.0, 1.0, 0.0, 0.0],
+    }
+}
+
+/// Size of a `width`×`height` picture after `rotation` quarter turns.
+pub fn rotated_size(rotation: u8, width: u32, height: u32) -> (u32, u32) {
+    if rotation & 1 == 1 {
+        (height, width)
+    } else {
+        (width, height)
+    }
+}
+
 impl VideoFrameBuffer {
+    /// Picture size as shown, after `rotation`.
+    pub fn display_size(&self) -> (u32, u32) {
+        rotated_size(self.rotation, self.width, self.height)
+    }
+
     pub fn clear(&mut self) {
         self.width = 0;
         self.height = 0;
@@ -497,5 +548,89 @@ unsafe fn com_release(ptr: *mut c_void) {
     if !ptr.is_null() {
         let object = ptr as *mut ComObject;
         ((*(*object).vtable).release)(ptr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Source pixel shown at display pixel `(xd, yd)` for a `w`×`h` source
+    /// turned `rotation` clockwise quarter turns, from the geometry alone.
+    fn geometric_source(rotation: u8, w: u32, h: u32, xd: u32, yd: u32) -> (u32, u32) {
+        match rotation {
+            0 => (xd, yd),
+            1 => (yd, h - 1 - xd),
+            2 => (w - 1 - xd, h - 1 - yd),
+            _ => (w - 1 - yd, xd),
+        }
+    }
+
+    #[test]
+    fn uv_rotation_samples_the_pixel_a_clockwise_turn_puts_there() {
+        let (w, h) = (4u32, 2u32);
+        for rotation in 0..4u8 {
+            let [a, b, c, d, e, f] = uv_rotation(rotation);
+            let (dw, dh) = rotated_size(rotation, w, h);
+            for yd in 0..dh {
+                for xd in 0..dw {
+                    let u = (xd as f32 + 0.5) / dw as f32;
+                    let v = (yd as f32 + 0.5) / dh as f32;
+                    let (us, vs) = (a * u + b * v + c, d * u + e * v + f);
+                    let sampled = (
+                        (us * w as f32).floor() as u32,
+                        (vs * h as f32).floor() as u32,
+                    );
+                    assert_eq!(
+                        sampled,
+                        geometric_source(rotation, w, h, xd, yd),
+                        "rotation {rotation} at ({xd},{yd})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rotation_swaps_the_size_only_for_odd_quarter_turns() {
+        assert_eq!(rotated_size(0, 1920, 1080), (1920, 1080));
+        assert_eq!(rotated_size(1, 1920, 1080), (1080, 1920));
+        assert_eq!(rotated_size(2, 1920, 1080), (1920, 1080));
+        assert_eq!(rotated_size(3, 1920, 1080), (1080, 1920));
+        let frame = VideoFrameBuffer {
+            width: 2560,
+            height: 1440,
+            rotation: 1,
+            ..Default::default()
+        };
+        assert_eq!(frame.display_size(), (1440, 2560));
+    }
+
+    #[test]
+    fn rotation_hands_unrotatable_native_surfaces_to_cpu_planes() {
+        let control = NativeSurfaceControl::new(NativeSurfaceCapabilities {
+            linux_dmabuf: true,
+            macos_videotoolbox: true,
+            windows_d3d11: true,
+            linux_dmabuf_rotates: false,
+        });
+        assert!(control.snapshot_for(0).macos_videotoolbox);
+        let caps = control.snapshot_for(1);
+        assert!(!caps.linux_dmabuf && !caps.macos_videotoolbox && !caps.windows_d3d11);
+        assert!(!control.snapshot_for(2).linux_dmabuf);
+        assert!(
+            control.snapshot_for(0).linux_dmabuf,
+            "upright takes natives again"
+        );
+
+        let wgpu_like = NativeSurfaceControl::new(NativeSurfaceCapabilities {
+            linux_dmabuf: true,
+            linux_dmabuf_rotates: true,
+            ..Default::default()
+        });
+        assert!(
+            wgpu_like.snapshot_for(1).linux_dmabuf,
+            "wgpu rotates DMA-BUFs itself"
+        );
     }
 }

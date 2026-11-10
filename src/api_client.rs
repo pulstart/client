@@ -554,8 +554,21 @@ fn validate_partner_response(
     Ok(())
 }
 
+/// The secret this attempt derived from the host key it was just handed. The
+/// discovery thread clears the shared slot on any failed poll, so it must not
+/// be read again after the next signaling round trip.
+fn attempt_secret(shared: &ApiDiscoveryShared) -> Result<[u8; 32], String> {
+    shared
+        .shared_key
+        .lock()
+        .unwrap()
+        .ok_or_else(|| "API host tunnel key is not ready".to_string())
+}
+
+#[allow(clippy::too_many_arguments)] // one signed signaling response, field by field
 fn crypto_from_signal_response(
     shared: &ApiDiscoveryShared,
+    shared_secret: [u8; 32],
     response: &serde_json::Value,
     mode: TunnelMode,
     mode_label: &str,
@@ -579,11 +592,6 @@ fn crypto_from_signal_response(
     let request_context = response["context"]
         .as_str()
         .ok_or_else(|| "API returned no tunnel request context".to_string())?;
-    let shared_secret = shared
-        .shared_key
-        .lock()
-        .unwrap()
-        .ok_or_else(|| "shared tunnel secret not ready".to_string())?;
     let session_key = derive_session_key(
         &shared_secret,
         &SessionKeyContext {
@@ -658,6 +666,7 @@ pub fn prepare_punch_attempt(
         return Err("API host lease changed during signaling".into());
     }
     shared.update_shared_key_from_partner_b64(host["public_key"].as_str());
+    let shared_secret = attempt_secret(shared)?;
     let partner_candidates: Vec<SocketAddr> = host["candidates"]
         .as_array()
         .into_iter()
@@ -695,6 +704,7 @@ pub fn prepare_punch_attempt(
         serde_json::from_str(&punch_text).map_err(|e| format!("parse punch response: {e}"))?;
     let crypto = crypto_from_signal_response(
         shared,
+        shared_secret,
         &punch_json,
         TunnelMode::Punch,
         "punch",
@@ -766,6 +776,7 @@ pub fn prepare_relay_attempt(
         serde_json::from_str(&key_text).map_err(|e| format!("parse key response: {e}"))?;
     validate_partner_response(&key_json, &expected_host_peer_id, &expected_host_lease_id)?;
     shared.update_shared_key_from_partner_b64(key_json["partner_key"].as_str());
+    let shared_secret = attempt_secret(shared)?;
     if should_cancel() {
         return Err(CANCELLED.into());
     }
@@ -795,6 +806,7 @@ pub fn prepare_relay_attempt(
         serde_json::from_str(&relay_text).map_err(|e| format!("parse relay response: {e}"))?;
     let crypto = crypto_from_signal_response(
         shared,
+        shared_secret,
         &relay_json,
         TunnelMode::Relay,
         "relay",

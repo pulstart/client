@@ -205,6 +205,9 @@ pub struct VideoDecoder {
     hw: Option<Box<HwAccel>>,
     hw_frame_access: Option<HwFrameAccess>,
     native_surface_control: Option<Arc<NativeSurfaceControl>>,
+    /// Rotation of the stream config being decoded; native surfaces are only
+    /// produced where the presenter can rotate by it.
+    rotation: u8,
     #[cfg(target_os = "linux")]
     linux_dmabuf_enabled: bool,
     #[cfg(target_os = "macos")]
@@ -650,6 +653,7 @@ impl VideoDecoder {
             hw: Some(hw),
             hw_frame_access: None,
             native_surface_control: None,
+            rotation: 0,
             #[cfg(target_os = "linux")]
             linux_dmabuf_enabled: false,
             #[cfg(target_os = "macos")]
@@ -684,6 +688,7 @@ impl VideoDecoder {
             hw: None,
             hw_frame_access: None,
             native_surface_control: None,
+            rotation: 0,
             #[cfg(target_os = "linux")]
             linux_dmabuf_enabled: false,
             #[cfg(target_os = "macos")]
@@ -707,8 +712,10 @@ impl VideoDecoder {
         nal_data: &[u8],
         packet_frame_id: u32,
         wire_frame_type: u8,
+        rotation: u8,
         frame_out: &mut VideoFrameBuffer,
     ) -> Result<DecodeOutput, String> {
+        self.rotation = rotation;
         self.refresh_native_surface_capabilities();
         // A4: the server's explicit frame-type marker is authoritative for "this
         // unit resets the reference chain" — an IDR, or an intra-refresh recovery
@@ -930,7 +937,7 @@ impl VideoDecoder {
         let Some(control) = self.native_surface_control.as_ref() else {
             return;
         };
-        self.set_native_surface_capabilities(control.snapshot());
+        self.set_native_surface_capabilities(control.snapshot_for(self.rotation));
     }
 
     fn set_native_surface_capabilities(&mut self, caps: NativeSurfaceCapabilities) {

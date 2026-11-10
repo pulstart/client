@@ -157,6 +157,9 @@ internal class AvcSurfaceDecoder(
             MediaFormat.KEY_MAX_INPUT_SIZE,
             max(512 * 1024, max(firstUnitSize * 2, stream.width * stream.height / 2)),
         )
+        if (stream.rotation != 0) {
+            format.setInteger(MediaFormat.KEY_ROTATION, rotationDegrees(stream.rotation))
+        }
         format.setByteBuffer("csd-0", ByteBuffer.wrap(sps))
         format.setByteBuffer("csd-1", ByteBuffer.wrap(pps))
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {

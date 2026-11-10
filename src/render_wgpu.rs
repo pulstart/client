@@ -12,7 +12,7 @@
 #[cfg(target_os = "linux")]
 use crate::video_frame::LinuxDmaBufFormat;
 use crate::video_frame::{
-    NativeSurfaceCapabilities, NativeSurfaceControl, VideoFormat, VideoFrameBuffer,
+    uv_rotation, NativeSurfaceCapabilities, NativeSurfaceControl, VideoFormat, VideoFrameBuffer,
 };
 use eframe::egui;
 use eframe::wgpu;
@@ -21,6 +21,10 @@ use std::num::NonZeroU64;
 pub struct WgpuVideoTexture {
     state: Option<PipelineState>,
     texture_id: Option<egui::TextureId>,
+    /// Set for secondary windows: the registration is freed with the texture.
+    /// The main window's lives as long as the app.
+    renderer: Option<std::sync::Arc<egui::mutex::RwLock<eframe::egui_wgpu::Renderer>>>,
+    free_on_drop: bool,
     width: u32,
     height: u32,
     #[cfg(target_os = "linux")]
@@ -49,7 +53,8 @@ struct PipelineState {
     output: Option<OutputSurface>,
     planes: Option<Planes>,
     bind_group: Option<wgpu::BindGroup>,
-    last_mode: u32,
+    /// Last `(mode, rotation)` written to the uniform buffer.
+    last_params: (u32, u8),
 }
 
 struct OutputSurface {
@@ -83,11 +88,28 @@ impl WgpuVideoTexture {
         Self {
             state: None,
             texture_id: None,
+            renderer: None,
+            free_on_drop: false,
             width: 0,
             height: 0,
             #[cfg(target_os = "linux")]
             dmabuf_support: DmaBufSupportState::Unprobed,
         }
+    }
+
+    pub fn new_secondary() -> Self {
+        let mut texture = Self::new();
+        texture.free_on_drop = true;
+        texture
+    }
+
+    /// Unregisters the output texture from egui (idempotent).
+    pub fn release(&mut self) {
+        if let (Some(id), Some(renderer)) = (self.texture_id.take(), self.renderer.take()) {
+            renderer.write().free_texture(&id);
+        }
+        self.width = 0;
+        self.height = 0;
     }
 
     pub fn has_frame(&self) -> bool {
@@ -136,6 +158,7 @@ impl WgpuVideoTexture {
         #[cfg(target_os = "linux")]
         {
             caps.linux_dmabuf = matches!(self.dmabuf_support, DmaBufSupportState::Enabled);
+            caps.linux_dmabuf_rotates = true;
         }
         caps
     }
@@ -178,7 +201,16 @@ impl WgpuVideoTexture {
         let render_state = frame
             .wgpu_render_state()
             .ok_or_else(|| "wgpu renderer unavailable".to_string())?;
+        self.upload_with(render_state, video)
+    }
 
+    /// Upload without an `eframe::Frame`, so a secondary window can present on
+    /// its own schedule.
+    pub fn upload_with(
+        &mut self,
+        render_state: &eframe::egui_wgpu::RenderState,
+        video: &VideoFrameBuffer,
+    ) -> Result<(), String> {
         #[cfg(target_os = "linux")]
         self.maybe_probe_dmabuf(&render_state.device);
 
@@ -195,13 +227,19 @@ impl WgpuVideoTexture {
         let mut dmabuf_failed = false;
         let new_id = {
             let state = self.ensure_state(&render_state.device, &render_state.queue)?;
-            state.ensure_output(&render_state.device, video.width, video.height);
+            let (display_width, display_height) = video.display_size();
+            state.ensure_output(&render_state.device, display_width, display_height);
 
             let mut used_dmabuf = false;
             #[cfg(target_os = "linux")]
             if try_dmabuf {
                 let dmabuf = video.dmabuf.as_ref().expect("checked above");
-                match state.render_from_dmabuf(&render_state.device, &render_state.queue, dmabuf) {
+                match state.render_from_dmabuf(
+                    &render_state.device,
+                    &render_state.queue,
+                    dmabuf,
+                    video.rotation,
+                ) {
                     Ok(()) => used_dmabuf = true,
                     Err(err) => {
                         eprintln!(
@@ -247,8 +285,10 @@ impl WgpuVideoTexture {
         };
 
         self.texture_id = Some(new_id);
-        self.width = video.width;
-        self.height = video.height;
+        if self.free_on_drop && self.renderer.is_none() {
+            self.renderer = Some(std::sync::Arc::clone(&render_state.renderer));
+        }
+        (self.width, self.height) = video.display_size();
         #[cfg(target_os = "linux")]
         if dmabuf_failed {
             self.dmabuf_support = DmaBufSupportState::Disabled;
@@ -266,6 +306,14 @@ impl WgpuVideoTexture {
             self.state = Some(PipelineState::new(device, queue)?);
         }
         Ok(self.state.as_mut().expect("state initialized"))
+    }
+}
+
+impl Drop for WgpuVideoTexture {
+    fn drop(&mut self) {
+        if self.free_on_drop {
+            self.release();
+        }
     }
 }
 
@@ -318,7 +366,7 @@ impl PipelineState {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: NonZeroU64::new(16),
+                        min_binding_size: NonZeroU64::new(PARAMS_SIZE),
                     },
                     count: None,
                 },
@@ -377,12 +425,11 @@ impl PipelineState {
 
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("st-wgpu-video.uniform"),
-            size: 16,
+            size: PARAMS_SIZE,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // Initialize as planar (mode=0).
-        queue.write_buffer(&uniform_buf, 0, &[0u8; 16]);
+        queue.write_buffer(&uniform_buf, 0, &params_bytes(0, 0));
 
         Ok(Self {
             pipeline,
@@ -392,8 +439,15 @@ impl PipelineState {
             output: None,
             planes: None,
             bind_group: None,
-            last_mode: 0,
+            last_params: (0, 0),
         })
+    }
+
+    fn write_params(&mut self, queue: &wgpu::Queue, mode: u32, rotation: u8) {
+        if self.last_params != (mode, rotation) {
+            queue.write_buffer(&self.uniform_buf, 0, &params_bytes(mode, rotation));
+            self.last_params = (mode, rotation);
+        }
     }
 
     fn ensure_output(&mut self, device: &wgpu::Device, width: u32, height: u32) {
@@ -472,6 +526,7 @@ impl PipelineState {
             self.bind_group = None;
         }
 
+        self.write_params(queue, mode, video.rotation);
         let planes = self.planes.as_ref().expect("planes initialized");
 
         match video.format {
@@ -506,29 +561,6 @@ impl PipelineState {
         }
 
         let _ = (plane1_bpp, plane2_bpp);
-
-        if mode != self.last_mode {
-            let bytes = [
-                mode.to_le_bytes()[0],
-                mode.to_le_bytes()[1],
-                mode.to_le_bytes()[2],
-                mode.to_le_bytes()[3],
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-            ];
-            queue.write_buffer(&self.uniform_buf, 0, &bytes);
-            self.last_mode = mode;
-        }
 
         if self.bind_group.is_none() {
             self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -605,6 +637,7 @@ impl PipelineState {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         frame: &crate::video_frame::LinuxDmaBufFrame,
+        rotation: u8,
     ) -> Result<(), String> {
         let mode: u32 = match frame.format {
             LinuxDmaBufFormat::Yuv420p8 | LinuxDmaBufFormat::Yuv444p8 => 0,
@@ -620,12 +653,7 @@ impl PipelineState {
             _ => (&imported[0].view, &imported[1].view, &imported[2].view),
         };
 
-        if mode != self.last_mode {
-            let mut bytes = [0u8; 16];
-            bytes[..4].copy_from_slice(&mode.to_le_bytes());
-            queue.write_buffer(&self.uniform_buf, 0, &bytes);
-            self.last_mode = mode;
-        }
+        self.write_params(queue, mode, rotation);
 
         // Imported textures are per-frame; a fresh bind group each time is
         // cheap (just references into existing views + sampler + uniform).
@@ -815,6 +843,19 @@ fn plane_layout(
 
 const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
+/// `mode: u32` + 12 bytes padding + two `vec4<f32>` rows of the UV rotation.
+const PARAMS_SIZE: u64 = 48;
+
+fn params_bytes(mode: u32, rotation: u8) -> [u8; PARAMS_SIZE as usize] {
+    let [a, b, c, d, e, f] = uv_rotation(rotation);
+    let mut bytes = [0u8; PARAMS_SIZE as usize];
+    bytes[..4].copy_from_slice(&mode.to_le_bytes());
+    for (i, value) in [a, b, c, 0.0, d, e, f, 0.0].into_iter().enumerate() {
+        bytes[16 + i * 4..20 + i * 4].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
 const VIDEO_WGSL: &str = r#"
 @group(0) @binding(0) var t_luma: texture_2d<f32>;
 @group(0) @binding(1) var t_chroma: texture_2d<f32>;
@@ -825,6 +866,8 @@ struct Params {
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+    uv_x: vec4<f32>,
+    uv_y: vec4<f32>,
 };
 @group(0) @binding(4) var<uniform> params: Params;
 
@@ -861,17 +904,21 @@ fn bt709_limited_to_rgb(y: f32, u: f32, v: f32) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let src = vec2<f32>(
+        dot(params.uv_x.xy, in.uv) + params.uv_x.z,
+        dot(params.uv_y.xy, in.uv) + params.uv_y.z
+    );
     if (params.mode == 2u) {
-        return textureSample(t_luma, s, in.uv);
+        return textureSample(t_luma, s, src);
     }
-    let y = textureSample(t_luma, s, in.uv).r;
+    let y = textureSample(t_luma, s, src).r;
     var u: f32;
     var v: f32;
     if (params.mode == 0u) {
-        u = textureSample(t_chroma, s, in.uv).r - 0.5;
-        v = textureSample(t_chroma_v, s, in.uv).r - 0.5;
+        u = textureSample(t_chroma, s, src).r - 0.5;
+        v = textureSample(t_chroma_v, s, src).r - 0.5;
     } else {
-        let uv = textureSample(t_chroma, s, in.uv).rg - vec2<f32>(0.5, 0.5);
+        let uv = textureSample(t_chroma, s, src).rg - vec2<f32>(0.5, 0.5);
         u = uv.x;
         v = uv.y;
     }
@@ -1224,5 +1271,56 @@ mod tests {
             r > 200 && g < 20 && b < 20,
             "expected dominant red, got ({r},{g},{b})"
         );
+    }
+
+    /// Every rotation turns the picture clockwise and swaps the output size
+    /// for odd quarter turns: a 4x2 image with a distinct colour per pixel must
+    /// land where the geometry says.
+    #[test]
+    fn wgpu_rotation_turns_the_picture_clockwise() {
+        let Some((device, queue)) = try_device() else {
+            return;
+        };
+        let (w, h) = (4u32, 2u32);
+        let pixel = |x: u32, y: u32| [(x * 60 + 10) as u8, (y * 100 + 20) as u8, 7, 255];
+        let mut rgba = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                rgba.extend_from_slice(&pixel(x, y));
+            }
+        }
+        let mut pipeline = PipelineState::new(&device, &queue).expect("pipeline");
+        for rotation in 0..4u8 {
+            let video = VideoFrameBuffer {
+                width: w,
+                height: h,
+                format: VideoFormat::Rgba8,
+                plane0: rgba.clone(),
+                rotation,
+                ..Default::default()
+            };
+            let (dw, dh) = video.display_size();
+            pipeline.ensure_output(&device, dw, dh);
+            pipeline
+                .upload_and_render(&device, &queue, &video)
+                .expect("render rotated");
+            let pixels = readback_output(&device, &queue, &pipeline);
+            for yd in 0..dh {
+                for xd in 0..dw {
+                    let (xs, ys) = match rotation {
+                        0 => (xd, yd),
+                        1 => (yd, h - 1 - xd),
+                        2 => (w - 1 - xd, h - 1 - yd),
+                        _ => (w - 1 - yd, xd),
+                    };
+                    let i = ((yd * dw + xd) * 4) as usize;
+                    assert_eq!(
+                        pixels[i..i + 4],
+                        pixel(xs, ys),
+                        "rotation {rotation} at ({xd},{yd})"
+                    );
+                }
+            }
+        }
     }
 }

@@ -305,7 +305,7 @@ class RemoteKeyboardTest {
     @Test
     fun cursorSnapshotExposesTextInputCapabilityBit() {
         val bytes = ByteBuffer.allocate(15).order(ByteOrder.LITTLE_ENDIAN)
-            .put(2.toByte())
+            .put(3.toByte())
             .put(1.toByte())
             .putInt(3)
             .putLong(7)

@@ -1,7 +1,6 @@
 package io.kubemaxx.st
 
 import android.content.ActivityNotFoundException
-import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Rect
@@ -19,8 +18,6 @@ import android.text.TextWatcher
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
-import android.view.SurfaceHolder
-import android.view.SurfaceView
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
@@ -52,14 +49,7 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import kotlin.math.hypot
 import kotlin.math.max
-import kotlin.math.min
 import kotlin.math.roundToInt
-
-private enum class VideoScaleMode(val label: String) {
-    FIT("Fit"),
-    COVER("Fill / Cover"),
-    STRETCH("Stretch"),
-}
 
 internal fun isConnectionPending(status: String): Boolean = status.startsWith("connecting")
 
@@ -91,28 +81,19 @@ internal fun shouldReseedPredictionForOwnership(
 ): Boolean = previous != ControllerOwnership.OWNED_BY_OTHER &&
     next == ControllerOwnership.OWNED_BY_OTHER && cursorPositionReliable
 
-class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
+class MainActivity : ComponentActivity() {
     private enum class HomePage { SERVERS, SETTINGS, UPDATE, ABOUT }
 
-    private data class StreamTransitionRequest(
-        val sessionEpoch: Long,
-        val stream: StreamDescription,
-        val restartDecoder: Boolean,
-        val previousDecoder: AvcSurfaceDecoder?,
-    )
-
-    private enum class StreamTransitionResult { ACCEPTED, RETRY, SUPERSEDED }
-
-    private val nativeHandle = NativeBridge.nativeCreate()
+    private val main: StreamPresenter by lazy {
+        StreamPresenter(this, handler, mainListener, videoScaleMode, "main")
+    }
+    private val aux: AuxDisplayController by lazy { AuxDisplayController(this, handler, auxHost) }
     private val tokenStore by lazy {
         TokenStore(getSharedPreferences(PREFERENCES, MODE_PRIVATE))
     }
     private val handler = Handler(Looper.getMainLooper())
     private val apiDiscoveryExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "st-api-discovery")
-    }
-    private val streamTransitionExecutor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "st-stream-transition")
     }
     private lateinit var homeContainer: LinearLayout
     private lateinit var rootContainer: FrameLayout
@@ -162,14 +143,13 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private lateinit var settingsScaleSpinner: Spinner
     private lateinit var menuScaleSpinner: Spinner
     private lateinit var streamArea: FrameLayout
-    private lateinit var videoView: AspectSurfaceView
-    private lateinit var cursorOverlay: CursorOverlayView
+    private lateinit var outputSection: LinearLayout
+    private lateinit var outputPicker: OutputPickerView
+    private lateinit var auxSection: LinearLayout
+    private lateinit var auxPicker: OutputPickerView
+    private lateinit var auxStatusText: TextView
     private var currentPage = HomePage.SERVERS
-    private var sessionStarted = false
-    private var currentSessionEpoch = 0L
     private var pendingConnect = false
-    private var surfaceReady = false
-    private var connected = false
     private var touchEnabled = true
     private var touchSensitivity = 1.5f
     private var refreshRateHz = 60
@@ -194,20 +174,9 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private var launcherDownRawY = 0f
     private var launcherStartX = 0f
     private var launcherStartY = 0f
-    private var decoder: AvcSurfaceDecoder? = null
-    private val retiredDecoders = mutableListOf<AvcSurfaceDecoder>()
-    private var pendingDecoderStream: StreamDescription? = null
-    private var pendingStreamAcceptance: StreamDescription? = null
-    private var decoderTransitionStartedAt = 0L
     private val audioPlayers = AudioPlayerSlot<AndroidAudioPlayer>()
-    private var decoderStatus = ""
-    private var hasRenderedVideo = false
     private var audioStatus = ""
-    private var connectionStatus = "disconnected"
     private var controlTransportGeneration = 0
-    private var streamGeneration = 0
-    private var acceptedVideoEpoch = 0L
-    private var activeStream: StreamDescription? = null
     private var savedServers = mutableListOf<SavedServer>()
     private var lanDiscoveredServers = emptyList<LanDiscoveredServer>()
     private var apiHostPresence: ApiHostPresence? = null
@@ -227,6 +196,10 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private var connectionTargetLabel = ""
     private var connectionApiPeerId: String? = null
     private var connectionSavedAddress: String? = null
+    private var connectionServerKey = ""
+    private var connectionOutputId = OUTPUT_DEFAULT
+    private var pendingOutputPick: Long? = null
+    private var outputChoices = emptyMap<String, RememberedOutput>()
     private val navigationButtons = mutableMapOf<HomePage, TextView>()
     private var lastTouchX = 0f
     private var lastTouchY = 0f
@@ -242,50 +215,76 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private val wheelAccumulator = WheelAccumulator()
     private val pointerTravelTracker = PointerTravelTracker()
     private val dragGesture = TrackpadDragGesture(ViewConfiguration.getDoubleTapTimeout().toLong())
-    private val streamTransitions by lazy {
-        LatestAsyncTask(
-            executor = streamTransitionExecutor,
-            deliver = { action -> handler.post { action() } },
-            work = ::performStreamTransition,
-            complete = ::completeStreamTransition,
-        )
+
+    private val mainListener: StreamPresenterListener = object : StreamPresenterListener {
+        override fun onStateChanged(presenter: StreamPresenter) = updateStatusText()
+
+        override fun onConnectionPolled(presenter: StreamPresenter, wasConnected: Boolean, pending: Boolean) {
+            if (presenter.connected && !wasConnected) {
+                markServerConnected()
+            }
+            if (!presenter.connected && audioPlayers.active != null) {
+                stopAudio()
+            }
+            if (!presenter.connected && wasConnected) {
+                cancelTouchInput()
+            }
+            if (!presenter.connected && !pending && keyboardOpen) {
+                closeRemoteKeyboard()
+            }
+        }
+
+        override fun onStreamPlanned(presenter: StreamPresenter, plan: StreamUpdatePlan) {
+            if (plan.restartAudio) {
+                stopAudio()
+                audioPlayers.resetAttempt()
+            } else if (plan.resetAudioDecoder) {
+                audioPlayers.active?.resetForTransport()
+            }
+        }
+
+        override fun onStreamApplied(presenter: StreamPresenter, stream: StreamDescription, plan: StreamUpdatePlan) {
+            if (plan.restartAudio) startAudio(stream)
+            rememberConfirmedOutput(stream)
+            syncOutputPicker()
+            updateStatusText()
+        }
+
+        override fun onControlSnapshot(presenter: StreamPresenter, update: CursorSnapshotUpdate) =
+            applyControlSnapshot(update)
+
+        override fun onOutputsChanged(presenter: StreamPresenter) {
+            syncOutputPicker()
+            aux.reconcile()
+        }
+
+        override fun onSurfaceReady(presenter: StreamPresenter) {
+            if (pendingConnect) startNativeConnection()
+        }
+
+        override fun onSurfaceDestroyed(presenter: StreamPresenter) {
+            if (presenter.sessionStarted || pendingConnect) disconnect()
+        }
+    }
+
+    private val auxHost: AuxDisplayHost = object : AuxDisplayHost {
+        override val mainStream: StreamDescription? get() = main.activeStream
+        override val mainConnected: Boolean get() = main.connected
+        override val mainOutputs: ServerOutputs get() = main.outputs
+        override val serverAddress: String get() = connectionTargetAddress
+        override val remembered: RememberedOutput? get() = rememberedAuxOutput()
+        override fun remember(choice: RememberedOutput) = rememberAuxOutput(choice)
+        override val token: String get() = authenticationToken
+        override val maxRefreshHz: Int get() = refreshRateHz
+        override val scaleMode: VideoScaleMode get() = videoScaleMode
+        override fun onAuxChanged() = syncAuxPicker()
     }
 
     private val pollStatus = object : Runnable {
         override fun run() {
-            val sessionEpoch = currentSessionEpoch
-            if (sessionStarted && sessionEpoch != 0L) {
-                val status = NativeBridge.nativeGetStatus(nativeHandle)
-                val wasConnected = connected
-                connected = status == "connected"
-                val connectionPending = isConnectionPending(status)
-                connectionStatus = status
-                if (connected && !wasConnected) {
-                    markServerConnected()
-                }
-                if (!connected && audioPlayers.active != null) {
-                    stopAudio()
-                }
-                if (!connected && wasConnected) {
-                    cancelTouchInput()
-                }
-                if (!connected && !connectionPending && keyboardOpen) {
-                    closeRemoteKeyboard()
-                }
-                if (!connectionPending && !connected) {
-                    cursorOverlay.clearSession()
-                }
-            } else {
-                connected = false
-            }
-            if (sessionStarted && sessionEpoch != 0L && surfaceReady) {
-                NativeBridge.nativeTakeStreamConfig(nativeHandle, sessionEpoch)
-                    ?.let(StreamDescription::from)
-                    ?.takeIf { currentSessionEpoch == sessionEpoch }
-                    ?.let(::applyStreamConfig)
-            }
-            retiredDecoders.removeAll { it.stop() }
-            if (connected) activeStream?.let(::startAudio)
+            main.pollStatus()
+            aux.poll()
+            if (main.connected) main.activeStream?.let(::startAudio)
             updateStatusText()
             if (SystemClock.uptimeMillis() >= nextDiscoveryRefresh) {
                 refreshDiscoveredServers()
@@ -297,13 +296,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     private val pollCursor = object : Runnable {
         override fun run() {
-            val sessionEpoch = currentSessionEpoch
-            if (sessionStarted && sessionEpoch != 0L) {
-                NativeBridge.nativePollCursorSnapshot(nativeHandle, sessionEpoch)
-                    ?.let(CursorSnapshotUpdate::from)
-                    ?.takeIf { currentSessionEpoch == sessionEpoch }
-                    ?.let(::applyControlSnapshot)
-            }
+            main.pollControl()
+            aux.pollControl()
             handler.postDelayed(this, CURSOR_POLL_MS)
         }
     }
@@ -328,6 +322,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         loadSettings()
         savedServers = loadSavedServers().toMutableList()
         persistSavedServers()
+        outputChoices = parseOutputChoices(preferences().getString(OUTPUT_CHOICES_KEY, null))
         buildUi()
         applyKeepAwake()
         showHome(HomePage.SERVERS)
@@ -389,8 +384,9 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     override fun onStart() {
         super.onStart()
         acquireDiscoveryLock()
-        NativeBridge.nativeSetDiscoveryEnabled(nativeHandle, true)
+        NativeBridge.nativeSetDiscoveryEnabled(main.nativeHandle, true)
         startApiDiscovery()
+        aux.onStart()
         handler.post(pollStatus)
         handler.post(pollCursor)
     }
@@ -399,9 +395,10 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         stopApiDiscovery()
         handler.removeCallbacks(pollStatus)
         handler.removeCallbacks(pollCursor)
-        NativeBridge.nativeSetDiscoveryEnabled(nativeHandle, false)
+        NativeBridge.nativeSetDiscoveryEnabled(main.nativeHandle, false)
         releaseDiscoveryLock()
         disconnect()
+        aux.onStop()
         super.onStop()
     }
 
@@ -410,47 +407,20 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         closeRemoteKeyboard()
         stopApiDiscovery()
         apiDiscoveryExecutor.shutdownNow()
-        streamTransitions.cancel()
-        streamTransitionExecutor.shutdownNow()
         updateChecks.cancel()
         updateCheckExecutor.shutdownNow()
         handler.removeCallbacks(pollStatus)
         handler.removeCallbacks(pollCursor)
-        currentSessionEpoch = 0L
-        sessionStarted = false
+        aux.release()
         stopAudio()
-        val decodersToStop = retiredDecoders.toMutableList().apply {
-            decoder?.let(::add)
-        }
-        retiredDecoders.clear()
-        decoder = null
+        main.release()
         legacyImeLayoutListener?.let { listener ->
             if (::rootContainer.isInitialized && rootContainer.viewTreeObserver.isAlive) {
                 rootContainer.viewTreeObserver.removeOnGlobalLayoutListener(listener)
             }
         }
         legacyImeLayoutListener = null
-        Thread({
-            decodersToStop.forEach { it.stopAndWait(500) }
-            NativeBridge.nativeDestroy(nativeHandle)
-        }, "st-native-destroy").start()
         super.onDestroy()
-    }
-
-    override fun surfaceCreated(holder: SurfaceHolder) {
-        surfaceReady = true
-        if (pendingConnect) {
-            startNativeConnection()
-        }
-    }
-
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
-
-    override fun surfaceDestroyed(holder: SurfaceHolder) {
-        surfaceReady = false
-        if (sessionStarted || pendingConnect) {
-            disconnect()
-        }
     }
 
     private fun buildUi() {
@@ -493,12 +463,6 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                 addView(addServerBar, rowParams())
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
         }
-        videoView = AspectSurfaceView(this).apply {
-            setScaleMode(videoScaleMode)
-            holder.addCallback(this@MainActivity)
-        }
-        cursorOverlay = CursorOverlayView(this, videoView)
-        videoView.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> cursorOverlay.invalidate() }
         statusPanel = buildStatusPanel()
         floatingMenu = buildFloatingMenu()
         menuLauncher = buildMenuLauncher()
@@ -541,7 +505,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             setOnTouchListener { _, event -> handleStreamTouch(event) }
             visibility = View.GONE
             addView(
-                videoView,
+                main.videoView,
                 FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -549,7 +513,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                 ),
             )
             addView(
-                cursorOverlay,
+                main.cursorOverlay,
                 FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -688,6 +652,25 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         addView(label("Video scaling"))
         menuScaleSpinner = videoScaleSpinner()
         addView(menuScaleSpinner, rowParams())
+        outputPicker = OutputPickerView(this@MainActivity, COLOR_ACCENT, COLOR_TEXT, ::dp, ::pickMainOutput)
+        outputSection = pickerSection("Display", outputPicker)
+        addView(outputSection, rowParams())
+        auxPicker = OutputPickerView(this@MainActivity, COLOR_ACCENT, COLOR_TEXT, ::dp, ::pickAuxOutput)
+        auxSection = pickerSection("External display", auxPicker)
+        auxStatusText = TextView(this@MainActivity).apply {
+            setTextColor(COLOR_TEXT_MUTED)
+            textSize = 12f
+            visibility = View.GONE
+        }
+        auxSection.addView(auxStatusText, rowParams())
+        addView(auxSection, rowParams())
+    }
+
+    private fun pickerSection(title: String, picker: OutputPickerView) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        visibility = View.GONE
+        addView(label(title))
+        addView(picker, rowParams())
     }
 
     private fun buildMenuLauncher() = FrameLayout(this).apply {
@@ -1050,98 +1033,70 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         connectionTargetLabel = server ?: "API tunnel to ${card.displayName}"
         connectionApiPeerId = tunnelPeerId
         connectionSavedAddress = card.savedAddress
+        connectionServerKey = card.key
+        connectionOutputId = connectOutputId(outputChoices[card.key])
         keyboardCapability = false
         textInputCapability = false
         controllerOwnership = ControllerOwnership.UNAVAILABLE
         resetFloatingControls()
-        pendingConnect = true
-        connected = false
-        connectionStatus = "preparing video surface"
-        decoderStatus = ""
-        hasRenderedVideo = false
-        audioStatus = ""
+        prepareConnect()
         showStreaming()
-        if (surfaceReady) {
+        if (main.surfaceReady) {
             startNativeConnection()
         }
     }
 
+    private fun prepareConnect() {
+        pendingConnect = true
+        pendingOutputPick = null
+        main.connectionStatus = "preparing video surface"
+        audioStatus = ""
+    }
+
     private fun startNativeConnection() {
-        if (!pendingConnect || !surfaceReady) {
+        if (!pendingConnect || !main.surfaceReady) {
             return
         }
         pendingConnect = false
-        cursorOverlay.clearSession()
         controlTransportGeneration = 0
-        currentSessionEpoch = 0L
-        sessionStarted = false
-        val error = NativeBridge.nativeStart(
-            nativeHandle,
-            connectionTargetAddress,
-            authenticationToken,
-            refreshRateHz * 1_000,
-            if (connectionApiPeerId != null) ApiDiscovery.BASE_URL else "",
-            if (connectionApiPeerId != null) clientPeerId else "",
-            connectionApiPeerId.orEmpty(),
-            if (connectionApiPeerId != null) nextApiRequestNonce() else 0L,
+        val (displayWidth, displayHeight) = displayPixelSize(currentDisplay())
+        val error = main.start(
+            StreamStart(
+                server = connectionTargetAddress,
+                token = authenticationToken,
+                refreshMilliHz = refreshRateHz * 1_000,
+                apiUrl = if (connectionApiPeerId != null) ApiDiscovery.BASE_URL else "",
+                clientPeerId = if (connectionApiPeerId != null) clientPeerId else "",
+                hostPeerId = connectionApiPeerId.orEmpty(),
+                requestNonce = if (connectionApiPeerId != null) nextApiRequestNonce() else 0L,
+                outputId = connectionOutputId,
+                displayWidth = displayWidth,
+                displayHeight = displayHeight,
+            ),
         )
         if (error != null) {
             homeStatusText.text = error
-            connectionStatus = error
-            updateStatusText()
-            return
         }
-        val sessionEpoch = NativeBridge.nativeGetSessionEpoch(nativeHandle)
-        if (sessionEpoch == 0L) {
-            NativeBridge.nativeStop(nativeHandle)
-            connectionStatus = "native session did not start"
-            updateStatusText()
-            return
-        }
-        currentSessionEpoch = sessionEpoch
-        sessionStarted = true
-        connectionStatus = "connecting"
         updateStatusText()
     }
 
     private fun disconnect() {
         pendingConnect = false
+        pendingOutputPick = null
         resetFloatingControls()
-        streamTransitions.cancel()
-        val wasStarted = sessionStarted
-        currentSessionEpoch = 0L
-        sessionStarted = false
+        aux.stop()
         stopAudio()
-        decoder?.let {
-            it.stop()
-            retiredDecoders += it
-        }
-        decoder = null
-        decoderStatus = ""
-        hasRenderedVideo = false
-        activeStream = null
-        pendingDecoderStream = null
-        pendingStreamAcceptance = null
-        decoderTransitionStartedAt = 0L
-        streamGeneration = 0
-        acceptedVideoEpoch = 0L
-        controlTransportGeneration = 0
+        main.stopSession()
         audioPlayers.resetAttempt()
-        connected = false
-        connectionStatus = "disconnected"
+        controlTransportGeneration = 0
         connectionSavedAddress = null
         connectionApiPeerId = null
         connectionTargetLabel = ""
         keyboardCapability = false
         textInputCapability = false
         controllerOwnership = ControllerOwnership.UNAVAILABLE
-        if (::cursorOverlay.isInitialized) {
-            cursorOverlay.clearSession()
-        }
-        if (wasStarted) {
-            NativeBridge.nativeStop(nativeHandle)
-        }
         if (::navigation.isInitialized) {
+            syncOutputPicker()
             showHome(currentPage)
         }
     }
@@ -1152,206 +1107,22 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         val targetLabel = connectionTargetLabel
         val apiPeerId = connectionApiPeerId
         val savedAddress = connectionSavedAddress
+        val serverKey = connectionServerKey
         disconnect()
         connectionTargetAddress = targetAddress
         connectionTargetLabel = targetLabel
         connectionApiPeerId = apiPeerId
         connectionSavedAddress = savedAddress
-        pendingConnect = true
-        connected = false
-        connectionStatus = "preparing video surface"
-        decoderStatus = ""
-        hasRenderedVideo = false
-        audioStatus = ""
+        connectionServerKey = serverKey
+        connectionOutputId = connectOutputId(outputChoices[serverKey])
+        prepareConnect()
         showStreaming()
-        if (surfaceReady) startNativeConnection()
-    }
-
-    private fun applyStreamConfig(stream: StreamDescription) {
-        val sessionEpoch = currentSessionEpoch
-        if (!sessionStarted || sessionEpoch == 0L) return
-        val previous = activeStream
-        val plan = planStreamUpdate(
-            previous,
-            stream,
-            decoderReady = decoder != null && pendingDecoderStream == null,
-        )
-        val decoderChanged = plan.restartDecoder
-        if (plan.restartAudio) {
-            stopAudio()
-            audioPlayers.resetAttempt()
-        } else if (plan.resetAudioDecoder) {
-            audioPlayers.active?.resetForTransport()
-        }
-        activeStream = stream
-        videoView.setVideoSize(stream.width, stream.height)
-        cursorOverlay.updateStreamConfig(
-            stream.generation,
-            stream.width,
-            stream.height,
-            stream.cursorWidth,
-            stream.cursorHeight,
-        )
-        if (decoderChanged) {
-            pendingStreamAcceptance = null
-            if (pendingDecoderStream?.generation != stream.generation ||
-                pendingDecoderStream?.videoEpoch != stream.videoEpoch
-            ) {
-                decoderTransitionStartedAt = SystemClock.uptimeMillis()
-            }
-            pendingDecoderStream = stream
-            decoderStatus = "starting decoder"
-            queueStreamTransition(stream, restartDecoder = true)
-        } else if (streamGeneration != stream.generation || acceptedVideoEpoch != stream.videoEpoch) {
-            if (pendingStreamAcceptance?.generation != stream.generation ||
-                pendingStreamAcceptance?.videoEpoch != stream.videoEpoch
-            ) {
-                decoderTransitionStartedAt = SystemClock.uptimeMillis()
-            }
-            pendingStreamAcceptance = stream
-            queueStreamTransition(stream, restartDecoder = false)
-        }
-        if (plan.restartAudio) startAudio(stream)
-        updateStatusText()
-    }
-
-    private fun queueStreamTransition(stream: StreamDescription, restartDecoder: Boolean) {
-        val sessionEpoch = currentSessionEpoch
-        if (!sessionStarted || sessionEpoch == 0L) return
-        streamTransitions.submit(
-            StreamTransitionRequest(sessionEpoch, stream, restartDecoder, decoder),
-        )
-    }
-
-    private fun performStreamTransition(
-        request: StreamTransitionRequest,
-        isCurrent: () -> Boolean,
-    ): StreamTransitionResult {
-        if (request.restartDecoder) {
-            val stopped = runCatching {
-                request.previousDecoder?.stopAndWait(DECODER_STOP_WAIT_MS) != false
-            }.getOrDefault(false)
-            if (!isCurrent()) return StreamTransitionResult.SUPERSEDED
-            if (!stopped) return StreamTransitionResult.RETRY
-        }
-        if (!isCurrent()) return StreamTransitionResult.SUPERSEDED
-        val accepted = runCatching {
-            NativeBridge.nativeAcceptStreamGeneration(
-                nativeHandle,
-                request.sessionEpoch,
-                request.stream.generation,
-                request.stream.videoEpoch,
-            )
-        }.getOrDefault(false)
-        return if (accepted) {
-            StreamTransitionResult.ACCEPTED
-        } else {
-            StreamTransitionResult.RETRY
-        }
-    }
-
-    private fun completeStreamTransition(
-        request: StreamTransitionRequest,
-        result: StreamTransitionResult,
-    ) {
-        val stream = request.stream
-        if (!sessionStarted || currentSessionEpoch != request.sessionEpoch ||
-            activeStream?.generation != stream.generation || activeStream?.videoEpoch != stream.videoEpoch
-        ) {
-            return
-        }
-        if (request.restartDecoder && request.previousDecoder?.stop() != false &&
-            decoder === request.previousDecoder
-        ) {
-            decoder = null
-        }
-        if (result != StreamTransitionResult.ACCEPTED) {
-            if (result == StreamTransitionResult.RETRY &&
-                SystemClock.uptimeMillis() - decoderTransitionStartedAt < DECODER_TRANSITION_TIMEOUT_MS
-            ) {
-                decoderStatus = if (request.restartDecoder) {
-                    "waiting for previous decoder to stop"
-                } else {
-                    "waiting to accept video configuration"
-                }
-                handler.postDelayed(
-                    {
-                        if (sessionStarted && currentSessionEpoch == request.sessionEpoch &&
-                            activeStream?.generation == stream.generation &&
-                            activeStream?.videoEpoch == stream.videoEpoch
-                        ) {
-                            queueStreamTransition(stream, request.restartDecoder)
-                        }
-                    },
-                    STREAM_STATUS_POLL_MS,
-                )
-            } else if (result == StreamTransitionResult.RETRY) {
-                pendingDecoderStream = null
-                pendingStreamAcceptance = null
-                decoderStatus = "decoder restart timed out; reconnect required"
-            }
-            updateStatusText()
-            return
-        }
-        streamGeneration = stream.generation
-        acceptedVideoEpoch = stream.videoEpoch
-        if (!request.restartDecoder) {
-            pendingStreamAcceptance = null
-            if (hasRenderedVideo) decoderStatus = VIDEO_ACTIVE_STATUS
-            updateStatusText()
-            return
-        }
-        startDecoder(stream, request.sessionEpoch)
-    }
-
-    private fun startDecoder(stream: StreamDescription, sessionEpoch: Long) {
-        val next = AvcSurfaceDecoder(nativeHandle, sessionEpoch, stream, videoView.holder.surface) { status ->
-            runOnUiThread {
-                if (currentSessionEpoch == sessionEpoch && streamGeneration == stream.generation &&
-                    acceptedVideoEpoch == stream.videoEpoch
-                ) {
-                    decoderStatus = status
-                    if (status == VIDEO_ACTIVE_STATUS) hasRenderedVideo = true
-                    updateStatusText()
-                }
-            }
-        }
-        try {
-            next.start()
-            decoder = next
-            pendingDecoderStream = null
-            decoderTransitionStartedAt = 0L
-        } catch (error: RuntimeException) {
-            next.stop()
-            NativeBridge.nativeRequestKeyframe(nativeHandle, sessionEpoch)
-            val timedOut = SystemClock.uptimeMillis() - decoderTransitionStartedAt >=
-                DECODER_TRANSITION_TIMEOUT_MS
-            decoderStatus = if (timedOut) {
-                pendingDecoderStream = null
-                "decoder start failed; reconnect required: ${error.message ?: error.javaClass.simpleName}"
-            } else {
-                "decoder start failed; retrying: ${error.message ?: error.javaClass.simpleName}"
-            }
-            updateStatusText()
-            if (!timedOut) {
-                handler.postDelayed(
-                    {
-                        if (sessionStarted && currentSessionEpoch == sessionEpoch &&
-                            activeStream?.generation == stream.generation &&
-                            activeStream?.videoEpoch == stream.videoEpoch
-                        ) {
-                            queueStreamTransition(stream, restartDecoder = true)
-                        }
-                    },
-                    STREAM_STATUS_POLL_MS,
-                )
-            }
-        }
+        if (main.surfaceReady) startNativeConnection()
     }
 
     private fun startAudio(stream: StreamDescription) {
-        val sessionEpoch = currentSessionEpoch
-        if (!audioEnabled || !connected || !sessionStarted || sessionEpoch == 0L ||
+        val sessionEpoch = main.currentSessionEpoch
+        if (!audioEnabled || !main.connected || !main.sessionStarted || sessionEpoch == 0L ||
             !audioPlayers.canStart(stream.generation)
         ) {
             return
@@ -1360,14 +1131,14 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         updateStatusText()
         lateinit var player: AndroidAudioPlayer
         player = AndroidAudioPlayer(
-            nativeHandle,
+            main.nativeHandle,
             sessionEpoch,
             stream,
             onStatus = { status ->
                 runOnUiThread {
-                    if (sessionStarted && currentSessionEpoch == sessionEpoch &&
-                        activeStream?.generation == stream.generation &&
-                        activeStream?.audioCompatibleWith(stream) == true
+                    if (main.sessionStarted && main.currentSessionEpoch == sessionEpoch &&
+                        main.activeStream?.generation == stream.generation &&
+                        main.activeStream?.audioCompatibleWith(stream) == true
                     ) {
                         audioStatus = status
                         updateStatusText()
@@ -1378,8 +1149,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                 runOnUiThread {
                     if (!audioPlayers.terminated(player)) return@runOnUiThread
                     if (failure != null) audioStatus = failure
-                    if (audioEnabled && connected && sessionStarted && currentSessionEpoch == sessionEpoch) {
-                        activeStream?.let(::startAudio)
+                    if (audioEnabled && main.connected && main.sessionStarted && main.currentSessionEpoch == sessionEpoch) {
+                        main.activeStream?.let(::startAudio)
                     }
                     updateStatusText()
                 }
@@ -1400,11 +1171,11 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     private fun updateStatusText() {
         if (!::statusText.isInitialized) return
-        val decoderDetail = decoderStatus.ifEmpty {
-            if (connected) "waiting for video" else "not started"
+        val decoderDetail = main.decoderStatus.ifEmpty {
+            if (main.connected) "waiting for video" else "not started"
         }
-        val targetDetail = connectionTargetLabel.takeIf { !connected && it.isNotEmpty() }
-        statusText.text = listOfNotNull(connectionStatus, targetDetail, decoderDetail)
+        val targetDetail = connectionTargetLabel.takeIf { !main.connected && it.isNotEmpty() }
+        statusText.text = listOfNotNull(main.connectionStatus, targetDetail, decoderDetail)
             .filter { it.isNotEmpty() && it != "not started" }
             .distinct()
             .joinToString("\n")
@@ -1413,19 +1184,19 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             val audioDetail = when {
                 !audioEnabled -> "disabled"
                 audioStatus.isNotEmpty() -> audioStatus
-                activeStream == null -> "waiting for stream"
+                main.activeStream == null -> "waiting for stream"
                 else -> "waiting for audio"
             }
             menuStatusText.text =
-                "Connection: $connectionStatus\nDecoder: $decoderDetail\nAudio: $audioDetail\nVersion: $appVersion"
+                "Connection: ${main.connectionStatus}\nDecoder: $decoderDetail\nAudio: $audioDetail\nVersion: $appVersion"
         }
 
         val streaming = isStreamingVisible()
         statusPanel.visibility = if (shouldShowStartupStatus(
                 streaming,
-                hasRenderedVideo,
-                connected,
-                decoderStatus,
+                main.hasRenderedVideo,
+                main.connected,
+                main.decoderStatus,
             )
         ) {
             View.VISIBLE
@@ -1433,13 +1204,13 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             View.GONE
         }
         if (::statusDisconnectButton.isInitialized) {
-            statusDisconnectButton.visibility = if (streaming && (sessionStarted || pendingConnect)) {
+            statusDisconnectButton.visibility = if (streaming && (main.sessionStarted || pendingConnect)) {
                 View.VISIBLE
             } else {
                 View.GONE
             }
-            val terminal = !connected && !isConnectionPending(connectionStatus) ||
-                decoderStatus.contains("reconnect required")
+            val terminal = !main.connected && !isConnectionPending(main.connectionStatus) ||
+                main.decoderStatus.contains("reconnect required")
             statusReconnectButton.visibility = if (streaming && terminal &&
                 (connectionTargetAddress.isNotEmpty() || connectionApiPeerId != null)
             ) {
@@ -1448,7 +1219,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                 View.GONE
             }
         }
-        val showLauncher = streaming && connected
+        val showLauncher = streaming && main.connected
         if (showLauncher) {
             if (menuLauncher.visibility != View.VISIBLE) {
                 menuLauncher.visibility = View.VISIBLE
@@ -1473,11 +1244,10 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             textInputCapability = it.value.textInput
         }
         update.controllerState?.let { controllerOwnership = it.value }
-        cursorOverlay.applyUpdate(update)
         updateKeyboardLauncher()
     }
 
-    private fun keyboardInputEligible(): Boolean = connected && keyboardCapability &&
+    private fun keyboardInputEligible(): Boolean = main.connected && keyboardCapability &&
         controllerOwnershipAllowsInput(controllerOwnership)
 
     private fun updateKeyboardLauncher() {
@@ -1485,7 +1255,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         val available = keyboardInputEligible()
         keyboardLauncher.setAvailable(available)
         keyboardLauncher.setTextInputAvailable(available && textInputCapability)
-        keyboardLauncher.visibility = if (connected && keyboardCapability && isStreamingVisible()) {
+        keyboardLauncher.visibility = if (main.connected && keyboardCapability && isStreamingVisible()) {
             View.VISIBLE
         } else {
             View.GONE
@@ -1507,7 +1277,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
         if (enabled) {
             audioPlayers.resetAttempt()
-            activeStream?.let(::startAudio)
+            main.activeStream?.let(::startAudio)
         } else {
             stopAudio()
         }
@@ -1536,10 +1306,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private fun setVideoScaleMode(mode: VideoScaleMode) {
         videoScaleMode = mode
         getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit().putString("video_scale", mode.name).apply()
-        if (::videoView.isInitialized) {
-            videoView.setScaleMode(mode)
-            cursorOverlay.invalidate()
-        }
+        main.setScaleMode(mode)
+        aux.setScaleMode(mode)
         val position = VideoScaleMode.values().indexOf(mode)
         syncingControls = true
         try {
@@ -1552,6 +1320,64 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         } finally {
             syncingControls = false
         }
+    }
+
+    private fun preferences() = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+
+    private fun rememberConfirmedOutput(stream: StreamDescription) {
+        val choice = outputChoiceToRemember(pendingOutputPick, stream.outputId, main.outputs.outputs) ?: return
+        pendingOutputPick = null
+        if (connectionServerKey.isEmpty()) return
+        outputChoices = outputChoices + (connectionServerKey to choice)
+        preferences().edit().putString(OUTPUT_CHOICES_KEY, serializeOutputChoices(outputChoices)).apply()
+    }
+
+    private fun pickMainOutput(index: Int) {
+        val output = main.outputs.outputs.getOrNull(index) ?: return
+        if (output.id == main.activeStream?.outputId) return
+        pendingOutputPick = output.id
+        if (!main.selectOutput(output.id)) pendingOutputPick = null
+        syncOutputPicker()
+    }
+
+    private fun syncOutputPicker() {
+        if (!::outputPicker.isInitialized) return
+        val outputs = main.outputs.outputs
+        outputSection.visibility = if (shouldShowOutputPicker(outputs)) View.VISIBLE else View.GONE
+        outputPicker.setEntries(
+            outputs.map(ServerOutput::label),
+            selected = outputPickerIndex(outputs, main.activeStream?.outputId),
+            pending = outputPickerIndex(outputs, pendingOutputPick),
+        )
+    }
+
+    private fun pickAuxOutput(index: Int) {
+        aux.pick(index)
+        syncAuxPicker()
+    }
+
+    private fun syncAuxPicker() {
+        if (!::auxPicker.isInitialized) return
+        val entries = aux.pickerEntries()
+        auxSection.visibility = if (aux.pickerVisible()) View.VISIBLE else View.GONE
+        auxPicker.setEntries(
+            entries.map(AuxPickerEntry::label),
+            selected = aux.pickerSelection(),
+            pending = aux.pickerPending(),
+        )
+        val failure = aux.failure
+        if (auxStatusText.text.toString() != failure.orEmpty()) auxStatusText.text = failure.orEmpty()
+        auxStatusText.visibility = if (failure == null) View.GONE else View.VISIBLE
+    }
+
+    private fun rememberedAuxOutput(): RememberedOutput? =
+        parseOutputChoices(preferences().getString(AUX_OUTPUT_CHOICES_KEY, null))[connectionServerKey]
+
+    private fun rememberAuxOutput(choice: RememberedOutput) {
+        if (connectionServerKey.isEmpty()) return
+        val choices = parseOutputChoices(preferences().getString(AUX_OUTPUT_CHOICES_KEY, null)) +
+            (connectionServerKey to choice)
+        preferences().edit().putString(AUX_OUTPUT_CHOICES_KEY, serializeOutputChoices(choices)).apply()
     }
 
     private fun videoScaleSpinner() = Spinner(this).apply {
@@ -1642,7 +1468,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             closeFloatingMenu()
             return
         }
-        if (!connected) return
+        if (!main.connected) return
         if (keyboardOpen) closeRemoteKeyboard()
         menuOpen = true
         updateStatusText()
@@ -1810,16 +1636,16 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     private fun publishKeyboardState(pressed: ByteArray): Boolean {
-        val epoch = currentSessionEpoch
-        if (!connected || epoch == 0L || pressed.size != KEYBOARD_STATE_BYTES) return false
+        val epoch = main.currentSessionEpoch
+        if (!main.connected || epoch == 0L || pressed.size != KEYBOARD_STATE_BYTES) return false
         if (pressed.any { it != 0.toByte() } && !keyboardInputEligible()) return false
-        return NativeBridge.nativeSendKeyboardState(nativeHandle, epoch, pressed)
+        return NativeBridge.nativeSendKeyboardState(main.nativeHandle, epoch, pressed)
     }
 
     private fun publishTextInput(text: String): Boolean {
-        val epoch = currentSessionEpoch
-        if (!connected || epoch == 0L || !textInputCapability || !keyboardInputEligible()) return false
-        return NativeBridge.nativeSendTextInput(nativeHandle, epoch, text)
+        val epoch = main.currentSessionEpoch
+        if (!main.connected || epoch == 0L || !textInputCapability || !keyboardInputEligible()) return false
+        return NativeBridge.nativeSendTextInput(main.nativeHandle, epoch, text)
     }
 
     private fun installImeInsetsListener() {
@@ -1920,8 +1746,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
 
     private fun sendTouch(event: MotionEvent): Boolean {
-        val sessionEpoch = currentSessionEpoch
-        if (!touchEnabled || !sessionStarted || sessionEpoch == 0L || !connected ||
+        val sessionEpoch = main.currentSessionEpoch
+        if (!touchEnabled || !main.sessionStarted || sessionEpoch == 0L || !main.connected ||
             streamArea.width <= 1 || streamArea.height <= 1
         ) {
             if (event.actionMasked == MotionEvent.ACTION_UP ||
@@ -2020,7 +1846,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                     pendingTouchY = 0f
                     if (wheel != null) {
                         NativeBridge.nativeSendMouseWheel(
-                            nativeHandle,
+                            main.nativeHandle,
                             sessionEpoch,
                             wheel.x,
                             wheel.y,
@@ -2045,7 +1871,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                     val sentDx = dx.coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
                     val sentDy = dy.coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
                     val route = NativeBridge.nativeSendTrackpadDelta(
-                        nativeHandle,
+                        main.nativeHandle,
                         sessionEpoch,
                         sentDx,
                         sentDy,
@@ -2053,10 +1879,10 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                     )
                     when (PackedTrackpadRoute.mode(route)) {
                         PackedTrackpadRoute.RELATIVE -> {
-                            cursorOverlay.predictRelativeTrackpadDelta(sentDx, sentDy)
+                            main.cursorOverlay.predictRelativeTrackpadDelta(sentDx, sentDy)
                         }
                         PackedTrackpadRoute.ABSOLUTE -> {
-                            cursorOverlay.predictAbsoluteTrackpadTarget(
+                            main.cursorOverlay.predictAbsoluteTrackpadTarget(
                                 PackedTrackpadRoute.absoluteX(route),
                                 PackedTrackpadRoute.absoluteY(route),
                             )
@@ -2090,7 +1916,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                     )
                     if (wheel != null) {
                         NativeBridge.nativeSendMouseWheel(
-                            nativeHandle,
+                            main.nativeHandle,
                             sessionEpoch,
                             wheel.x,
                             wheel.y,
@@ -2150,7 +1976,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         activation = Runnable {
             if (longPressRunnable !== activation) return@Runnable
             longPressRunnable = null
-            if (!sessionStarted || !connected || currentSessionEpoch != sessionEpoch ||
+            if (!main.sessionStarted || !main.connected || main.currentSessionEpoch != sessionEpoch ||
                 maxTouchPointers != 1
             ) {
                 return@Runnable
@@ -2177,7 +2003,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private fun sendTouchButtonMask(sessionEpoch: Long, buttons: Int): Boolean {
         if (touchButtonMask == buttons) return true
         touchButtonMask = buttons
-        return NativeBridge.nativeSendMouseButtons(nativeHandle, sessionEpoch, buttons)
+        return NativeBridge.nativeSendMouseButtons(main.nativeHandle, sessionEpoch, buttons)
     }
 
     private fun sendTouchClick(sessionEpoch: Long, button: Int) {
@@ -2185,11 +2011,11 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         releaseTouchButtons(sessionEpoch)
     }
 
-    private fun releaseTouchButtons(sessionEpoch: Long = currentSessionEpoch) {
+    private fun releaseTouchButtons(sessionEpoch: Long = main.currentSessionEpoch) {
         if (touchButtonMask == 0) return
         touchButtonMask = 0
-        if (sessionStarted && sessionEpoch != 0L) {
-            NativeBridge.nativeSendMouseButtons(nativeHandle, sessionEpoch, 0)
+        if (main.sessionStarted && sessionEpoch != 0L) {
+            NativeBridge.nativeSendMouseButtons(main.nativeHandle, sessionEpoch, 0)
         }
     }
 
@@ -2217,7 +2043,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     private fun refreshDiscoveredServers() {
         if (!::serverCardsContainer.isInitialized) return
-        val json = NativeBridge.nativeGetDiscoveredServers(nativeHandle, authenticationToken)
+        val json = NativeBridge.nativeGetDiscoveredServers(main.nativeHandle, authenticationToken)
         if (json == lastDiscoveryJson) {
             return
         }
@@ -2597,9 +2423,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         const val PREFERENCES = "st"
         const val TAP_TIMEOUT_MS = 250L
         const val CURSOR_POLL_MS = 16L
-        const val DECODER_TRANSITION_TIMEOUT_MS = 3_000L
-        const val DECODER_STOP_WAIT_MS = 50L
-        const val VIDEO_ACTIVE_STATUS = "video active"
+        const val OUTPUT_CHOICES_KEY = "output_choices"
+        const val AUX_OUTPUT_CHOICES_KEY = "aux_output_choices"
         const val MENU_VISUAL_DP = 40
         const val MENU_TOUCH_DP = 48
         const val MOUSE_BUTTON_LEFT = 1
@@ -2619,47 +2444,5 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         val COLOR_ACCENT = Color.rgb(90, 200, 250)
         val COLOR_ONLINE = Color.rgb(80, 200, 120)
         val COLOR_OFFLINE = Color.rgb(180, 80, 80)
-    }
-}
-
-private class AspectSurfaceView(context: Context) : SurfaceView(context) {
-    private var videoWidth = 0
-    private var videoHeight = 0
-    private var scaleMode = VideoScaleMode.FIT
-
-    fun setScaleMode(mode: VideoScaleMode) {
-        if (scaleMode == mode) return
-        scaleMode = mode
-        requestLayout()
-    }
-
-    fun setVideoSize(width: Int, height: Int) {
-        videoWidth = width
-        videoHeight = height
-        holder.setFixedSize(width, height)
-        requestLayout()
-    }
-
-    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-        val availableWidth = MeasureSpec.getSize(widthMeasureSpec)
-        val availableHeight = MeasureSpec.getSize(heightMeasureSpec)
-        if (videoWidth <= 0 || videoHeight <= 0 || availableWidth <= 0 || availableHeight <= 0) {
-            setMeasuredDimension(availableWidth, availableHeight)
-            return
-        }
-        if (scaleMode == VideoScaleMode.STRETCH) {
-            setMeasuredDimension(availableWidth, availableHeight)
-            return
-        }
-        val widthScale = availableWidth.toDouble() / videoWidth
-        val heightScale = availableHeight.toDouble() / videoHeight
-        val scale = if (scaleMode == VideoScaleMode.COVER) {
-            max(widthScale, heightScale)
-        } else {
-            min(widthScale, heightScale)
-        }
-        val measuredWidth = (videoWidth * scale).roundToInt().coerceAtLeast(1)
-        val measuredHeight = (videoHeight * scale).roundToInt().coerceAtLeast(1)
-        setMeasuredDimension(measuredWidth, measuredHeight)
     }
 }

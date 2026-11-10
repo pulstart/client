@@ -8,11 +8,11 @@ use crate::render_windows::{WindowsD3d11Importer, WindowsDirectVideoPresenter};
 use crate::render_windows_native::WindowsNativeVideoPresenter;
 #[cfg(target_os = "macos")]
 use crate::video_frame::MacosVideoToolboxFrame;
+use crate::video_frame::{
+    uv_rotation, NativeSurfaceCapabilities, NativeSurfaceControl, VideoFormat, VideoFrameBuffer,
+};
 #[cfg(target_os = "linux")]
 use crate::video_frame::{LinuxDmaBufFormat, LinuxDmaBufFrame, LinuxDmaBufPlane};
-use crate::video_frame::{
-    NativeSurfaceCapabilities, NativeSurfaceControl, VideoFormat, VideoFrameBuffer,
-};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use eframe::egui_glow;
 use eframe::{egui, glow};
@@ -38,9 +38,20 @@ fn direct_present_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// A native texture registered with egui. egui cannot unregister those, so a
+/// closed secondary window hands its slot back for the next one to reuse.
+pub struct GlowSlot {
+    texture: glow::Texture,
+    id: egui::TextureId,
+}
+
+pub type GlowSlotPool = Arc<std::sync::Mutex<Vec<GlowSlot>>>;
+
 pub struct NativeVideoTexture {
     texture: Option<glow::Texture>,
     texture_id: Option<egui::TextureId>,
+    /// Where `release` returns the output texture; `None` for the main window.
+    slot_pool: Option<GlowSlotPool>,
     width: u32,
     height: u32,
     yuv_pipeline: Option<YuvPipeline>,
@@ -86,6 +97,12 @@ struct YuvPipeline {
     chroma_tex: glow::Texture,
     chroma_v_tex: glow::Texture,
     mode_uniform: glow::UniformLocation,
+    uv_x_uniform: glow::UniformLocation,
+    uv_y_uniform: glow::UniformLocation,
+    /// Quarter turns applied while sampling; set per frame by the CPU-plane
+    /// path. Native-surface paths never rotate (their frames are only produced
+    /// while the stream is upright).
+    rotation: u8,
     last_format: Option<VideoFormat>,
     last_luma_size: (u32, u32),
     last_chroma_size: (u32, u32),
@@ -351,6 +368,7 @@ impl NativeVideoTexture {
         Self {
             texture: None,
             texture_id: None,
+            slot_pool: None,
             width: 0,
             height: 0,
             yuv_pipeline: None,
@@ -390,6 +408,34 @@ impl NativeVideoTexture {
             #[cfg(target_os = "windows")]
             windows_overlayless_preferred: false,
         }
+    }
+
+    /// A texture for a secondary window; `release` gives its GL objects back.
+    pub fn new_secondary(pool: GlowSlotPool) -> Self {
+        let mut texture = Self::new(None);
+        texture.slot_pool = Some(pool);
+        texture
+    }
+
+    /// Deletes the GL objects this texture made and returns its egui slot to
+    /// the pool. `gl` must be current.
+    pub fn release(&mut self, gl: &glow::Context) {
+        if let Some(mut pipeline) = self.yuv_pipeline.take() {
+            unsafe { pipeline.destroy(gl) };
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(importer) = self.dmabuf_importer.take() {
+            unsafe { importer.destroy(gl) };
+        }
+        if let (Some(pool), Some(texture), Some(id)) = (
+            self.slot_pool.as_ref(),
+            self.texture.take(),
+            self.texture_id.take(),
+        ) {
+            pool.lock().unwrap().push(GlowSlot { texture, id });
+        }
+        self.width = 0;
+        self.height = 0;
     }
 
     pub fn has_frame(&self) -> bool {
@@ -724,6 +770,7 @@ impl NativeVideoTexture {
             windows_d3d11: self.windows_d3d11_supported,
             #[cfg(not(target_os = "windows"))]
             windows_d3d11: false,
+            linux_dmabuf_rotates: false,
         }
     }
 
@@ -783,8 +830,9 @@ impl NativeVideoTexture {
             }
         }
 
+        let (display_width, display_height) = video.display_size();
         let output_texture =
-            self.ensure_output_texture(frame, gl.as_ref(), video.width, video.height)?;
+            self.ensure_output_texture(frame, gl.as_ref(), display_width, display_height)?;
 
         #[cfg(target_os = "linux")]
         if let Some(dmabuf) = video.dmabuf.as_ref() {
@@ -872,21 +920,21 @@ impl NativeVideoTexture {
         }
 
         match video.format {
-            VideoFormat::Rgba8 => upload_rgba(
+            VideoFormat::Rgba8 if video.rotation == 0 => upload_rgba(
                 gl.as_ref(),
                 output_texture,
                 video.width,
                 video.height,
                 &video.plane0,
             )?,
-            VideoFormat::Yuv420p8 | VideoFormat::Yuv444p8 | VideoFormat::Nv12 => {
+            _ => {
                 let pipeline = self.ensure_yuv_pipeline(gl.as_ref())?;
                 pipeline.upload_and_render(gl.as_ref(), output_texture, video)?;
             }
         }
 
-        self.width = video.width;
-        self.height = video.height;
+        self.width = display_width;
+        self.height = display_height;
         Ok(())
     }
 
@@ -925,8 +973,17 @@ impl NativeVideoTexture {
         gl: &glow::Context,
     ) -> Result<glow::Texture, String> {
         if self.texture.is_none() {
-            let texture = unsafe { create_texture(gl)? };
-            let texture_id = frame.register_native_glow_texture(texture);
+            let pooled = self
+                .slot_pool
+                .as_ref()
+                .and_then(|pool| pool.lock().unwrap().pop());
+            let (texture, texture_id) = match pooled {
+                Some(slot) => (slot.texture, slot.id),
+                None => {
+                    let texture = unsafe { create_texture(gl)? };
+                    (texture, frame.register_native_glow_texture(texture))
+                }
+            };
             self.texture = Some(texture);
             self.texture_id = Some(texture_id);
         }
@@ -946,6 +1003,19 @@ impl NativeVideoTexture {
 }
 
 impl YuvPipeline {
+    unsafe fn destroy(&mut self, gl: &glow::Context) {
+        gl.delete_program(self.program);
+        gl.delete_framebuffer(self.framebuffer);
+        gl.delete_vertex_array(self.vao);
+        gl.delete_buffer(self._vbo);
+        for texture in [self.luma_tex, self.chroma_tex, self.chroma_v_tex] {
+            gl.delete_texture(texture);
+        }
+        self.luma_pbo.destroy(gl);
+        self.chroma_pbo.destroy(gl);
+        self.chroma_v_pbo.destroy(gl);
+    }
+
     fn new(gl: &glow::Context) -> Result<Self, String> {
         ensure_yuv_gl_support(gl)?;
         let program = unsafe { create_yuv_program(gl)? };
@@ -983,6 +1053,10 @@ impl YuvPipeline {
             .ok_or_else(|| "missing u_chroma_v uniform".to_string())?;
         let mode_uniform = unsafe { gl.get_uniform_location(program, "u_mode") }
             .ok_or_else(|| "missing u_mode uniform".to_string())?;
+        let uv_x_uniform = unsafe { gl.get_uniform_location(program, "u_uv_x") }
+            .ok_or_else(|| "missing u_uv_x uniform".to_string())?;
+        let uv_y_uniform = unsafe { gl.get_uniform_location(program, "u_uv_y") }
+            .ok_or_else(|| "missing u_uv_y uniform".to_string())?;
 
         unsafe {
             gl.bind_vertex_array(Some(vao));
@@ -1012,6 +1086,9 @@ impl YuvPipeline {
             chroma_tex,
             chroma_v_tex,
             mode_uniform,
+            uv_x_uniform,
+            uv_y_uniform,
+            rotation: 0,
             last_format: None,
             last_luma_size: (0, 0),
             last_chroma_size: (0, 0),
@@ -1032,6 +1109,7 @@ impl YuvPipeline {
         let reallocate = self.last_format != Some(video.format)
             || self.last_luma_size != (video.width, video.height)
             || self.last_chroma_size != chroma_size;
+        self.rotation = video.rotation;
 
         unsafe {
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
@@ -1039,14 +1117,28 @@ impl YuvPipeline {
 
         let pbo_enabled = self.pbo_enabled;
 
+        let (luma_internal, luma_format) = match video.format {
+            VideoFormat::Rgba8 => (glow::RGBA8 as i32, glow::RGBA),
+            _ => (glow::R8 as i32, glow::RED),
+        };
+        let luma_len = match video.format {
+            VideoFormat::Rgba8 => video.width as usize * video.height as usize * 4,
+            _ => video.plane0.len(),
+        };
+        let Some(luma) = video.plane0.get(..luma_len) else {
+            return Err(format!(
+                "luma plane too small: {} < {luma_len}",
+                video.plane0.len()
+            ));
+        };
         upload_plane_texture(
             gl,
             self.luma_tex,
-            glow::R8 as i32,
-            glow::RED,
+            luma_internal,
+            luma_format,
             video.width,
             video.height,
-            &video.plane0,
+            luma,
             reallocate,
             pbo_enabled.then_some(&mut self.luma_pbo),
         )?;
@@ -1113,14 +1205,15 @@ impl YuvPipeline {
                     pbo_enabled.then_some(&mut self.chroma_pbo),
                 )?;
             }
-            VideoFormat::Rgba8 => return Err("unexpected RGBA frame in YUV pipeline".into()),
+            VideoFormat::Rgba8 => {}
         }
 
+        let (display_width, display_height) = video.display_size();
         self.render_textures(
             gl,
             output_texture,
-            video.width,
-            video.height,
+            display_width,
+            display_height,
             video.format,
             self.luma_tex,
             self.chroma_tex,
@@ -1132,6 +1225,20 @@ impl YuvPipeline {
         self.last_chroma_size = chroma_size;
 
         Ok(())
+    }
+
+    unsafe fn set_sampling_uniforms(&self, gl: &glow::Context, format: VideoFormat) {
+        gl.uniform_1_i32(
+            Some(&self.mode_uniform),
+            match format {
+                VideoFormat::Yuv420p8 | VideoFormat::Yuv444p8 => 0,
+                VideoFormat::Nv12 => 1,
+                VideoFormat::Rgba8 => 2,
+            },
+        );
+        let [a, b, c, d, e, f] = uv_rotation(self.rotation);
+        gl.uniform_3_f32(Some(&self.uv_x_uniform), a, b, c);
+        gl.uniform_3_f32(Some(&self.uv_y_uniform), d, e, f);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1166,14 +1273,7 @@ impl YuvPipeline {
             gl.disable(glow::DEPTH_TEST);
             gl.disable(glow::CULL_FACE);
             gl.use_program(Some(self.program));
-            gl.uniform_1_i32(
-                Some(&self.mode_uniform),
-                match format {
-                    VideoFormat::Yuv420p8 | VideoFormat::Yuv444p8 => 0,
-                    VideoFormat::Nv12 => 1,
-                    VideoFormat::Rgba8 => 0,
-                },
-            );
+            self.set_sampling_uniforms(gl, format);
 
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(luma_tex));
@@ -1213,14 +1313,7 @@ impl YuvPipeline {
             gl.disable(glow::DEPTH_TEST);
             gl.disable(glow::CULL_FACE);
             gl.use_program(Some(self.program));
-            gl.uniform_1_i32(
-                Some(&self.mode_uniform),
-                match format {
-                    VideoFormat::Yuv420p8 | VideoFormat::Yuv444p8 => 0,
-                    VideoFormat::Nv12 => 1,
-                    VideoFormat::Rgba8 => 0,
-                },
-            );
+            self.set_sampling_uniforms(gl, format);
 
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(luma_tex));
@@ -1248,6 +1341,12 @@ impl YuvPipeline {
 
 #[cfg(target_os = "linux")]
 impl LinuxDmabufImporter {
+    unsafe fn destroy(self, gl: &glow::Context) {
+        for texture in [self.luma_tex, self.chroma_tex, self.chroma_v_tex] {
+            gl.delete_texture(texture);
+        }
+    }
+
     fn probe(gl: &glow::Context) -> bool {
         linux_dmabuf_support(gl).is_ok()
     }
@@ -1618,7 +1717,7 @@ unsafe fn create_yuv_program(gl: &glow::Context) -> Result<glow::Program, String
         "{shader_header}layout(location = 0) in vec2 a_pos;\nlayout(location = 1) in vec2 a_uv;\nout vec2 v_uv;\nvoid main() {{\n    v_uv = a_uv;\n    gl_Position = vec4(a_pos, 0.0, 1.0);\n}}\n"
     );
     let fragment_src = format!(
-        "{shader_header}in vec2 v_uv;\nout vec4 frag_color;\nuniform sampler2D u_luma;\nuniform sampler2D u_chroma;\nuniform sampler2D u_chroma_v;\nuniform int u_mode;\nvec3 bt709_limited_to_rgb(float y, float u, float v) {{\n    float yy = max(y - 0.0625, 0.0) * 1.16438356;\n    return vec3(\n        yy + 1.79274107 * v,\n        yy - 0.21324861 * u - 0.53290933 * v,\n        yy + 2.11240179 * u\n    );\n}}\nvoid main() {{\n    float y = texture(u_luma, v_uv).r;\n    float u;\n    float v;\n    if (u_mode == 0) {{\n        u = texture(u_chroma, v_uv).r - 0.5;\n        v = texture(u_chroma_v, v_uv).r - 0.5;\n    }} else {{\n        vec2 uv = texture(u_chroma, v_uv).rg - vec2(0.5, 0.5);\n        u = uv.x;\n        v = uv.y;\n    }}\n    vec3 rgb = clamp(bt709_limited_to_rgb(y, u, v), 0.0, 1.0);\n    frag_color = vec4(rgb, 1.0);\n}}\n"
+        "{shader_header}in vec2 v_uv;\nout vec4 frag_color;\nuniform sampler2D u_luma;\nuniform sampler2D u_chroma;\nuniform sampler2D u_chroma_v;\nuniform int u_mode;\nuniform vec3 u_uv_x;\nuniform vec3 u_uv_y;\nvec3 bt709_limited_to_rgb(float y, float u, float v) {{\n    float yy = max(y - 0.0625, 0.0) * 1.16438356;\n    return vec3(\n        yy + 1.79274107 * v,\n        yy - 0.21324861 * u - 0.53290933 * v,\n        yy + 2.11240179 * u\n    );\n}}\nvoid main() {{\n    vec2 src = vec2(dot(u_uv_x.xy, v_uv) + u_uv_x.z, dot(u_uv_y.xy, v_uv) + u_uv_y.z);\n    if (u_mode == 2) {{\n        frag_color = vec4(texture(u_luma, src).rgb, 1.0);\n        return;\n    }}\n    float y = texture(u_luma, src).r;\n    float u;\n    float v;\n    if (u_mode == 0) {{\n        u = texture(u_chroma, src).r - 0.5;\n        v = texture(u_chroma_v, src).r - 0.5;\n    }} else {{\n        vec2 uv = texture(u_chroma, src).rg - vec2(0.5, 0.5);\n        u = uv.x;\n        v = uv.y;\n    }}\n    vec3 rgb = clamp(bt709_limited_to_rgb(y, u, v), 0.0, 1.0);\n    frag_color = vec4(rgb, 1.0);\n}}\n"
     );
 
     let vertex = gl

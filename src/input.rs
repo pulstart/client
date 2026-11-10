@@ -54,6 +54,8 @@ pub struct SharedInputSnapshot {
     pub controller_state: ControllerState,
     pub capabilities: InputCapabilities,
     pub stream_config: Option<StreamConfig>,
+    /// Bumped by every `StreamConfig`, including a re-sent unchanged one.
+    pub stream_config_version: u64,
     pub cursor_shape: Option<Arc<CursorShape>>,
     pub cursor_state: CursorState,
     pub cursor_shape_version: u64,
@@ -61,9 +63,10 @@ pub struct SharedInputSnapshot {
     /// Monitors the server can capture. Empty when the server can't enumerate
     /// (portal fallback) — the picker stays hidden.
     pub available_outputs: Vec<OutputInfo>,
-    /// The output currently captured (`OutputInfo::id`), as reported by the
-    /// server. `None` until the server tells us.
-    pub selected_output: Option<u32>,
+    /// The server can create virtual outputs for this client.
+    pub virtual_supported: bool,
+    /// An `AvailableOutputs` arrived (it may well have been empty).
+    pub outputs_received: bool,
 }
 
 impl Default for SharedInputSnapshot {
@@ -74,12 +77,14 @@ impl Default for SharedInputSnapshot {
             controller_state: ControllerState::Unavailable,
             capabilities: InputCapabilities::default(),
             stream_config: None,
+            stream_config_version: 0,
             cursor_shape: None,
             cursor_state: CursorState::default(),
             cursor_shape_version: 0,
             cursor_state_version: 0,
             available_outputs: Vec::new(),
-            selected_output: None,
+            virtual_supported: false,
+            outputs_received: false,
         }
     }
 }
@@ -126,7 +131,9 @@ impl SharedInputState {
     }
 
     pub fn set_stream_config(&self, stream_config: StreamConfig) {
-        self.inner.lock().unwrap().stream_config = Some(stream_config);
+        let mut inner = self.inner.lock().unwrap();
+        inner.stream_config = Some(stream_config);
+        inner.stream_config_version = inner.stream_config_version.wrapping_add(1);
     }
 
     pub fn set_cursor_shape(&self, cursor_shape: CursorShape) {
@@ -141,12 +148,11 @@ impl SharedInputState {
         inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
     }
 
-    pub fn set_available_outputs(&self, outputs: Vec<OutputInfo>) {
-        self.inner.lock().unwrap().available_outputs = outputs;
-    }
-
-    pub fn set_selected_output(&self, id: u32) {
-        self.inner.lock().unwrap().selected_output = Some(id);
+    pub fn set_available_outputs(&self, outputs: Vec<OutputInfo>, virtual_supported: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.available_outputs = outputs;
+        inner.virtual_supported = virtual_supported;
+        inner.outputs_received = true;
     }
 }
 
@@ -172,6 +178,16 @@ impl LocalKeyboardState {
         }
         self.pressed = [0u8; KEYBOARD_STATE_BYTES];
         true
+    }
+
+    /// Releases exactly the keys in `mask`, leaving every other key alone.
+    pub fn release_mask(&mut self, mask: &[u8; KEYBOARD_STATE_BYTES]) -> bool {
+        let mut changed = false;
+        for (byte, held) in self.pressed.iter_mut().zip(mask) {
+            changed |= *byte & held != 0;
+            *byte &= !held;
+        }
+        changed
     }
 
     pub fn pressed_count(&self) -> usize {
@@ -212,6 +228,23 @@ mod tests {
     fn is_down(keys: &LocalKeyboardState, key: KeyboardKey) -> bool {
         let (byte, bit) = key.bit();
         keys.pressed()[byte] & bit != 0
+    }
+
+    #[test]
+    fn releasing_a_mask_leaves_other_keys_down() {
+        let mut keys = LocalKeyboardState::default();
+        keys.set_key(KeyboardKey::LeftShift, true);
+        keys.set_key(KeyboardKey::Enter, true);
+        let mut mask = LocalKeyboardState::default();
+        mask.set_key(KeyboardKey::Enter, true);
+        mask.set_key(KeyboardKey::Escape, true);
+        assert!(keys.release_mask(&mask.pressed()));
+        assert!(is_down(&keys, KeyboardKey::LeftShift));
+        assert!(!is_down(&keys, KeyboardKey::Enter));
+        assert!(
+            !keys.release_mask(&mask.pressed()),
+            "nothing left to release"
+        );
     }
 
     #[test]

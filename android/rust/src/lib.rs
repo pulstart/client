@@ -2,8 +2,9 @@ use jni::objects::{JByteArray, JByteBuffer, JClass, JString};
 use jni::sys::{jboolean, jbyteArray, jint, jintArray, jlong, jstring};
 use jni::JNIEnv;
 use st_client_core::{
-    ApiConnectionConfig, Client, ClientConfig, ControlSnapshot, ControllerState, InputCapabilities,
-    LanDiscovery, QueuedAudioPacket as AudioPacket, TrackpadRoute, KEYBOARD_STATE_BYTES,
+    ApiConnectionConfig, AvailableOutputs, Client, ClientConfig, ControlSnapshot, ControllerState,
+    InputCapabilities, LanDiscovery, OutputInfo, QueuedAudioPacket as AudioPacket, StreamEvent,
+    TrackpadRoute, TransportKind, KEYBOARD_STATE_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -20,11 +21,13 @@ const MAX_AUDIO_POLL_MS: u64 = 50;
 const AUDIO_FILL_BUFFER_ERROR: jint = -1;
 const AUDIO_FILL_DECODE_ERROR: jint = -2;
 const AUDIO_FILL_RESYNC_FLAG: jint = 1 << 30;
-const CURSOR_SNAPSHOT_VERSION: u8 = 2;
+const CURSOR_SNAPSHOT_VERSION: u8 = 3;
 const SNAPSHOT_CAPABILITIES: u8 = 1 << 0;
 const SNAPSHOT_CONTROLLER_STATE: u8 = 1 << 1;
 const SNAPSHOT_CURSOR_SHAPE: u8 = 1 << 2;
 const SNAPSHOT_CURSOR_STATE: u8 = 1 << 3;
+const SNAPSHOT_OUTPUTS: u8 = 1 << 4;
+const STREAM_CONFIG_FIELDS: usize = 15;
 
 // Trackpad JNI result: mode in bits 0..7, absolute x in 8..23, y in 24..39.
 // Coordinates are normalized u16 values. Relative/rejected results leave them zero.
@@ -618,14 +621,18 @@ fn controller_state_code(state: ControllerState) -> u8 {
     }
 }
 
-/// JNI cursor snapshot v2. All integers are little-endian. The header is
+/// JNI control snapshot v3. All integers are little-endian. The header is
 /// `[version:u8][present_flags:u8][transport_generation:u32]`; present sections follow in bit order:
 /// capabilities `[revision:u64][flags:u8]`, controller
 /// `[revision:u64][state:u8]`, shape
 /// `[revision:u64][serial:u64][width:u16][height:u16][hotspot_x:u16]
-/// [hotspot_y:u16][rgba_len:u32][premultiplied_rgba8...]`, and state
+/// [hotspot_y:u16][rgba_len:u32][premultiplied_rgba8...]`, state
 /// `[revision:u64][serial:u64][x:i32][y:i32][flags:u8]` where state flag bit 0
-/// is visible and bit 1 is app_grab. Capability flag bit 6 is reliable committed
+/// is visible and bit 1 is app_grab, and outputs
+/// `[revision:u64][virtual_supported:u8][count:u16]` followed by `count` of
+/// `[id:u32][width:u32][height:u32][x:i32][y:i32][refresh_millihz:u32]
+/// [rotation:u8][flags:u8][name_len:u16][name utf-8]` where output flag bit 0
+/// is primary and bit 1 is virtual. Capability flag bit 6 is reliable committed
 /// Unicode text input.
 fn serialize_control_snapshot(snapshot: ControlSnapshot) -> Vec<u8> {
     let mut present = 0u8;
@@ -640,6 +647,9 @@ fn serialize_control_snapshot(snapshot: ControlSnapshot) -> Vec<u8> {
     }
     if snapshot.cursor_state.is_some() {
         present |= SNAPSHOT_CURSOR_STATE;
+    }
+    if snapshot.outputs.is_some() {
+        present |= SNAPSHOT_OUTPUTS;
     }
 
     let shape_len = snapshot
@@ -674,7 +684,68 @@ fn serialize_control_snapshot(snapshot: ControlSnapshot) -> Vec<u8> {
         bytes.extend_from_slice(&state.value.y.to_le_bytes());
         bytes.push(u8::from(state.value.visible) | (u8::from(state.value.app_grab) << 1));
     }
+    if let Some(outputs) = snapshot.outputs {
+        bytes.extend_from_slice(&outputs.revision.to_le_bytes());
+        write_outputs(&mut bytes, &outputs.value);
+    }
     bytes
+}
+
+fn write_outputs(bytes: &mut Vec<u8>, available: &AvailableOutputs) {
+    let count = available.outputs.len().min(u16::MAX as usize);
+    bytes.push(u8::from(available.virtual_supported));
+    bytes.extend_from_slice(&(count as u16).to_le_bytes());
+    for output in &available.outputs[..count] {
+        write_output(bytes, output);
+    }
+}
+
+fn write_output(bytes: &mut Vec<u8>, output: &OutputInfo) {
+    let name = output.name.as_bytes();
+    let name_len = name.len().min(u16::MAX as usize);
+    bytes.extend_from_slice(&output.id.to_le_bytes());
+    bytes.extend_from_slice(&output.width.to_le_bytes());
+    bytes.extend_from_slice(&output.height.to_le_bytes());
+    bytes.extend_from_slice(&output.x.to_le_bytes());
+    bytes.extend_from_slice(&output.y.to_le_bytes());
+    bytes.extend_from_slice(&output.refresh_millihz.to_le_bytes());
+    bytes.push(output.rotation);
+    bytes.push(u8::from(output.is_primary) | (u8::from(output.is_virtual) << 1));
+    bytes.extend_from_slice(&(name_len as u16).to_le_bytes());
+    bytes.extend_from_slice(&name[..name_len]);
+}
+
+fn transport_code(kind: TransportKind) -> jint {
+    match kind {
+        TransportKind::Direct => 1,
+        TransportKind::DirectTcpTunnel => 2,
+        TransportKind::ApiPunch => 3,
+        TransportKind::ApiRelay => 4,
+    }
+}
+
+/// `nativeTakeStreamConfig` layout: transport generation, stream generation,
+/// video epoch high/low words, encoded width/height, upright (cursor) width/height,
+/// framerate, audio rate/channels/packet ms, output id (u32 bits), rotation (quarter
+/// turns), transport code (1 direct, 2 direct TCP tunnel, 3 API punch, 4 API relay).
+fn stream_event_values(event: &StreamEvent) -> [jint; STREAM_CONFIG_FIELDS] {
+    [
+        event.transport_generation as jint,
+        event.generation as jint,
+        (event.video_epoch >> 32) as u32 as jint,
+        event.video_epoch as u32 as jint,
+        event.width as jint,
+        event.height as jint,
+        event.cursor_width as jint,
+        event.cursor_height as jint,
+        event.framerate as jint,
+        event.audio_sample_rate as jint,
+        event.audio_channels as jint,
+        event.packet_duration_ms as jint,
+        event.output_id as jint,
+        event.rotation as jint,
+        transport_code(event.transport),
+    ]
 }
 
 #[no_mangle]
@@ -701,6 +772,10 @@ pub extern "system" fn Java_io_kubemaxx_st_NativeBridge_nativeStart(
     client_peer_id: JString<'_>,
     host_peer_id: JString<'_>,
     request_nonce: jlong,
+    output_id: jlong,
+    aux: jboolean,
+    display_width: jint,
+    display_height: jint,
 ) -> jstring {
     jni_boundary!(java_string(&env, "native session failure"), {
         let Some(session) = session(handle) else {
@@ -740,12 +815,20 @@ pub extern "system" fn Java_io_kubemaxx_st_NativeBridge_nativeStart(
             })
         };
 
+        let Ok(output_id) = u32::try_from(output_id) else {
+            return java_string(&env, "invalid output id");
+        };
+
         let epoch = session.invalidate();
         match Client::start(ClientConfig {
             server: (!server.is_empty()).then_some(server),
             api,
             token,
             refresh_millihz: refresh_millihz.max(0) as u32,
+            output_id,
+            aux: aux != 0,
+            display_width: display_width.max(0) as u32,
+            display_height: display_height.max(0) as u32,
         }) {
             Ok(client) => match session.install_client(epoch, client) {
                 Ok(()) => ptr::null_mut(),
@@ -869,24 +952,13 @@ pub extern "system" fn Java_io_kubemaxx_st_NativeBridge_nativeTakeStreamConfig(
         else {
             return ptr::null_mut();
         };
-        let Ok(array) = env.new_int_array(12) else {
+        let Ok(array) = env.new_int_array(STREAM_CONFIG_FIELDS as jint) else {
             return ptr::null_mut();
         };
-        let values = [
-            config.transport_generation as jint,
-            config.generation as jint,
-            (config.video_epoch >> 32) as u32 as jint,
-            config.video_epoch as u32 as jint,
-            config.width as jint,
-            config.height as jint,
-            config.cursor_width as jint,
-            config.cursor_height as jint,
-            config.framerate as jint,
-            config.audio_sample_rate as jint,
-            config.audio_channels as jint,
-            config.packet_duration_ms as jint,
-        ];
-        if env.set_int_array_region(&array, 0, &values).is_err() {
+        if env
+            .set_int_array_region(&array, 0, &stream_event_values(&config))
+            .is_err()
+        {
             return ptr::null_mut();
         }
         array.into_raw()
@@ -1276,6 +1348,27 @@ pub extern "system" fn Java_io_kubemaxx_st_NativeBridge_nativeRequestKeyframe(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_io_kubemaxx_st_NativeBridge_nativeSelectOutput(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    epoch: jlong,
+    output_id: jlong,
+) -> jboolean {
+    jni_boundary!(0, {
+        let Ok(output_id) = u32::try_from(output_id) else {
+            return 0;
+        };
+        let Some(sent) = session(handle).and_then(|session| {
+            session.with_client(epoch, |client| client.select_output(output_id).is_ok())
+        }) else {
+            return 0;
+        };
+        u8::from(sent)
+    })
+}
+
+#[no_mangle]
 pub extern "system" fn Java_io_kubemaxx_st_NativeBridge_nativeAcceptStreamGeneration(
     _env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -1412,6 +1505,100 @@ mod tests {
     }
 
     #[test]
+    fn control_snapshot_serializes_outputs_section() {
+        use st_client_core::Revised;
+
+        let snapshot = ControlSnapshot {
+            transport_generation: 3,
+            outputs: Some(Revised {
+                revision: 0x0102,
+                value: AvailableOutputs {
+                    virtual_supported: true,
+                    outputs: vec![
+                        OutputInfo {
+                            id: 0xA1B2_C3D4,
+                            name: "DP-1".into(),
+                            width: 2560,
+                            height: 1440,
+                            x: -1920,
+                            y: 12,
+                            is_primary: true,
+                            is_virtual: false,
+                            refresh_millihz: 143_856,
+                            rotation: 1,
+                        },
+                        OutputInfo {
+                            id: 2,
+                            name: "Virtuell \u{fc}".into(),
+                            width: 1280,
+                            height: 720,
+                            x: 0,
+                            y: 0,
+                            is_primary: false,
+                            is_virtual: true,
+                            refresh_millihz: 0,
+                            rotation: 0,
+                        },
+                    ],
+                },
+            }),
+            ..ControlSnapshot::default()
+        };
+        let bytes = serialize_control_snapshot(snapshot);
+
+        let mut expected = vec![CURSOR_SNAPSHOT_VERSION, SNAPSHOT_OUTPUTS, 3, 0, 0, 0];
+        expected.extend_from_slice(&0x0102u64.to_le_bytes());
+        expected.push(1);
+        expected.extend_from_slice(&2u16.to_le_bytes());
+        expected.extend_from_slice(&0xA1B2_C3D4u32.to_le_bytes());
+        expected.extend_from_slice(&2560u32.to_le_bytes());
+        expected.extend_from_slice(&1440u32.to_le_bytes());
+        expected.extend_from_slice(&(-1920i32).to_le_bytes());
+        expected.extend_from_slice(&12i32.to_le_bytes());
+        expected.extend_from_slice(&143_856u32.to_le_bytes());
+        expected.extend_from_slice(&[1, 0b01]);
+        expected.extend_from_slice(&4u16.to_le_bytes());
+        expected.extend_from_slice(b"DP-1");
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&1280u32.to_le_bytes());
+        expected.extend_from_slice(&720u32.to_le_bytes());
+        expected.extend_from_slice(&0i32.to_le_bytes());
+        expected.extend_from_slice(&0i32.to_le_bytes());
+        expected.extend_from_slice(&0u32.to_le_bytes());
+        expected.extend_from_slice(&[0, 0b10]);
+        let name = "Virtuell \u{fc}".as_bytes();
+        expected.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        expected.extend_from_slice(name);
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn stream_event_values_expose_output_rotation_and_transport() {
+        let event = StreamEvent {
+            transport_generation: 4,
+            transport: TransportKind::ApiRelay,
+            generation: 5,
+            video_epoch: 0x0000_0001_0000_0002,
+            width: 1920,
+            height: 1080,
+            cursor_width: 1080,
+            cursor_height: 1920,
+            output_id: 0xFFFF_FFFE,
+            rotation: 3,
+            framerate: 60,
+            audio_sample_rate: 48_000,
+            audio_channels: 2,
+            packet_duration_ms: 20,
+        };
+        let values = stream_event_values(&event);
+        assert_eq!(
+            values,
+            [4, 5, 1, 2, 1920, 1080, 1080, 1920, 60, 48_000, 2, 20, -2, 3, 4]
+        );
+        assert_eq!(values[12] as u32, 0xFFFF_FFFE);
+    }
+
+    #[test]
     fn blocking_media_receives_do_not_hold_session_state() {
         let session = Arc::new(Session::new());
         let epoch = session.invalidate();
@@ -1420,6 +1607,10 @@ mod tests {
             api: None,
             token: "test-token".into(),
             refresh_millihz: 60_000,
+            output_id: 0,
+            aux: false,
+            display_width: 0,
+            display_height: 0,
         })
         .unwrap();
         assert!(session.install_client(epoch, client).is_ok());

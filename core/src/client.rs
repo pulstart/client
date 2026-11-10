@@ -9,13 +9,14 @@ use st_protocol::tcp_tunnel::{TcpTunnel, TunnelLink, TCP_TUNNEL_PREAMBLE};
 use st_protocol::{
     ClientDisplayInfo, ClockSyncPing, ControlMessage, ControllerState, CursorShape, CursorState,
     InputCapabilities, InputCredential, InputPacket, KeyboardKey, KeyboardStateInput,
-    MouseAbsoluteInput, MouseButtonsInput, MouseRelativeInput, MouseWheelInput, StreamConfig,
-    VideoChromaSampling, VideoCodec, VideoCodecSupport, KEYBOARD_STATE_BYTES, MAX_TEXT_INPUT_BYTES,
+    MouseAbsoluteInput, MouseButtonsInput, MouseRelativeInput, MouseWheelInput, OutputInfo,
+    StreamConfig, VideoChromaSampling, VideoCodec, VideoCodecSupport, KEYBOARD_STATE_BYTES,
+    MAX_TEXT_INPUT_BYTES, OUTPUT_DEFAULT, OUTPUT_VIRTUAL,
 };
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -117,17 +118,52 @@ pub struct ClientConfig {
     pub api: Option<ApiConnectionConfig>,
     pub token: String,
     pub refresh_millihz: u32,
+    /// Output to stream: an `OutputInfo::id`, `OUTPUT_DEFAULT` or `OUTPUT_VIRTUAL`.
+    pub output_id: u32,
+    /// Video-only companion session: no audio, no input, no control.
+    pub aux: bool,
+    /// Pixel size of the local display showing this stream; sizes a virtual output.
+    pub display_width: u32,
+    pub display_height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TransportKind {
+    Direct,
+    DirectTcpTunnel,
+    ApiPunch,
+    ApiRelay,
+}
+
+impl TransportKind {
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::DirectTcpTunnel,
+            2 => Self::ApiPunch,
+            3 => Self::ApiRelay,
+            _ => Self::Direct,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamEvent {
     pub transport_generation: u32,
+    pub transport: TransportKind,
     pub generation: u32,
     pub video_epoch: u64,
+    /// Encoded picture size.
     pub width: u32,
     pub height: u32,
+    /// Upright picture size (after `rotation`): the space cursor and pointer
+    /// coordinates live in.
     pub cursor_width: u32,
     pub cursor_height: u32,
+    /// `OutputInfo::id` this stream shows; 0 when the server cannot enumerate.
+    pub output_id: u32,
+    /// Clockwise quarter turns that make the decoded picture upright.
+    pub rotation: u8,
     pub framerate: u16,
     pub audio_sample_rate: u32,
     pub audio_channels: u8,
@@ -147,12 +183,19 @@ pub struct Revised<T> {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AvailableOutputs {
+    pub outputs: Vec<OutputInfo>,
+    pub virtual_supported: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ControlSnapshot {
     pub transport_generation: u32,
     pub input_capabilities: Option<Revised<InputCapabilities>>,
     pub controller_state: Option<Revised<ControllerState>>,
     pub cursor_shape: Option<Revised<CursorShape>>,
     pub cursor_state: Option<Revised<CursorState>>,
+    pub outputs: Option<Revised<AvailableOutputs>>,
 }
 
 impl ControlSnapshot {
@@ -161,6 +204,7 @@ impl ControlSnapshot {
             && self.controller_state.is_none()
             && self.cursor_shape.is_none()
             && self.cursor_state.is_none()
+            && self.outputs.is_none()
     }
 }
 
@@ -210,6 +254,7 @@ struct ControlState {
     controller_state: RevisionedValue<ControllerState>,
     cursor_shape: RevisionedValue<CursorShape>,
     cursor_state: RevisionedValue<CursorState>,
+    outputs: RevisionedValue<AvailableOutputs>,
 }
 
 #[derive(Clone, Copy)]
@@ -263,6 +308,7 @@ impl ControlState {
             controller_state: self.controller_state.take_changed(),
             cursor_shape: self.cursor_shape.take_changed(),
             cursor_state: self.cursor_state.take_changed(),
+            outputs: self.outputs.take_changed(),
         };
         (transport_changed || !snapshot.is_empty()).then_some(snapshot)
     }
@@ -284,6 +330,7 @@ enum Command {
     RequestKeyframe,
     SetAudio(bool),
     TextInput(String),
+    SelectOutput(u32),
     Stop,
 }
 
@@ -324,6 +371,11 @@ struct Shared {
     last_stream_generation: AtomicU32,
     transport_generation: AtomicU32,
     audio_enabled_requested: AtomicBool,
+    aux: bool,
+    /// Output the next transport session asks for; follows the confirmed stream
+    /// so a transport fallback does not silently move back to the first choice.
+    output_id: AtomicU32,
+    transport: AtomicU8,
 }
 
 pub struct Client {
@@ -366,6 +418,9 @@ impl Client {
             last_stream_generation: AtomicU32::new(0),
             transport_generation: AtomicU32::new(1),
             audio_enabled_requested: AtomicBool::new(false),
+            aux: config.aux,
+            output_id: AtomicU32::new(config.output_id),
+            transport: AtomicU8::new(TransportKind::Direct as u8),
         });
         let client = Arc::new(Self {
             shared: Arc::clone(&shared),
@@ -435,6 +490,13 @@ impl Client {
     }
 
     pub fn set_audio_enabled(&self, enabled: bool) -> Result<(), String> {
+        if self.shared.aux {
+            return if enabled {
+                Err("aux sessions carry no audio".into())
+            } else {
+                Ok(())
+            };
+        }
         if enabled && self.status() != "connected" {
             return Err("audio is unavailable while disconnected".into());
         }
@@ -458,9 +520,7 @@ impl Client {
     }
 
     pub fn send_mouse_absolute(&self, x: u16, y: u16, buttons: u8) -> Result<(), String> {
-        if self.status() != "connected" {
-            return Err("input is unavailable while disconnected".into());
-        }
+        self.ensure_input_session()?;
         let mut router = self.shared.trackpad_router.lock().unwrap();
         if !router.eligibility().allows_absolute() {
             return Err("absolute mouse input is unavailable".into());
@@ -477,9 +537,7 @@ impl Client {
         dy: i16,
         buttons: u8,
     ) -> Result<TrackpadRoute, String> {
-        if self.status() != "connected" {
-            return Err("input is unavailable while disconnected".into());
-        }
+        self.ensure_input_session()?;
         let mut router = self.shared.trackpad_router.lock().unwrap();
         let (route, mouse) = router
             .route_trackpad_delta(dx, dy, buttons)
@@ -491,9 +549,7 @@ impl Client {
     }
 
     pub fn send_mouse_buttons(&self, buttons: u8) -> Result<(), String> {
-        if self.status() != "connected" {
-            return Err("input is unavailable while disconnected".into());
-        }
+        self.ensure_input_session()?;
         if !self
             .shared
             .trackpad_router
@@ -510,9 +566,7 @@ impl Client {
     }
 
     pub fn send_mouse_wheel(&self, delta_x: i16, delta_y: i16, buttons: u8) -> Result<(), String> {
-        if self.status() != "connected" {
-            return Err("input is unavailable while disconnected".into());
-        }
+        self.ensure_input_session()?;
         if !self
             .shared
             .trackpad_router
@@ -533,9 +587,7 @@ impl Client {
     }
 
     pub fn send_keyboard_state(&self, pressed: [u8; KEYBOARD_STATE_BYTES]) -> Result<(), String> {
-        if self.status() != "connected" {
-            return Err("input is unavailable while disconnected".into());
-        }
+        self.ensure_input_session()?;
         if !keyboard_state_is_valid(&pressed) {
             return Err("keyboard state contains unsupported keys".into());
         }
@@ -557,9 +609,7 @@ impl Client {
     }
 
     pub fn send_text_input(&self, text: String) -> Result<(), String> {
-        if self.status() != "connected" {
-            return Err("text input is unavailable while disconnected".into());
-        }
+        self.ensure_input_session()?;
         validate_text_input(&text)?;
         if !self
             .shared
@@ -574,6 +624,22 @@ impl Client {
         self.command_tx
             .try_send(Command::TextInput(text))
             .map_err(|error| format!("text input queue unavailable: {error}"))
+    }
+
+    /// Move this connection's stream to another output. The server answers with
+    /// a `StreamConfig` naming the output that is streamed afterwards.
+    pub fn select_output(&self, output_id: u32) -> Result<(), String> {
+        if output_id == OUTPUT_DEFAULT || output_id == OUTPUT_VIRTUAL {
+            return Err("output id is reserved".into());
+        }
+        if self.status() != "connected" {
+            return Err("output selection is unavailable while disconnected".into());
+        }
+        self.command_tx
+            .try_send(Command::SelectOutput(output_id))
+            .map_err(|error| format!("output selection queue unavailable: {error}"))?;
+        self.shared.output_id.store(output_id, Ordering::Release);
+        Ok(())
     }
 
     pub fn accept_stream_generation(&self, generation: u32, video_epoch: u64) -> bool {
@@ -599,6 +665,16 @@ impl Client {
 
     pub fn request_keyframe(&self) {
         let _ = self.command_tx.try_send(Command::RequestKeyframe);
+    }
+
+    fn ensure_input_session(&self) -> Result<(), String> {
+        if self.shared.aux {
+            return Err("aux sessions never send input".into());
+        }
+        if self.status() != "connected" {
+            return Err("input is unavailable while disconnected".into());
+        }
+        Ok(())
     }
 }
 
@@ -634,6 +710,7 @@ fn run_worker(shared: Arc<Shared>, config: ClientConfig) {
 fn run_session(shared: &Arc<Shared>, config: &ClientConfig) -> Result<(), SessionFailure> {
     let mut previous_failure = None;
     if let Some(server) = config.server.as_deref() {
+        set_transport(shared, TransportKind::Direct);
         let direct_result = SessionTransport::connect_direct(server)
             .map_err(|error| SessionFailure::transport(SessionStage::DirectConnect, error))
             .and_then(|mut transport| run_transport_session(shared, config, &mut transport));
@@ -646,6 +723,7 @@ fn run_session(shared: &Arc<Shared>, config: &ClientConfig) -> Result<(), Sessio
 
         if should_try_direct_tcp_tunnel(&direct_failure) {
             reset_for_transport_fallback(shared, "connecting through direct TCP tunnel");
+            set_transport(shared, TransportKind::DirectTcpTunnel);
             let tunnel_result = SessionTransport::connect_direct_tunnel(server)
                 .map_err(|error| SessionFailure::transport(SessionStage::DirectTcpTunnel, error))
                 .and_then(|mut transport| run_transport_session(shared, config, &mut transport));
@@ -671,6 +749,7 @@ fn run_session(shared: &Arc<Shared>, config: &ClientConfig) -> Result<(), Sessio
         })
     })?;
     reset_for_transport_fallback(shared, "connecting through API punch");
+    set_transport(shared, TransportKind::ApiPunch);
     let punch_result = crate::api_tunnel::connect_punch(api, &config.token, &shared.stop)
         .map_err(|error| SessionFailure::transport(SessionStage::ApiPunch, error));
     let punch_failure = match punch_result {
@@ -690,6 +769,7 @@ fn run_session(shared: &Arc<Shared>, config: &ClientConfig) -> Result<(), Sessio
     };
 
     reset_for_transport_fallback(shared, "connecting through API relay");
+    set_transport(shared, TransportKind::ApiRelay);
     let connection =
         crate::api_tunnel::connect_relay(api, &config.token, &shared.stop).map_err(|error| {
             SessionFailure::transport(
@@ -737,8 +817,31 @@ fn run_transport_session(
     transport: &mut SessionTransport,
 ) -> Result<(), SessionFailure> {
     let result = run_transport_session_inner(shared, config, transport);
-    graceful_release(transport);
+    if !config.aux {
+        graceful_release(transport);
+    }
     result
+}
+
+fn client_display_info(config: &ClientConfig, output_id: u32, udp_port: u16) -> ClientDisplayInfo {
+    let codecs = VideoCodecSupport::h264_only();
+    ClientDisplayInfo {
+        max_refresh_millihz: config.refresh_millihz,
+        udp_port,
+        supported_video_codecs: codecs,
+        hardware_video_codecs: codecs,
+        supported_yuv444_video_codecs: VideoCodecSupport::empty(),
+        hardware_yuv444_video_codecs: VideoCodecSupport::empty(),
+        hdr_display: false,
+        aux: config.aux,
+        output_id,
+        width: config.display_width,
+        height: config.display_height,
+    }
+}
+
+fn set_transport(shared: &Shared, kind: TransportKind) {
+    shared.transport.store(kind as u8, Ordering::Release);
 }
 
 fn run_transport_session_inner(
@@ -752,17 +855,12 @@ fn run_transport_session_inner(
     let mut deferred = VecDeque::new();
     authenticate(transport, &mut deferred, shared)?;
 
-    let codecs = VideoCodecSupport::h264_only();
     transport
-        .send_control(ControlMessage::ClientDisplayInfo(ClientDisplayInfo {
-            max_refresh_millihz: config.refresh_millihz,
-            udp_port: transport.udp_port(),
-            supported_video_codecs: codecs,
-            hardware_video_codecs: codecs,
-            supported_yuv444_video_codecs: VideoCodecSupport::empty(),
-            hardware_yuv444_video_codecs: VideoCodecSupport::empty(),
-            hdr_display: false,
-        }))
+        .send_control(ControlMessage::ClientDisplayInfo(client_display_info(
+            config,
+            shared.output_id.load(Ordering::Acquire),
+            transport.udp_port(),
+        )))
         .map_err(|error| SessionFailure::transport(SessionStage::Startup, error))?;
 
     let mut session = SessionState::new(transport.peer().ip());
@@ -806,11 +904,13 @@ fn run_transport_session_inner(
         transport.pace();
     }
 
-    transport
-        .send_control(ControlMessage::SetAudio(
-            shared.audio_enabled_requested.load(Ordering::Acquire),
-        ))
-        .map_err(|error| SessionFailure::transport(SessionStage::Startup, error))?;
+    if !config.aux {
+        transport
+            .send_control(ControlMessage::SetAudio(
+                shared.audio_enabled_requested.load(Ordering::Acquire),
+            ))
+            .map_err(|error| SessionFailure::transport(SessionStage::Startup, error))?;
+    }
     send_media_bootstrap(transport, &session, &mut input_seq);
     set_status(shared, "connected");
     let mut next_ping = Instant::now();
@@ -847,6 +947,11 @@ fn run_transport_session_inner(
                 }))
                 .map_err(|error| SessionFailure::transport(SessionStage::Connected, error))?;
             next_ping = Instant::now() + Duration::from_secs(2);
+            // An aux session sends no input, so nothing else keeps the return
+            // path to its media port open through a NAT or stateful firewall.
+            if config.aux {
+                send_media_bootstrap(transport, &session, &mut input_seq);
+            }
         }
         transport.pace();
     }
@@ -1093,7 +1198,7 @@ impl TrackpadRouter {
     }
 
     fn set_stream_config(&mut self, config: StreamConfig) {
-        let extent = (config.width, config.height);
+        let extent = config.display_size();
         if let Some(previous) = self.stream_extent {
             if previous != extent {
                 self.absolute_target = self.absolute_target.and_then(|(x, y)| {
@@ -1383,16 +1488,18 @@ fn publish_stream_event(session: &SessionState, shared: &Shared) {
     let Some(config) = session.stream_config else {
         return;
     };
+    let (cursor_width, cursor_height) = config.display_size();
     *shared.stream_event.lock().unwrap() = Some(StreamEvent {
         transport_generation: shared.transport_generation.load(Ordering::Acquire),
+        transport: TransportKind::from_code(shared.transport.load(Ordering::Acquire)),
         generation: session.generation,
         video_epoch: config.video_epoch,
         width: config.width,
         height: config.height,
-        // CursorState uses these same stream-space dimensions today,
-        // but presentation needs the two coordinate spaces explicit.
-        cursor_width: config.width,
-        cursor_height: config.height,
+        cursor_width,
+        cursor_height,
+        output_id: config.output_id,
+        rotation: config.rotation,
         framerate: config.framerate,
         audio_sample_rate: config.audio_sample_rate,
         audio_channels: config.audio_channels,
@@ -1423,12 +1530,15 @@ fn handle_control_message(
                 .lock()
                 .unwrap()
                 .set_stream_config(config);
-            if audio_changed {
-                clear_audio_queue(shared);
+            if !shared.aux {
+                if audio_changed {
+                    clear_audio_queue(shared);
+                }
+                shared
+                    .audio_queue
+                    .set_limit(audio_queue_limit(config.packet_duration_ms));
             }
-            shared
-                .audio_queue
-                .set_limit(audio_queue_limit(config.packet_duration_ms));
+            follow_streamed_output(shared, config.output_id);
             if decoder_changed {
                 session.generation = next_stream_generation(shared);
             }
@@ -1506,6 +1616,20 @@ fn handle_control_message(
                 .cursor_state
                 .set(cursor);
         }
+        ControlMessage::AvailableOutputs {
+            outputs,
+            virtual_supported,
+        } => {
+            shared
+                .control_state
+                .lock()
+                .unwrap()
+                .outputs
+                .set(AvailableOutputs {
+                    outputs,
+                    virtual_supported,
+                });
+        }
         ControlMessage::ClockSyncPong(pong) => {
             let now = unix_time_micros();
             let round_trip = now.saturating_sub(pong.client_send_micros);
@@ -1522,6 +1646,12 @@ fn handle_control_message(
         _ => {}
     }
     Ok(())
+}
+
+fn follow_streamed_output(shared: &Shared, streamed: u32) {
+    if streamed != OUTPUT_DEFAULT && shared.output_id.load(Ordering::Acquire) != OUTPUT_VIRTUAL {
+        shared.output_id.store(streamed, Ordering::Release);
+    }
 }
 
 fn validate_stream_config(config: StreamConfig) -> Result<(), String> {
@@ -1549,6 +1679,7 @@ fn decoder_configs_compatible(previous: StreamConfig, next: StreamConfig) -> boo
         && previous.height == next.height
         && previous.hdr == next.hdr
         && previous.chroma == next.chroma
+        && previous.rotation == next.rotation
 }
 
 fn audio_configs_compatible(previous: StreamConfig, next: StreamConfig) -> bool {
@@ -1734,6 +1865,7 @@ fn drain_commands(
                     x,
                     y,
                     buttons,
+                    output_id: 0,
                 }),
                 buttons,
             ),
@@ -1824,6 +1956,9 @@ fn drain_commands(
             }
             Ok(Command::TextInput(text)) => {
                 transport.send_control(ControlMessage::TextInput(text))?;
+            }
+            Ok(Command::SelectOutput(output_id)) => {
+                transport.send_control(ControlMessage::SelectOutput(output_id))?;
             }
             Ok(Command::Stop) | Err(TryRecvError::Disconnected) => return Ok(()),
             Err(TryRecvError::Empty) => return Ok(()),
@@ -2019,8 +2154,12 @@ fn validate_text_input(text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A tunnel has no connection close for the server to see: without the
+/// goodbye it keeps the session (and streams into the void) until its
+/// silence timeout.
 fn graceful_release(transport: &mut SessionTransport) {
     let _ = transport.send_control(ControlMessage::ReleaseControl);
+    let _ = transport.send_control(ControlMessage::Shutdown);
     transport.flush_control(Duration::from_millis(250));
 }
 
@@ -2305,6 +2444,9 @@ mod tests {
                 last_stream_generation: AtomicU32::new(0),
                 transport_generation: AtomicU32::new(1),
                 audio_enabled_requested: AtomicBool::new(false),
+                aux: false,
+                output_id: AtomicU32::new(0),
+                transport: AtomicU8::new(0),
             }),
             command_tx,
             mouse_tx,
@@ -2323,6 +2465,8 @@ mod tests {
             hdr: false,
             chroma: VideoChromaSampling::Yuv420,
             packet_duration_ms: 20,
+            output_id: 7,
+            rotation: 0,
         }
     }
 
@@ -2589,6 +2733,8 @@ mod tests {
             hdr: false,
             chroma: VideoChromaSampling::Yuv420,
             packet_duration_ms: 20,
+            output_id: 7,
+            rotation: 0,
         };
         assert!(validate_stream_config(valid).is_ok());
         assert!(validate_stream_config(StreamConfig {
@@ -3001,6 +3147,9 @@ mod tests {
             last_stream_generation: AtomicU32::new(0),
             transport_generation: AtomicU32::new(1),
             audio_enabled_requested: AtomicBool::new(false),
+            aux: false,
+            output_id: AtomicU32::new(0),
+            transport: AtomicU8::new(0),
         };
         let mut session = SessionState::new("127.0.0.1".parse().unwrap());
         let capabilities = InputCapabilities {
@@ -3113,6 +3262,9 @@ mod tests {
             last_stream_generation: AtomicU32::new(0),
             transport_generation: AtomicU32::new(1),
             audio_enabled_requested: AtomicBool::new(true),
+            aux: false,
+            output_id: AtomicU32::new(0),
+            transport: AtomicU8::new(0),
         };
         for seq in 0..AUDIO_QUEUE_MAX_CAPACITY as u16 + 3 {
             queue_audio_packet(
@@ -3284,6 +3436,7 @@ mod tests {
                 x: 10,
                 y: 20,
                 buttons: 1,
+                output_id: 0,
             }),
             1,
         );
@@ -3311,6 +3464,7 @@ mod tests {
                 x: 10,
                 y: 20,
                 buttons: 1,
+                output_id: 0,
             }),
             1,
         ));
@@ -3477,6 +3631,10 @@ mod tests {
                     api: None,
                     token: "test-token".into(),
                     refresh_millihz: 60_000,
+                    output_id: 0,
+                    aux: false,
+                    display_width: 0,
+                    display_height: 0,
                 },
                 &mut transport,
             )
@@ -3558,6 +3716,8 @@ mod tests {
                 hdr: false,
                 chroma: VideoChromaSampling::Yuv420,
                 packet_duration_ms: 20,
+                output_id: 0,
+                rotation: 0,
             };
             for message in [
                 ControlMessage::StreamConfig(config),
@@ -3625,6 +3785,7 @@ mod tests {
                             x: 100,
                             y: 200,
                             buttons: 1,
+                            output_id: 0,
                         }
                     );
                     break;
@@ -3680,6 +3841,10 @@ mod tests {
             api: None,
             token: "test-token".into(),
             refresh_millihz: 60_000,
+            output_id: 0,
+            aux: false,
+            display_width: 0,
+            display_height: 0,
         })
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -3704,6 +3869,449 @@ mod tests {
         client.send_text_input("e\u{301} 中文 😀".into()).unwrap();
         server.join().unwrap();
         client.stop();
+    }
+
+    fn output(id: u32, name: &str, width: u32, height: u32, is_virtual: bool) -> OutputInfo {
+        OutputInfo {
+            id,
+            name: name.into(),
+            width,
+            height,
+            x: 0,
+            y: 0,
+            is_primary: id == 1,
+            is_virtual,
+            refresh_millihz: 60_000,
+            rotation: 0,
+        }
+    }
+
+    fn take_event(shared: &Shared) -> StreamEvent {
+        shared.stream_event.lock().unwrap().take().unwrap()
+    }
+
+    #[test]
+    fn stream_event_carries_output_rotation_and_upright_cursor_space() {
+        let (shared, _, _) = test_shared();
+        set_transport(&shared, TransportKind::ApiPunch);
+        let mut session = SessionState::new("127.0.0.1".parse().unwrap());
+        let config = StreamConfig {
+            output_id: 9,
+            rotation: 1,
+            ..test_stream_config(1920, 1080)
+        };
+        handle_control_message(ControlMessage::StreamConfig(config), &mut session, &shared)
+            .unwrap();
+
+        let event = take_event(&shared);
+        assert_eq!((event.width, event.height), (1920, 1080));
+        assert_eq!((event.cursor_width, event.cursor_height), (1080, 1920));
+        assert_eq!((event.output_id, event.rotation), (9, 1));
+        assert_eq!(event.transport, TransportKind::ApiPunch);
+        assert_eq!(
+            shared.trackpad_router.lock().unwrap().stream_extent,
+            Some((1080, 1920))
+        );
+    }
+
+    #[test]
+    fn rotation_change_restarts_decoder_at_the_same_encoded_size() {
+        let (shared, _, _) = test_shared();
+        let mut session = SessionState::new("127.0.0.1".parse().unwrap());
+        let upright = test_stream_config(1920, 1080);
+        handle_control_message(ControlMessage::StreamConfig(upright), &mut session, &shared)
+            .unwrap();
+        let first = take_event(&shared);
+
+        let turned = StreamConfig {
+            rotation: 3,
+            video_epoch: 2,
+            ..upright
+        };
+        handle_control_message(ControlMessage::StreamConfig(turned), &mut session, &shared)
+            .unwrap();
+        let second = take_event(&shared);
+        assert_eq!(second.generation, first.generation + 1);
+        assert_eq!(second.rotation, 3);
+        assert_eq!((second.cursor_width, second.cursor_height), (1080, 1920));
+        assert!(session.waiting_for_recovery);
+    }
+
+    #[test]
+    fn output_switch_on_a_new_epoch_keeps_the_decoder_and_reports_the_output() {
+        let (shared, _, _) = test_shared();
+        let mut session = SessionState::new("127.0.0.1".parse().unwrap());
+        let first_config = test_stream_config(1920, 1080);
+        handle_control_message(
+            ControlMessage::StreamConfig(first_config),
+            &mut session,
+            &shared,
+        )
+        .unwrap();
+        let first = take_event(&shared);
+
+        let switched = StreamConfig {
+            output_id: 12,
+            video_epoch: 2,
+            ..first_config
+        };
+        handle_control_message(
+            ControlMessage::StreamConfig(switched),
+            &mut session,
+            &shared,
+        )
+        .unwrap();
+        let second = take_event(&shared);
+        assert_eq!(second.generation, first.generation);
+        assert_eq!(second.video_epoch, 2);
+        assert_eq!(second.output_id, 12);
+        assert_eq!(shared.accepted_video_epoch.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn failed_switch_resend_republishes_the_unchanged_output() {
+        let (shared, _, _) = test_shared();
+        let mut session = SessionState::new("127.0.0.1".parse().unwrap());
+        let config = test_stream_config(1920, 1080);
+        handle_control_message(ControlMessage::StreamConfig(config), &mut session, &shared)
+            .unwrap();
+        let first = take_event(&shared);
+        shared
+            .accepted_generation
+            .store(first.generation, Ordering::Release);
+        shared
+            .accepted_video_epoch
+            .store(first.video_epoch, Ordering::Release);
+        session.waiting_for_recovery = false;
+
+        handle_control_message(ControlMessage::StreamConfig(config), &mut session, &shared)
+            .unwrap();
+        assert_eq!(take_event(&shared), first);
+        assert_eq!(shared.accepted_video_epoch.load(Ordering::Acquire), 1);
+        assert!(!session.waiting_for_recovery);
+    }
+
+    #[test]
+    fn available_outputs_are_revisioned_control_state() {
+        let (shared, _, _) = test_shared();
+        let mut session = SessionState::new("127.0.0.1".parse().unwrap());
+        let outputs = vec![
+            output(1, "DP-1", 2560, 1440, false),
+            output(2, "HDMI-A-1", 1920, 1080, false),
+        ];
+        let announce = |outputs: Vec<OutputInfo>, virtual_supported, session: &mut SessionState| {
+            handle_control_message(
+                ControlMessage::AvailableOutputs {
+                    outputs,
+                    virtual_supported,
+                },
+                session,
+                &shared,
+            )
+            .unwrap();
+            shared.control_state.lock().unwrap().take_snapshot(1)
+        };
+
+        let first = announce(outputs.clone(), false, &mut session)
+            .unwrap()
+            .outputs
+            .unwrap();
+        assert_eq!(first.revision, 1);
+        assert_eq!(first.value.outputs, outputs);
+        assert!(!first.value.virtual_supported);
+
+        assert!(announce(outputs.clone(), false, &mut session).is_none());
+
+        let virtual_flip = announce(outputs.clone(), true, &mut session)
+            .unwrap()
+            .outputs
+            .unwrap();
+        assert_eq!(virtual_flip.revision, 2);
+        assert!(virtual_flip.value.virtual_supported);
+
+        let emptied = announce(Vec::new(), true, &mut session)
+            .unwrap()
+            .outputs
+            .unwrap();
+        assert_eq!(emptied.revision, 3);
+        assert!(emptied.value.outputs.is_empty());
+
+        reset_for_transport_fallback(&shared, "connecting through API punch");
+        let relayed = announce(outputs.clone(), false, &mut session)
+            .unwrap()
+            .outputs
+            .unwrap();
+        assert_eq!(relayed.revision, 1, "fallback starts a fresh control state");
+    }
+
+    #[test]
+    fn trackpad_space_follows_the_upright_extent_across_rotation() {
+        let mut router = TrackpadRouter::default();
+        router.set_stream_config(StreamConfig {
+            rotation: 1,
+            ..test_stream_config(1920, 1080)
+        });
+        router.set_capabilities(desktop_capabilities(false));
+        router.set_controller_state(ControllerState::Available);
+        router.set_cursor_shape(CursorShape {
+            serial: 1,
+            width: 1,
+            height: 1,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            rgba: vec![0; 4],
+        });
+        router.set_cursor_state(CursorState {
+            serial: 1,
+            x: 0,
+            y: 0,
+            visible: true,
+            app_grab: false,
+        });
+
+        let (route, _) = router.route_trackpad_delta(0, 0, 0).unwrap();
+        assert_tip_near(absolute_tip(route, 1080, 1920), (540.0, 960.0));
+        let (route, _) = router.route_trackpad_delta(100, 100, 0).unwrap();
+        assert_tip_near(absolute_tip(route, 1080, 1920), (640.0, 1060.0));
+
+        router.set_stream_config(StreamConfig {
+            rotation: 0,
+            ..test_stream_config(1920, 1080)
+        });
+        let (route, _) = router.route_trackpad_delta(0, 0, 0).unwrap();
+        assert_tip_near(
+            absolute_tip(route, 1920, 1080),
+            (640.0 * 1919.0 / 1079.0, 1060.0 * 1079.0 / 1919.0),
+        );
+    }
+
+    #[test]
+    fn display_info_names_the_requested_output_and_local_display() {
+        let config = ClientConfig {
+            server: Some("127.0.0.1:1".into()),
+            api: None,
+            token: "t".into(),
+            refresh_millihz: 90_000,
+            output_id: OUTPUT_VIRTUAL,
+            aux: true,
+            display_width: 2560,
+            display_height: 1440,
+        };
+        let info = client_display_info(&config, 77, 4321);
+        assert!(info.aux);
+        assert_eq!(info.output_id, 77);
+        assert_eq!((info.width, info.height), (2560, 1440));
+        assert_eq!((info.max_refresh_millihz, info.udp_port), (90_000, 4321));
+    }
+
+    #[test]
+    fn transport_fallback_keeps_the_confirmed_output_but_virtual_stays_virtual() {
+        let (shared, _, _) = test_shared();
+        shared.output_id.store(5, Ordering::Release);
+        follow_streamed_output(&shared, 9);
+        assert_eq!(shared.output_id.load(Ordering::Acquire), 9);
+        follow_streamed_output(&shared, OUTPUT_DEFAULT);
+        assert_eq!(shared.output_id.load(Ordering::Acquire), 9);
+
+        shared.output_id.store(OUTPUT_VIRTUAL, Ordering::Release);
+        follow_streamed_output(&shared, 31);
+        assert_eq!(shared.output_id.load(Ordering::Acquire), OUTPUT_VIRTUAL);
+    }
+
+    #[test]
+    fn select_output_rejects_sentinels_and_disconnected_sessions() {
+        let client = Client::start(ClientConfig {
+            server: Some("127.0.0.1:1".into()),
+            api: None,
+            token: "test-token".into(),
+            refresh_millihz: 60_000,
+            output_id: OUTPUT_DEFAULT,
+            aux: false,
+            display_width: 0,
+            display_height: 0,
+        })
+        .unwrap();
+        assert!(client.select_output(OUTPUT_DEFAULT).is_err());
+        assert!(client.select_output(OUTPUT_VIRTUAL).is_err());
+        assert!(client.select_output(5).is_err());
+        client.stop();
+    }
+
+    fn read_available(
+        tcp: &mut TcpStream,
+        pending: &mut Vec<u8>,
+        window: Duration,
+    ) -> Vec<ControlMessage> {
+        let deadline = Instant::now() + window;
+        let mut messages = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while Instant::now() < deadline {
+            match tcp.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(size) => {
+                    pending.extend_from_slice(&buffer[..size]);
+                    messages.extend(drain_control_messages(pending));
+                }
+                Err(error) if is_retryable_read(&error) => {}
+                Err(_) => break,
+            }
+        }
+        messages
+    }
+
+    #[test]
+    fn aux_session_is_video_only_and_can_move_to_another_output() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let media = UdpSocket::bind(server_addr).unwrap();
+        media.set_nonblocking(true).unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().unwrap();
+            tcp.set_read_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+            let mut pending = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            assert_eq!(
+                read_control(&mut tcp, &mut pending, deadline),
+                ControlMessage::Authenticate("test-token".into())
+            );
+            write_control(&mut tcp, ControlMessage::AuthResult(true)).unwrap();
+            let display = loop {
+                if let ControlMessage::ClientDisplayInfo(display) =
+                    read_control(&mut tcp, &mut pending, deadline)
+                {
+                    break display;
+                }
+            };
+            assert!(display.aux);
+            assert_eq!(display.output_id, OUTPUT_VIRTUAL);
+            assert_eq!((display.width, display.height), (1920, 1080));
+
+            let config = StreamConfig {
+                output_id: 40,
+                ..test_stream_config(1920, 1080)
+            };
+            for message in [
+                ControlMessage::StreamConfig(config),
+                ControlMessage::InputSession(InputSession {
+                    client_id: 43,
+                    credential: TEST_INPUT_CREDENTIAL,
+                }),
+            ] {
+                write_control(&mut tcp, message).unwrap();
+            }
+            let mut seen = Vec::new();
+            while !seen.contains(&ControlMessage::ClientReadyForMedia) {
+                seen.push(read_control(&mut tcp, &mut pending, deadline));
+            }
+            write_control(&mut tcp, ControlMessage::StreamStarted).unwrap();
+
+            let mut picked = false;
+            while !picked {
+                assert!(Instant::now() < deadline, "SelectOutput never arrived");
+                seen.extend(read_available(
+                    &mut tcp,
+                    &mut pending,
+                    Duration::from_millis(50),
+                ));
+                picked = seen.contains(&ControlMessage::SelectOutput(41));
+            }
+            write_control(
+                &mut tcp,
+                ControlMessage::StreamConfig(StreamConfig {
+                    output_id: 41,
+                    video_epoch: 2,
+                    ..config
+                }),
+            )
+            .unwrap();
+            seen.extend(read_available(
+                &mut tcp,
+                &mut pending,
+                Duration::from_millis(600),
+            ));
+            for message in &seen {
+                assert!(
+                    !matches!(
+                        message,
+                        ControlMessage::SetAudio(_)
+                            | ControlMessage::ReleaseControl
+                            | ControlMessage::AcquireControl
+                            | ControlMessage::TextInput(_)
+                    ),
+                    "aux session sent {message:?}"
+                );
+            }
+        });
+
+        let client = Client::start(ClientConfig {
+            server: Some(server_addr.to_string()),
+            api: None,
+            token: "test-token".into(),
+            refresh_millihz: 60_000,
+            output_id: OUTPUT_VIRTUAL,
+            aux: true,
+            display_width: 1920,
+            display_height: 1080,
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while client.status() != "connected" {
+            assert!(Instant::now() < deadline, "aux session never connected");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let first = loop {
+            if let Some(event) = client.take_stream_event() {
+                break event;
+            }
+            assert!(Instant::now() < deadline, "stream config did not arrive");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(first.output_id, 40);
+
+        assert!(client.send_mouse_absolute(1, 2, 0).is_err());
+        assert!(client.send_trackpad_delta(1, 1, 0).is_err());
+        assert!(client.send_mouse_buttons(1).is_err());
+        assert!(client.send_mouse_wheel(1, 1, 0).is_err());
+        assert!(client
+            .send_keyboard_state([0; KEYBOARD_STATE_BYTES])
+            .is_err());
+        assert!(client.send_text_input("x".into()).is_err());
+        assert!(client.set_audio_enabled(true).is_err());
+        assert!(client.set_audio_enabled(false).is_ok());
+
+        client.select_output(41).unwrap();
+        let moved = loop {
+            if let Some(event) = client.take_stream_event() {
+                if event.output_id == 41 {
+                    break event;
+                }
+            }
+            assert!(Instant::now() < deadline, "switched config did not arrive");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(moved.generation, first.generation);
+        assert_eq!(moved.video_epoch, 2);
+        assert_eq!(client.audio_backlog(), 0);
+
+        server.join().unwrap();
+        client.stop();
+        // The only datagrams an aux session sends reveal its media port: no
+        // button, no key.
+        let mut datagram = [0u8; 128];
+        let mut revealed = 0;
+        while let Ok((size, _)) = media.recv_from(&mut datagram) {
+            match InputPacket::deserialize(&datagram[..size]).unwrap().2 {
+                InputPacket::MouseButtons(packet) => assert_eq!(packet.buttons, 0),
+                InputPacket::KeyboardState(packet) => {
+                    assert_eq!(packet.pressed, [0; KEYBOARD_STATE_BYTES])
+                }
+                packet => panic!("aux session sent {packet:?}"),
+            }
+            revealed += 1;
+        }
+        assert!(revealed > 0, "aux session never revealed its media port");
     }
 
     #[test]

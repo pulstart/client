@@ -31,6 +31,22 @@ platform are both API 24 because the Rust network interface discovery path uses
 - Unified saved, LAN, and API server list with search, reload, path badges,
   stable peer identity, last-connected ordering, and add/remove actions
 - Fit, fill/cover, and stretch video scaling
+- Display picker in the floating menu when the server has more than one
+  output: each entry shows name, size, and a primary/virtual marker, the
+  highlight follows the output the server actually streams, and the pick is
+  remembered per server and requested at the next connect so the first frame is
+  already the right output
+- Rotated outputs are shown upright: the decoder applies the stream's
+  clockwise quarter turns (`MediaFormat.KEY_ROTATION`), and the view aspect,
+  cursor overlay, and trackpad coordinates all use the upright size
+- External display: while connected directly (LAN or VPN, not an API punch,
+  relay, or TCP tunnel) and a presentation display is attached (DeX, HDMI,
+  wireless display), a second video-only session shows another server output
+  in a `Presentation`. It uses the remembered choice for the server, else the
+  first output the main display is not showing, else a new virtual output sized
+  to the external display when the server can create one. The menu's
+  "External display" list changes it. The second session carries no audio and
+  no input, and its failure only ends the external view
 - Immersive fullscreen and a native-style floating connected menu
 - Settings for refresh rate, audio, touch input, and screen wake behavior
 - Desktop-style Servers, Settings, Update, and About navigation
@@ -41,9 +57,9 @@ hosts are connectable: Android persists a distinct client peer identity,
 verifies the selected host identity, registers and exchanges candidates through
 the API, then carries media/input on encrypted channel 0 and reliable control on
 channel 1. Fresh LAN beacons try the lower-overhead direct path first and fall
-back to the API tunnel on transport failure. Clipboard, file transfer, output
-selection, and game-style pointer capture are not yet
-implemented; trackpad input does not provide game-capture mode.
+back to the API tunnel on transport failure. Clipboard, file transfer, and
+game-style pointer capture are not yet implemented; trackpad input does not
+provide game-capture mode.
 
 The keyboard keeps physical keys separate from committed text. Android's
 installed IME continues to provide its language layout, composition, and

@@ -265,8 +265,16 @@ internal class CursorOverlayView(
         val (tipX, tipY) = displayedTip(shape, capabilities.cursorPositionReliable)
         val scaleX = videoRect.width() / cursorWidth
         val scaleY = videoRect.height() / cursorHeight
-        val mappedTipX = videoRect.left + tipX * scaleX
-        val mappedTipY = videoRect.top + tipY * scaleY
+        val (viewTipX, viewTipY) = mapUprightToView(
+            tipX,
+            tipY,
+            cursorWidth,
+            cursorHeight,
+            videoRect.width(),
+            videoRect.height(),
+        )
+        val mappedTipX = videoRect.left + viewTipX
+        val mappedTipY = videoRect.top + viewTipY
 
         if (shape == null) {
             drawFallbackArrow(canvas, mappedTipX, mappedTipY)

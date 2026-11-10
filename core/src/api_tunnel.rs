@@ -14,6 +14,12 @@ use std::time::{Duration, Instant};
 use crate::client::ApiConnectionConfig;
 
 const PUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// One failed round is usually timing, not topology: the host starts probing
+/// only once its API poll shows the request, and the first round's probes have
+/// opened both NAT mappings by the time the second starts.
+const PUNCH_ROUNDS: u64 = 2;
+/// How long a signaling call keeps retrying a transport error or a 5xx.
+const SIGNAL_RETRY: Duration = Duration::from_secs(4);
 const MAX_TOKEN_LEN: usize = 256;
 
 struct ApiProcessState {
@@ -59,9 +65,12 @@ impl ApiProcessState {
     }
 }
 
-struct HostIdentity {
+/// The host as one API snapshot described it.
+struct Host {
     peer_id: String,
     lease_id: String,
+    shared_secret: [u8; 32],
+    candidates: Vec<SocketAddr>,
 }
 
 struct ApiSessionLease {
@@ -97,7 +106,7 @@ impl ApiLeaseHeartbeat {
                 stopped.recv_timeout(Duration::from_secs(30)),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout)
             ) {
-                let _ = post_json(&url, "heartbeat", &body);
+                let _ = post_once(&url, "heartbeat", &body);
             }
         });
         Self {
@@ -153,32 +162,20 @@ pub(crate) fn connect_punch(
     let result = (|| {
         let socket = UdpSocket::bind("0.0.0.0:0")
             .map_err(|error| format!("failed to bind API punch socket: {error}"))?;
-        let port = socket
-            .local_addr()
-            .map_err(|error| format!("failed to inspect API punch socket: {error}"))?
-            .port();
-        let local_candidates = tunnel::gather_candidates_with_stun(port, Some(&socket));
-        check_cancelled(stop)?;
-
-        let (partner_candidates, shared_secret, host) =
-            prepare_punch(config, token, &local_candidates, &state, stop)?;
-        let signal = request(config, token, "punch", &state, &host)?;
-        let crypto = crypto_from_signal_response(
-            config,
-            &state,
-            &host,
-            shared_secret,
-            TunnelMode::Punch,
-            "punch",
-            &signal,
-        )?;
-        let peer = tunnel::hole_punch_cancellable(
-            &socket,
-            &partner_candidates,
-            &crypto,
-            PUNCH_TIMEOUT,
-            || stop.load(Ordering::Acquire),
-        )?;
+        let mut round = 0;
+        let (peer, crypto) = loop {
+            match punch_round(config, token, &state, &socket, round, stop) {
+                Ok(punched) => break punched,
+                Err(error) => {
+                    check_cancelled(stop)?;
+                    round += 1;
+                    if round == PUNCH_ROUNDS {
+                        return Err(error);
+                    }
+                    eprintln!("[punch] round {round}/{PUNCH_ROUNDS} failed: {error}");
+                }
+            }
+        };
         check_cancelled(stop)?;
         let link: Arc<dyn TunnelLink> = Arc::new(PunchedSocket::new(socket, peer, crypto));
         Ok(link)
@@ -231,7 +228,7 @@ fn unregister(config: &ApiConnectionConfig, token: &str, state: &ApiProcessState
         "peer_id": config.client_peer_id,
         "lease_id": state.lease_id,
     });
-    let _ = post_json(&config.api_url, "unregister", &body);
+    let _ = post_once(&config.api_url, "unregister", &body);
 }
 
 fn validate_config(config: &ApiConnectionConfig) -> Result<(), String> {
@@ -300,24 +297,41 @@ fn acquire_session(
     }
 }
 
-fn prepare_punch(
+/// One punch round on `socket`: fresh candidates, a fresh request (each round
+/// has its own generation, so the host drops the previous one), then probing.
+fn punch_round(
     config: &ApiConnectionConfig,
     token: &str,
-    local_candidates: &[String],
     state: &ApiProcessState,
+    socket: &UdpSocket,
+    round: u64,
     stop: &AtomicBool,
-) -> Result<(Vec<SocketAddr>, [u8; 32], HostIdentity), String> {
-    register(config, token, local_candidates, state)?;
+) -> Result<(SocketAddr, Arc<CryptoContext>), String> {
     check_cancelled(stop)?;
-    let host = verify_host(config, token, state)?;
+    let port = socket
+        .local_addr()
+        .map_err(|error| format!("failed to inspect API punch socket: {error}"))?
+        .port();
+    let local_candidates = tunnel::gather_candidates_with_stun(port, Some(socket));
     check_cancelled(stop)?;
-    // The host reads keys, candidates and the request from one API snapshot;
-    // it no longer needs a fixed sleep to synchronize independent polls.
-    let shared_secret = exchange_key(config, token, state, &host)?;
-    check_cancelled(stop)?;
-    let partner_candidates = exchange_candidates(config, token, local_candidates, state, &host)?;
-    check_cancelled(stop)?;
-    Ok((partner_candidates, shared_secret, host))
+    let host = register(config, token, &local_candidates, state, stop)?;
+    if host.candidates.is_empty() {
+        return Err("API host has no usable punch candidates".into());
+    }
+    let generation = config.request_nonce.saturating_add(round);
+    let signal = post_json(
+        &config.api_url,
+        "punch",
+        &request_body(config, token, state, &host, generation),
+        stop,
+    )?;
+    let crypto =
+        crypto_from_signal_response(config, state, &host, TunnelMode::Punch, generation, &signal)?;
+    let peer =
+        tunnel::hole_punch_cancellable(socket, &host.candidates, &crypto, PUNCH_TIMEOUT, || {
+            stop.load(Ordering::Acquire)
+        })?;
+    Ok((peer, crypto))
 }
 
 fn prepare_relay(
@@ -327,26 +341,10 @@ fn prepare_relay(
     state: &ApiProcessState,
     stop: &AtomicBool,
 ) -> Result<(Arc<CryptoContext>, String, Option<u16>), String> {
-    register(config, token, local_candidates, state)?;
-    check_cancelled(stop)?;
-    let host = verify_host(config, token, state)?;
-    check_cancelled(stop)?;
-    let shared_secret = exchange_key(config, token, state, &host)?;
-    check_cancelled(stop)?;
-    let response = post_json(
-        &config.api_url,
-        "relay",
-        &serde_json::json!({
-            "token": token,
-            "role": "client",
-            "peer_id": config.client_peer_id,
-            "lease_id": state.lease_id,
-            "expected_partner_peer_id": host.peer_id,
-            "expected_partner_lease_id": host.lease_id,
-            "generation": config.request_nonce,
-            "mode": "request",
-        }),
-    )?;
+    let host = register(config, token, local_candidates, state, stop)?;
+    let mut body = request_body(config, token, state, &host, config.request_nonce);
+    body["mode"] = "request".into();
+    let response = post_json(&config.api_url, "relay", &body, stop)?;
     let ticket = response["ticket"]
         .as_str()
         .filter(|ticket| !ticket.is_empty())
@@ -360,21 +358,24 @@ fn prepare_relay(
         config,
         state,
         &host,
-        shared_secret,
         TunnelMode::Relay,
-        "relay",
+        config.request_nonce,
         &response,
     )?;
     Ok((crypto, ticket, relay_port))
 }
 
+/// Registers this client and reads the host out of the same atomic snapshot
+/// the host itself polls: identity, key and candidates of one lease, in one
+/// round trip instead of five.
 fn register(
     config: &ApiConnectionConfig,
     token: &str,
     candidates: &[String],
     state: &ApiProcessState,
-) -> Result<(), String> {
-    post_json(
+    stop: &AtomicBool,
+) -> Result<Host, String> {
+    let response = post_json(
         &config.api_url,
         "register",
         &serde_json::json!({
@@ -385,166 +386,68 @@ fn register(
             "candidates": candidates,
             "public_key": state.public_key_b64(),
         }),
+        stop,
     )?;
-    Ok(())
-}
-
-fn verify_host(
-    config: &ApiConnectionConfig,
-    token: &str,
-    state: &ApiProcessState,
-) -> Result<HostIdentity, String> {
-    let discovery = post_json(
-        &config.api_url,
-        "session",
-        &serde_json::json!({"token": token}),
-    )?;
-    let actual_peer = discovery["host"]["peer_id"]
+    let host = &response["session"]["host"];
+    let peer_id = host["peer_id"]
         .as_str()
         .ok_or_else(|| "API host is no longer online".to_string())?;
-    let host_lease_id = discovery["host"]["lease_id"]
+    if peer_id != config.host_peer_id {
+        return Err("API host identity changed; reload the server list".into());
+    }
+    let lease_id = host["lease_id"]
         .as_str()
         .ok_or_else(|| "API host has no active process lease".to_string())?;
-    if actual_peer != config.host_peer_id {
-        return Err("API host identity changed; reload the server list".into());
-    }
-    let host = HostIdentity {
-        peer_id: actual_peer.to_string(),
-        lease_id: host_lease_id.to_string(),
-    };
-    let session = post_json(
-        &config.api_url,
-        "session",
-        &serde_json::json!({
-            "token": token,
-            "role": "client",
-            "peer_id": config.client_peer_id,
-            "lease_id": state.lease_id,
-            "expected_partner_peer_id": host.peer_id,
-            "expected_partner_lease_id": host.lease_id,
-        }),
-    )?;
-    let actual_peer = session["host"]["peer_id"]
+    let public_key: [u8; 32] = host["public_key"]
         .as_str()
-        .ok_or_else(|| "API host is no longer online".to_string())?;
-    if actual_peer != config.host_peer_id {
-        return Err("API host identity changed; reload the server list".into());
-    }
-    if session["host"]["lease_id"].as_str() != Some(host.lease_id.as_str()) {
-        return Err("API host lease changed during session validation".into());
-    }
-    Ok(host)
-}
-
-fn exchange_key(
-    config: &ApiConnectionConfig,
-    token: &str,
-    state: &ApiProcessState,
-    host: &HostIdentity,
-) -> Result<[u8; 32], String> {
-    let response = post_json(
-        &config.api_url,
-        "key",
-        &serde_json::json!({
-            "token": token,
-            "role": "client",
-            "peer_id": config.client_peer_id,
-            "lease_id": state.lease_id,
-            "expected_partner_peer_id": host.peer_id,
-            "expected_partner_lease_id": host.lease_id,
-            "public_key": state.public_key_b64(),
-        }),
-    )?;
-    validate_partner_response(&response, host)?;
-    let partner_key = response["partner_key"]
-        .as_str()
+        .and_then(base64_decode)
+        .and_then(|bytes| bytes.try_into().ok())
         .ok_or_else(|| "API host tunnel key is not ready".to_string())?;
-    let decoded = base64_decode(partner_key)
-        .filter(|bytes| bytes.len() == 32)
-        .ok_or_else(|| "API host returned an invalid tunnel key".to_string())?;
-    let mut public_key = [0u8; 32];
-    public_key.copy_from_slice(&decoded);
-    Ok(state.shared_secret(public_key))
+    Ok(Host {
+        peer_id: peer_id.to_string(),
+        lease_id: lease_id.to_string(),
+        shared_secret: state.shared_secret(public_key),
+        candidates: host["candidates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str()?.parse().ok())
+            .collect(),
+    })
 }
 
-fn exchange_candidates(
+fn request_body(
     config: &ApiConnectionConfig,
     token: &str,
-    candidates: &[String],
     state: &ApiProcessState,
-    host: &HostIdentity,
-) -> Result<Vec<SocketAddr>, String> {
-    let response = post_json(
-        &config.api_url,
-        "candidates",
-        &serde_json::json!({
-            "token": token,
-            "role": "client",
-            "peer_id": config.client_peer_id,
-            "lease_id": state.lease_id,
-            "expected_partner_peer_id": host.peer_id,
-            "expected_partner_lease_id": host.lease_id,
-            "candidates": candidates,
-        }),
-    )?;
-    validate_partner_response(&response, host)?;
-    let candidates: Vec<SocketAddr> = response["partner_candidates"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|value| value.as_str()?.parse().ok())
-        .collect();
-    if candidates.is_empty() {
-        return Err("API host has no usable punch candidates".into());
-    }
-    Ok(candidates)
-}
-
-fn request(
-    config: &ApiConnectionConfig,
-    token: &str,
-    endpoint: &str,
-    state: &ApiProcessState,
-    host: &HostIdentity,
-) -> Result<serde_json::Value, String> {
-    post_json(
-        &config.api_url,
-        endpoint,
-        &serde_json::json!({
-            "token": token,
-            "role": "client",
-            "peer_id": config.client_peer_id,
-            "lease_id": state.lease_id,
-            "expected_partner_peer_id": host.peer_id,
-            "expected_partner_lease_id": host.lease_id,
-            "generation": config.request_nonce,
-        }),
-    )
-}
-
-fn validate_partner_response(
-    response: &serde_json::Value,
-    host: &HostIdentity,
-) -> Result<(), String> {
-    if response["partner_peer_id"].as_str() != Some(host.peer_id.as_str())
-        || response["partner_lease_id"].as_str() != Some(host.lease_id.as_str())
-    {
-        return Err("API host lease changed during signaling".into());
-    }
-    Ok(())
+    host: &Host,
+    generation: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "token": token,
+        "role": "client",
+        "peer_id": config.client_peer_id,
+        "lease_id": state.lease_id,
+        "expected_partner_peer_id": host.peer_id,
+        "expected_partner_lease_id": host.lease_id,
+        "generation": generation,
+    })
 }
 
 fn crypto_from_signal_response(
     config: &ApiConnectionConfig,
     state: &ApiProcessState,
-    host: &HostIdentity,
-    shared_secret: [u8; 32],
+    host: &Host,
     mode: TunnelMode,
-    mode_label: &str,
+    generation: u64,
     response: &serde_json::Value,
 ) -> Result<Arc<CryptoContext>, String> {
+    let mode_label = match mode {
+        TunnelMode::Punch => "punch",
+        TunnelMode::Relay => "relay",
+    };
     if response["mode"].as_str() != Some(mode_label)
-        || response["generation"].as_u64() != Some(config.request_nonce)
+        || response["generation"].as_u64() != Some(generation)
         || response["owner_peer_id"].as_str() != Some(config.client_peer_id.as_str())
         || response["owner_lease_id"].as_str() != Some(state.lease_id.as_str())
         || response["partner_peer_id"].as_str() != Some(host.peer_id.as_str())
@@ -559,12 +462,12 @@ fn crypto_from_signal_response(
         .as_str()
         .ok_or_else(|| "API returned no tunnel request context".to_string())?;
     let key = derive_session_key(
-        &shared_secret,
+        &host.shared_secret,
         &SessionKeyContext {
             request_context,
             session_id,
             mode,
-            generation: config.request_nonce,
+            generation,
             host_peer_id: &host.peer_id,
             host_lease_id: &host.lease_id,
             client_peer_id: &config.client_peer_id,
@@ -626,17 +529,50 @@ fn dial_relay(
     Ok(Arc::new(tunnel))
 }
 
+enum PostError {
+    /// The API answered and said no; asking again cannot help.
+    Refused(u16),
+    Unreachable(String),
+}
+
+fn post_once(
+    api_url: &str,
+    endpoint: &str,
+    body: &serde_json::Value,
+) -> Result<ureq::Response, PostError> {
+    http_agent()
+        .post(&format!("{}/api/{endpoint}", api_url.trim_end_matches('/')))
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+        .map_err(|error| match error {
+            ureq::Error::Status(code, _) if code < 500 => PostError::Refused(code),
+            error => PostError::Unreachable(error.to_string()),
+        })
+}
+
+/// Every signaling call is idempotent, so a transport error or a 5xx is
+/// retried for `SIGNAL_RETRY`: one hiccup used to end the punch and send the
+/// session to the relay.
 fn post_json(
     api_url: &str,
     endpoint: &str,
     body: &serde_json::Value,
+    stop: &AtomicBool,
 ) -> Result<serde_json::Value, String> {
-    let url = format!("{}/api/{endpoint}", api_url.trim_end_matches('/'));
-    let response = http_agent()
-        .post(&url)
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())
-        .map_err(|error| format!("API {endpoint} request failed: {error}"))?;
+    let deadline = Instant::now() + SIGNAL_RETRY;
+    let response = loop {
+        check_cancelled(stop)?;
+        match post_once(api_url, endpoint, body) {
+            Ok(response) => break response,
+            Err(PostError::Refused(code)) => {
+                return Err(format!("API {endpoint} request refused: status {code}"));
+            }
+            Err(PostError::Unreachable(error)) if Instant::now() >= deadline => {
+                return Err(format!("API {endpoint} request failed: {error}"));
+            }
+            Err(PostError::Unreachable(_)) => std::thread::sleep(Duration::from_millis(300)),
+        }
+    };
     let text = response
         .into_string()
         .map_err(|error| format!("failed to read API {endpoint} response: {error}"))?;
