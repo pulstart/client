@@ -150,9 +150,38 @@ struct SessionControl {
     next_retry: Option<Instant>,
 }
 
+/// A value that never leaves the UI thread, held where the type system wants
+/// `Send`: egui requires `Send + Sync` of a deferred viewport's callback but
+/// runs it on the UI thread. The platform presenters inside `VideoTexture`
+/// (D3D11/WGL interop, Metal layers) hold thread-bound handles and are not
+/// `Send` on Windows and macOS.
+#[derive(Default)]
+struct UiThreadOnly<T>(T);
+
+// SAFETY: the only value wrapped is `WindowUi::video`, and `AuxStream::ui` is
+// locked from the UI thread alone — the viewport callback, the root update
+// (`upload_pending`, `aux_raw_input`, window removal) and `connect`. The
+// connection thread is handed clones of other fields, never the stream itself,
+// so the last `Arc<AuxStream>` is dropped on the UI thread too.
+unsafe impl<T> Send for UiThreadOnly<T> {}
+
+impl<T> std::ops::Deref for UiThreadOnly<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for UiThreadOnly<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
 #[derive(Default)]
 struct WindowUi {
-    video: Option<VideoTexture>,
+    video: UiThreadOnly<Option<VideoTexture>>,
     upload_frame: VideoFrameBuffer,
     cursor_textures: BTreeMap<u64, RemoteCursorTexture>,
     latest_cursor_serial: Option<u64>,
@@ -214,10 +243,10 @@ impl AuxStream {
             aux: true,
         };
         let ui = WindowUi {
-            video: Some(VideoTexture::new_secondary(
+            video: UiThreadOnly(Some(VideoTexture::new_secondary(
                 use_wgpu,
                 Arc::clone(&env.glow_slots),
-            )),
+            ))),
             ..Default::default()
         };
         let stream = Arc::new(Self {
