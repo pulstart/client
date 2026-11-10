@@ -1,3 +1,16 @@
+# 0.13.1
+
+Works with any 0.10.x host; update the host to 0.10.1 (monitor arrangement
+on installed hosts).
+
+- Android: every APK is now signed with one key kept in the repository, so
+  a new version installs over the old one. Until now each release was
+  signed with a throwaway key and had to be installed after uninstalling
+  the previous one. An app installed before this release still has to be
+  uninstalled once.
+- Android: a locally built APK takes its version from the newest release
+  tag, so it installs over a released one.
+
 # 0.13.0
 
 Requires host 0.10.0: the wire format changed, update both together.
