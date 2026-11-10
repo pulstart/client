@@ -1,3 +1,25 @@
+# 0.13.0
+
+Requires host 0.10.0: the wire format changed, update both together.
+
+- Multi-screen. The floating menu has a display picker; the choice is
+  remembered per server. Every other host monitor can open in its own
+  window, and with several local monitors each one gets a host monitor
+  automatically (setting "auto layout", on by default; on Wayland the
+  compositor places the windows, so they open as normal windows to move).
+  Rotated host monitors are shown upright. Android: display picker in the
+  menu, and an attached external display shows a second host monitor.
+- Connecting over the internet no longer gives up on hole punching after
+  one failed signaling request: that sent the session straight to the
+  relay. Android now makes two punch rounds like the desktop client and
+  needs one signaling round trip instead of six.
+- Hole-punched sessions no longer freeze and drop after packet loss (see
+  host 0.10.0), and a client that disconnects tells the host, so an
+  immediate reconnect is not held up for 5 s.
+
+The extra windows and the Android external display have not been run on
+real hardware yet.
+
 # 0.12.18
 
 Works with any 0.9.x host; update the host to 0.9.23 for the full effect.
